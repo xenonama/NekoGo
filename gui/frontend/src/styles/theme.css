@@ -1,0 +1,1355 @@
+/* Three-zone layout: sidebar (180px) | center (flex) | servers (320px).
+   Windowed mode (narrower than ~1200px) used to break: the shell forced
+   min-width:1200px so the right panel clipped off-screen with a
+   horizontal scrollbar. The shell is fluid now; breakpoints below shrink
+   the chrome and stack rows instead of overflowing. */
+.nb-shell {
+  display: flex;
+  min-width: 0;
+  min-height: 0;
+  height: 100vh;
+  max-width: 100vw;
+  overflow: hidden;
+  background: var(--bg);
+}
+
+/* UI chrome must never be selectable (dragging over it highlights nothing). */
+.nb-logo, .nb-nav, .nb-nav-item,
+button,
+.nb-section-title,
+.nb-status,
+.nb-qa, .nb-srv, .nb-appinfo,
+.nb-card, .nb-page,
+.nb-flag, .nb-lat, .nb-chev, .nb-speed {
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+/* ---------- Left sidebar ---------- */
+.nb-sidebar {
+  width: 180px;
+  flex: 0 0 180px;
+  background: var(--sidebar);
+  display: flex;
+  flex-direction: column;
+  padding: 18px 12px 14px;
+  border-right: 1px solid var(--border);
+}
+.nb-logo { display: flex; align-items: center; gap: 8px; padding: 0 8px 18px; font-weight: 700; font-size: 17px; }
+.nb-logo-img { width: 32px; height: 32px; border-radius: 8px; object-fit: cover; }
+.nb-logo-text { flex: 1; }
+.nb-logo-toggle { width: 36px; height: 36px; min-height: 36px; padding: 0; }
+.nb-nav { display: flex; flex-direction: column; gap: 4px; }
+.nb-nav-item {
+  position: relative;
+  display: flex; align-items: center; gap: 10px;
+  padding: 10px 12px; border: none; background: transparent;
+  border-radius: 10px; color: var(--muted); font-weight: 500; font-size: 13.5px;
+  text-align: left; width: 100%;
+}
+.nb-nav-item:hover { background: var(--hover); color: var(--fg); }
+.nb-nav-item.active { background: var(--accent-soft); color: var(--accent); font-weight: 600; }
+/* Bottom-left Advanced Mode switch: pinned under the nav, mirrors
+   the labeled master switch in the Advanced shell footer. */
+.nb-side-foot {
+  margin-top: auto; padding-top: 10px;
+  border-top: 1px solid var(--border);
+}
+.nb-side-advrow {
+  display: flex; align-items: center; justify-content: space-between; gap: 8px;
+  width: 100%; height: 36px; padding: 0 10px; border-radius: 8px;
+  background: transparent;
+  font-size: 13px; font-weight: 600; color: var(--fg);
+  cursor: pointer; user-select: none; -webkit-user-select: none;
+}
+.nb-side-advrow:hover { background: var(--hover); }
+.nb-side-advrow:focus-visible {
+  outline: 2px solid var(--accent); outline-offset: -2px;
+}
+.nb-side-advlabel { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* Live connection status above the switch: pill with dot + word;
+   click toggles connect. */
+.nb-side-status {
+  display: flex; align-items: center; gap: 8px;
+  width: 100%; height: 34px; padding: 0 12px; margin-bottom: 8px;
+  border: 1px solid var(--border); background: var(--card); border-radius: 9999px;
+  cursor: pointer; user-select: none; -webkit-user-select: none;
+  font-size: 12px; font-weight: 700; color: var(--muted);
+  box-sizing: border-box;
+}
+.nb-side-status:hover:not(:disabled) { border-color: var(--chev); }
+.nb-side-status:disabled { cursor: default; }
+.nb-side-dot {
+  width: 9px; height: 9px; border-radius: 9999px;
+  background: var(--muted); flex: 0 0 auto;
+}
+.nb-side-state {
+  min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.nb-side-status.on { color: var(--accent2); }
+.nb-side-status.on .nb-side-dot {
+  background: var(--accent2);
+  outline: 2px solid var(--accent2); outline-offset: 2px;
+}
+.nb-side-status.busy { color: var(--accent); }
+.nb-side-status.busy .nb-side-dot {
+  background: var(--accent);
+  animation: adv-dot-pulse 1s ease-in-out infinite;
+}
+
+/* ---------- Center panel ---------- */
+.nb-center { flex: 1; min-width: 0; overflow-y: auto; padding: 20px 22px; display: flex; flex-direction: column; gap: 16px; }
+.nb-card { background: var(--card); border: 1px solid var(--border); border-radius: var(--radius); box-shadow: var(--shadow); padding: 18px 20px; }
+.nb-section-head { display: flex; align-items: center; justify-content: space-between; margin: 2px 2px 10px; }
+.nb-section-title { font-weight: 700; font-size: 15px; }
+
+/* Connection hero: horizontal layout — power ring, status pill +
+   server, live rates — plus one explicit Connect button. */
+.nb-conn { padding: 20px; }
+.nb-conn.is-on { border-color: var(--accent2); box-shadow: var(--shadow-lg); }
+.nb-conn-top { display: flex; align-items: center; gap: 18px; text-align: left; }
+.nb-power-btn {
+  width: 96px; height: 96px; flex: 0 0 96px; border-radius: 50%; border: none;
+  background: var(--hover); color: var(--muted);
+  display: inline-flex; align-items: center; justify-content: center;
+  box-shadow: inset 0 0 0 2px var(--border);
+  transition: transform 0.15s ease, box-shadow 0.2s ease, background 0.2s ease, color 0.2s ease;
+}
+.nb-power-btn:hover:not(:disabled) { transform: scale(1.04); color: var(--accent); box-shadow: inset 0 0 0 2px var(--accent); }
+.nb-power-btn.on {
+  background: linear-gradient(135deg, #6366f1, #a855f7); color: #fff;
+  box-shadow: 0 0 0 4px var(--accent-soft), 0 8px 24px rgba(99, 102, 241, 0.45);
+}
+.nb-power-btn.on:hover { background: linear-gradient(135deg, #6366f1, #a855f7); color: #fff; }
+.nb-power-btn:disabled { cursor: wait; }
+.nb-conn-meta { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 10px; }
+/* Status pill: green / amber pulse / gray. */
+.nb-pill {
+  align-self: flex-start;
+  font-size: 12px; font-weight: 700; letter-spacing: 0.03em; text-transform: uppercase;
+  padding: 3px 12px; border-radius: 9999px;
+  background: var(--hover); color: var(--muted);
+}
+.nb-pill.is-on { background: var(--qa-green-bg); color: var(--qa-green-fg); }
+.nb-pill.is-busy { background: var(--warn-soft); color: var(--warn); animation: adv-dot-pulse 1s ease-in-out infinite; }
+.nb-conn-server {
+  display: flex; align-items: center; gap: 12px; min-width: 0;
+  background: var(--cur); border: 1px solid var(--border);
+  border-radius: 12px; padding: 10px 14px;
+}
+.nb-conn-server .meta { flex: 1; min-width: 0; display: flex; flex-direction: column; }
+.nb-conn-server .name { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.nb-conn-server .city { color: var(--muted); font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.nb-conn-rates { display: flex; flex-direction: column; gap: 6px; align-items: flex-end; flex: 0 0 auto; }
+/* Connect hero button: one wide pill with an icon chip, a bold label and
+   a live dot while connected. Gradient fill when idle, quiet outlined
+   danger treatment when connected (disconnect is not the happy path). */
+.nb-connect-btn {
+  width: 100%; margin-top: 16px; height: 50px; min-height: 50px;
+  display: flex; align-items: center; justify-content: center; gap: 10px;
+  border-radius: 999px; border: 1px solid transparent;
+  background: linear-gradient(135deg, var(--accent), #a855f7);
+  color: #fff; font-size: 15px; font-weight: 700; letter-spacing: 0.01em;
+  box-shadow: 0 8px 20px -8px rgba(99, 102, 241, 0.65);
+  transition: transform 0.15s ease, box-shadow 0.15s ease, background 0.15s ease;
+}
+.nb-connect-btn:hover:not(:disabled) {
+  transform: translateY(-1px);
+  box-shadow: 0 12px 24px -10px rgba(99, 102, 241, 0.75);
+}
+/* The global `button:hover` rule (v2rayn-like.css, 0,1,1) outranks the bare
+   class (0,1,0) and matches disabled buttons too, so hovering flattened the
+   hero fill into a plain gray chip. Re-assert it for every non-connected
+   state (hover, disabled, busy) without touching the danger treatment. */
+.nb-connect-btn:not(.is-on) {
+  background: linear-gradient(135deg, var(--accent), #a855f7);
+}
+.nb-connect-btn:active:not(:disabled) { transform: translateY(0); }
+.nb-connect-ico {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 30px; height: 30px; border-radius: 999px;
+  background: rgba(255, 255, 255, 0.18);
+}
+.nb-connect-label { line-height: 1; }
+.nb-connect-dot {
+  width: 8px; height: 8px; border-radius: 999px; background: #5eead4;
+  box-shadow: 0 0 0 3px rgba(94, 234, 212, 0.25);
+  animation: adv-dot-pulse 1.6s ease-in-out infinite;
+}
+.nb-connect-btn.is-on {
+  background: var(--danger-soft); border-color: var(--danger); color: var(--danger);
+  box-shadow: none;
+}
+.nb-connect-btn.is-on:hover:not(:disabled) {
+  background: var(--danger); color: #fff; box-shadow: 0 8px 20px -10px rgba(239, 68, 68, 0.7);
+}
+.nb-connect-btn.is-on .nb-connect-ico { background: rgba(239, 68, 68, 0.12); }
+.nb-connect-btn.is-on:hover .nb-connect-ico { background: rgba(255, 255, 255, 0.2); }
+.nb-connect-btn:disabled { box-shadow: none; }
+.nb-speed { font-weight: 600; font-size: 13px; white-space: nowrap; }
+.nb-speed.down { color: var(--down); }
+.nb-speed.up { color: var(--up); }
+.nb-conn-err { color: var(--danger); font-size: 13px; margin-top: 8px; }
+.nb-speed.api-down { color: var(--warn); }
+
+/* Amber warning banners: stale-stats (TrafficStats) and startup/tray
+   error (App shell). Dismissible variant adds a text close button. */
+.nb-warn-banner {
+  border: 1px solid var(--warn); color: var(--warn);
+  background: var(--accent-soft); border-radius: 10px;
+  padding: 8px 12px; margin-bottom: 12px; font-size: 13px;
+}
+.nb-warn-banner.nb-dismissible { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.nb-banner-x {
+  background: none; border: none; color: var(--warn);
+  font-size: 14px; cursor: pointer; padding: 2px 6px;
+}
+
+/* Quick actions */
+.nb-qa-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; }
+.nb-qa {
+  background: var(--card); border: 1.5px solid var(--border); border-radius: var(--radius);
+  box-shadow: var(--shadow); padding: 14px; text-align: left;
+  display: flex; flex-direction: column; gap: 8px; align-items: flex-start;
+  transition: transform 0.15s ease, box-shadow 0.15s ease, border-color 0.15s ease;
+}
+.nb-qa:hover:not(:disabled) { transform: translateY(-2px); box-shadow: var(--shadow-lg); background: var(--card); border-color: var(--chev); }
+.nb-qa.active { border-color: var(--accent); background: var(--accent-soft); box-shadow: inset 0 0 0 1px var(--accent); }
+.nb-qa:disabled { opacity: 0.75; }
+.nb-qa .ico { width: 40px; height: 40px; border-radius: 12px; display: flex; align-items: center; justify-content: center; }
+.nb-qa .t { font-weight: 600; font-size: 13.5px; }
+.nb-qa .s { color: var(--muted); font-size: 12px; }
+.ico-blue { background: var(--qa-blue-bg); color: var(--qa-blue-fg); }
+.ico-green { background: var(--qa-green-bg); color: var(--qa-green-fg); }
+.ico-purple { background: var(--qa-purple-bg); color: var(--qa-purple-fg); }
+.ico-pink { background: var(--qa-pink-bg); color: var(--qa-pink-fg); }
+
+.nb-lat { font-size: 12px; font-weight: 600; white-space: nowrap; }
+.lat-ok { color: var(--accent2); }
+.lat-warn { color: var(--warn); }
+.lat-bad { color: var(--danger); }
+/* BUG-016: never-tested badge — muted gray, never healthy green. */
+.lat-untested { color: var(--muted); }
+/* Last-good latency kept across a failed retest: amber-bordered number. */
+.lat-failed-num { color: var(--warn); border: 1px solid var(--warn); }
+.nb-chev { color: var(--chev); display: flex; }
+
+/* Flag badge: circular emoji flag */
+.nb-flag {
+  width: 32px; height: 32px; flex: 0 0 32px; border-radius: 50%;
+  background: var(--flag-bg); display: inline-flex; align-items: center; justify-content: center;
+  font-size: 19px; overflow: hidden;
+}
+
+/* ---------- Right servers panel (config rail) ----------
+   Sticky header, pill search, one card per profile. Hover only shifts
+   color — no transform — because this rail is also a scroll container
+   and a translating card turns into horizontal scrolling. */
+.nb-servers {
+  width: 320px; flex: 0 0 320px;
+  overflow-y: auto; overflow-x: hidden;
+  padding: 0 12px 14px;
+  display: flex; flex-direction: column; gap: 10px;
+  border-left: 1px solid var(--border);
+  background: var(--sidebar);
+}
+.nb-servers-head {
+  position: sticky; top: 0; z-index: 5;
+  background: var(--sidebar);
+  display: flex; align-items: center; gap: 8px;
+  padding: 16px 0 6px;
+}
+.nb-servers-title {
+  display: inline-flex; align-items: center; gap: 7px;
+  font-weight: 700; font-size: 14px;
+}
+.nb-servers-title > svg { color: var(--muted); }
+.nb-servers-count {
+  margin-left: auto;
+  height: 22px; min-width: 22px; padding: 0 7px;
+  display: inline-flex; align-items: center; justify-content: center;
+  border-radius: 999px; background: var(--accent-soft); color: var(--accent);
+  font-size: 11.5px; font-weight: 700; font-variant-numeric: tabular-nums;
+}
+.nb-search { position: relative; }
+.nb-search > svg {
+  position: absolute; left: 14px; top: 50%; transform: translateY(-50%);
+  color: var(--search-ico); pointer-events: none;
+}
+.nb-search input {
+  width: 100%; height: 36px; background: var(--card); border: 1px solid var(--border);
+  border-radius: 999px; padding: 8px 38px 8px 38px;
+  transition: border-color 0.15s ease, box-shadow 0.15s ease;
+}
+.nb-search input:focus {
+  outline: none; border-color: var(--accent);
+  box-shadow: 0 0 0 3px rgba(99, 102, 241, 0.14);
+}
+.nb-clear {
+  position: absolute; right: 4px; top: 50%; transform: translateY(-50%);
+  width: 28px; height: 28px; min-height: 28px; padding: 0;
+  border-radius: 999px; background: transparent; border-color: transparent;
+  color: var(--muted);
+}
+.nb-clear:hover:not(:disabled) { background: var(--hover); color: var(--fg); }
+.nb-list { display: flex; flex-direction: column; gap: 6px; overflow-y: auto; }
+/* The rail is a fixed-height flex column: the list must own the leftover
+   space and scroll inside it, otherwise it runs under the app-info card
+   pinned at the bottom. */
+.nb-servers .nb-list { flex: 1 1 auto; min-height: 0; }
+.nb-list::-webkit-scrollbar { width: 6px; }
+.nb-list::-webkit-scrollbar-track { background: transparent; }
+.nb-list::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+.nb-empty { text-align: center; color: var(--muted); padding: 24px 0; font-size: 13px; }
+.nb-empty-cat { opacity: 0.6; }
+
+/* Server card */
+/* Children have fixed sizes (flag + caps + test btn + radio ≈ 240px
+   incl. gaps/padding); at the ≤980 panel (250px) that overflows and the
+   radio bleeds off the card edge. Tighter gap and a narrower test
+   button keep the row inside even the 210px rail. */
+.nb-srv {
+  display: flex; align-items: center; gap: 8px; width: 100%;
+  min-height: 60px;
+  background: var(--card); border: 1px solid var(--border); border-radius: 16px;
+  box-shadow: var(--shadow); padding: 9px 10px; text-align: left;
+  transition: border-color 0.12s ease, background 0.12s ease, box-shadow 0.12s ease;
+  cursor: pointer;
+}
+.nb-srv:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+/* Scoped two-class rule: the bare .nb-srv-test { width: 28px } was
+   overruled by the LATER .nb-icon-btn { width: 38px } tie, blew the
+   test button up and pushed the row out of the card. */
+.nb-srv .nb-srv-test {
+  width: 28px; height: 28px; min-width: 28px; min-height: 28px; padding: 0;
+  border-radius: 999px; flex: 0 0 28px;
+  border: 1px solid var(--border); background: transparent; color: var(--muted);
+}
+.nb-srv .nb-srv-test:hover:not(:disabled) {
+  border-color: var(--accent); color: var(--accent); background: var(--accent-soft);
+}
+.nb-spin {
+  width: 16px; height: 16px; flex: 0 0 auto; border-radius: 50%;
+  border: 2px solid var(--border); border-top-color: var(--accent);
+  animation: nb-spin 0.9s linear infinite;
+}
+@keyframes nb-spin { to { transform: rotate(360deg); } }
+/* Busy pulse for status dots/pills; referenced above but never defined,
+   so every busy indicator rendered static. */
+@keyframes adv-dot-pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.35; } }
+.lat-stale { color: var(--muted); }
+.nb-untested { color: var(--muted); font-weight: 500; }
+.nb-srv:hover { border-color: var(--chev); background: var(--hover); }
+.nb-srv.selected {
+  border-color: var(--accent); background: var(--accent-soft);
+  box-shadow: 0 0 0 3px rgba(99, 102, 241, 0.14);
+}
+.nb-srv .meta { flex: 1; min-width: 0; }
+.nb-srv .name-row { display: flex; align-items: center; gap: 6px; min-width: 0; }
+.nb-srv .name-row .name {
+  flex: 0 1 auto; min-width: 0;
+  font-weight: 600; font-size: 13.5px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+/* Pill never shrinks with the name; kill its default left margin (gap). */
+.nb-srv .name-row .nb-active-pill { flex: 0 0 auto; margin-left: 0; }
+.nb-srv .city {
+  color: var(--muted); font-size: 11.5px;
+  font-family: Consolas, monospace;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+/* Square flag chip, scoped to server rows (ConnectionCard keeps the round one). */
+.nb-srv .nb-flag { width: 34px; height: 34px; flex-basis: 34px; border-radius: 11px; font-size: 19px; }
+/* Fixed badge slot: spinner stays centered, rows never shift width.
+   76px fits "● 9999 ms" at 12px; 84px + gaps blew past the 250px rail. */
+.nb-lat-slot { display: inline-flex; align-items: center; justify-content: center; min-width: 76px; }
+.nb-srv .nb-lat { border-radius: 9999px; padding: 2px 9px; font-size: 11.5px; font-weight: 600; }
+.nb-failed { display: inline-flex; align-items: center; }
+.nb-fail-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--danger); margin-right: 6px; }
+.nb-radio {
+  width: 20px; height: 20px; flex: 0 0 20px; border-radius: 7px;
+  border: 1.5px solid var(--gray-btn);
+  display: inline-flex; align-items: center; justify-content: center; color: #fff;
+  transition: border-color 0.12s ease, background 0.12s ease;
+}
+.nb-srv.selected .nb-radio { border-color: var(--accent); background: var(--accent); }
+
+/* App info card */
+.nb-appinfo {
+  display: flex; align-items: center; gap: 12px; width: 100%;
+  height: 60px; flex: 0 0 60px;
+  background: var(--accent-soft); border: 1px solid transparent; border-radius: 16px;
+  padding: 12px 14px; text-align: left; margin-top: auto;
+  transition: border-color 0.12s ease, background 0.12s ease;
+}
+.nb-appinfo:hover { background: var(--appinfo-hover); border-color: var(--accent); }
+.nb-appinfo .nb-chev { color: var(--muted); }
+.nb-appinfo .avatar-img {
+  width: 36px; height: 36px; border-radius: 50%; object-fit: cover;
+}
+.nb-appinfo .meta { flex: 1; }
+.nb-appinfo .t { font-weight: 700; }
+.nb-appinfo .v { color: var(--muted); font-size: 12px; }
+
+/* Generic page card (subscription / about / proxies headers) */
+.nb-page h3 { margin: 0 0 8px; font-size: 16px; }
+
+/* Modal */
+.nb-modal-overlay {
+  position: fixed; inset: 0; z-index: 50;
+  background: rgba(15, 17, 21, 0.45);
+  display: flex; align-items: center; justify-content: center; padding: 24px;
+}
+.nb-modal {
+  width: 560px; max-width: 100%; max-height: 85vh; overflow-y: auto;
+  background: var(--card); border: 1px solid var(--border);
+  border-radius: 14px; box-shadow: var(--shadow-lg);
+  padding: 20px 22px;
+}
+.nb-modal-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 6px; }
+.nb-modal-hint { font-size: 13px; margin: 0 0 10px; }
+.nb-modal-text { width: 100%; resize: vertical; font-family: Consolas, monospace; font-size: 12.5px; }
+.nb-modal-preview { margin-top: 10px; display: flex; flex-direction: column; }
+.nb-modal-name { flex: 1; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.nb-modal-summary { margin-top: 10px; font-weight: 600; color: var(--accent2); }
+.nb-modal-foot { display: flex; gap: 8px; justify-content: flex-end; margin-top: 14px; }
+/* Phase B JSON editor: wider modal, scrolling mono textarea, validation colors. */
+.nb-modal-wide { width: 640px; max-width: calc(100vw - 48px); max-height: 80vh; display: flex; flex-direction: column; }
+.nb-json-text {
+  width: 100%; min-height: 220px; max-height: 46vh; overflow: auto; resize: vertical;
+  font-family: Consolas, monospace; font-size: 12.5px;
+  border-radius: 10px; border: 1px solid var(--border);
+  padding: 10px 12px; background: var(--input);
+}
+.nb-json-bar { display: flex; gap: 8px; align-items: center; margin-top: 8px; font-size: 13px; }
+.nb-json-bar .spacer { flex: 1; }
+.nb-json-valid { color: var(--accent2); font-weight: 600; }
+.nb-json-error { color: var(--danger); }
+.nb-json-backend { margin-top: 8px; font-size: 13px; }
+
+/* Icon button + search row (Win11 glyph buttons: transparent until hover) */
+.nb-icon-btn {
+  flex: 0 0 auto; width: 38px; height: 38px; padding: 0;
+  display: inline-flex; align-items: center; justify-content: center;
+  border-radius: 4px; background: transparent; border-color: transparent;
+}
+.nb-icon-btn:hover:not(:disabled) { background: var(--hover); }
+.nb-icon-btn:disabled { background: transparent; }
+.nb-search-row { display: flex; gap: 6px; align-items: center; }
+.nb-search-row .nb-search { flex: 1; min-width: 0; }
+.nb-search-row .nb-srv-add {
+  width: 36px; height: 36px; min-height: 36px; padding: 0;
+  display: inline-flex; align-items: center; justify-content: center;
+  border-radius: 999px; border: 1px solid var(--border);
+  background: var(--card); color: var(--muted);
+}
+.nb-search-row .nb-srv-add:hover:not(:disabled) {
+  border-color: var(--accent); color: var(--accent); background: var(--accent-soft);
+}
+
+/* Custom select dropdown (theme) */
+.nb-select { position: relative; min-width: 170px; }
+.nb-select-btn { width: 100%; justify-content: flex-start; }
+.nb-select-chev { margin-left: auto; display: flex; color: var(--muted); }
+.nb-select-menu {
+  position: absolute; top: calc(100% + 6px); left: 0; right: 0; z-index: 30;
+  background: var(--card); border: 1px solid var(--border);
+  border-radius: 8px; box-shadow: var(--shadow-lg); padding: 6px;
+  display: flex; flex-direction: column; gap: 2px;
+}
+.nb-select-opt {
+  border: none; background: transparent; min-height: 36px; border-radius: 4px;
+  justify-content: flex-start; padding: 8px 10px;
+}
+.nb-select-opt:hover { background: var(--hover); }
+.nb-select-opt.active { color: var(--accent); font-weight: 600; }
+.nb-select-check { margin-left: auto; display: flex; min-width: 14px; }
+
+/* Custom edit context menu */
+.nb-ctxmenu {
+  position: fixed; z-index: 100; min-width: 170px;
+  background: var(--card); border: 1px solid var(--border);
+  border-radius: 8px; box-shadow: var(--shadow-lg); padding: 6px;
+  display: flex; flex-direction: column; gap: 2px;
+}
+.nb-ctxmenu-item {
+  border: none; background: transparent; min-height: 34px; border-radius: 4px;
+  justify-content: flex-start; padding: 7px 12px; font-size: 13.5px;
+}
+.nb-ctxmenu-item:hover:not(:disabled) { background: var(--hover); }
+
+/* Proxies table */
+.nb-px-toolbar { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-bottom: 12px; }
+.nb-px-toolbar .grow { flex: 1; min-width: 180px; }
+.nb-px-menu-wrap { position: relative; }
+.nb-px-menu {
+  position: absolute; top: calc(100% + 6px); left: 0; z-index: 20;
+  min-width: 200px; background: var(--card); border: 1px solid var(--border);
+  border-radius: 8px; box-shadow: var(--shadow-lg); padding: 6px;
+  display: flex; flex-direction: column;
+}
+.nb-px-menu button {
+  border: none; background: transparent; text-align: left;
+  padding: 8px 10px; border-radius: 4px; font-weight: 500;
+}
+.nb-px-menu button:hover { background: var(--hover); }
+
+/* ---------- Chip-style selection button (PickSelect.vue) ----------
+   Pill trigger + themed popover, used where a native <select> sat in a
+   toolbar (Proxies filters/sort, log level filters). The trigger tints
+   with the accent as soon as it holds a real choice, so an active
+   filter is visible without reading the label. */
+.nb-pick { position: relative; display: inline-flex; }
+.nb-pick-btn {
+  height: 32px; min-height: 32px; padding: 0 10px 0 12px;
+  border-radius: 999px; border: 1px solid var(--border);
+  background: var(--card); color: var(--fg);
+  font-size: 12.5px; font-weight: 600;
+  transition: background 0.15s ease, border-color 0.15s ease, color 0.15s ease;
+}
+.nb-pick-btn:hover:not(:disabled) { border-color: var(--accent); filter: none; }
+.nb-pick-btn:active:not(:disabled) { transform: none; }
+.nb-pick-btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.nb-pick.is-set > .nb-pick-btn {
+  background: var(--accent-soft); border-color: var(--accent); color: var(--accent);
+}
+.nb-pick.is-disabled .nb-pick-btn { opacity: 0.55; cursor: not-allowed; }
+.nb-pick-ico { flex: 0 0 auto; opacity: 0.85; }
+.nb-pick-label {
+  min-width: 0; max-width: 220px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.nb-pick-chev {
+  flex: 0 0 auto; margin-left: 2px; color: var(--muted);
+  transform: rotate(90deg); transition: transform 0.15s ease;
+}
+.nb-pick.is-open .nb-pick-chev { transform: rotate(-90deg); }
+.nb-pick.is-set .nb-pick-chev { color: var(--accent); }
+.nb-pick-menu {
+  position: absolute; top: calc(100% + 6px); left: 0; z-index: 40;
+  /* Pinned, not content-sized: place() predicts the width to decide the
+     flip, and a long label must not grow the menu past that prediction
+     (which is how a picker near the right edge pushed the page into a
+     horizontal scroll). Labels ellipsize instead. */
+  width: max(170px, 100%);
+  max-height: 300px; overflow-y: auto;
+  overscroll-behavior: contain;
+  margin: 0; padding: 6px; list-style: none;
+  background: var(--card); border: 1px solid var(--border);
+  border-radius: 12px; box-shadow: var(--shadow-lg);
+  display: flex; flex-direction: column; gap: 2px;
+}
+.nb-pick.is-up .nb-pick-menu { top: auto; bottom: calc(100% + 6px); }
+.nb-pick.is-flip .nb-pick-menu { left: auto; right: 0; }
+.nb-pick-opt {
+  width: 100%; min-height: 32px; padding: 6px 10px;
+  border: none; border-radius: 8px; background: transparent;
+  color: var(--fg); font-size: 12.5px; font-weight: 500;
+  justify-content: flex-start; gap: 8px; text-align: left;
+}
+.nb-pick-opt:hover, .nb-pick-opt.focused { background: var(--hover); filter: none; }
+.nb-pick-opt:active { transform: none; }
+.nb-pick-opt.active { color: var(--accent); font-weight: 600; }
+.nb-pick-opt-label {
+  flex: 1; min-width: 0;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.nb-pick-check { color: var(--accent); flex: 0 0 auto; }
+/* Form rows: the chip trigger fills the field column like the inputs do,
+   while the popover stays compact instead of spanning the whole column. */
+.form-grid > .nb-pick { display: flex; width: 100%; min-width: 0; }
+.form-grid > .nb-pick > .nb-pick-btn { flex: 1 1 auto; justify-content: flex-start; min-width: 0; }
+
+/* ---------- Toolbar action pills ----------
+   Compact rounded buttons with an icon slot for list toolbars (Test,
+   Delete, Export, refresh actions). Variants keep the semantics: accent
+   = the primary action, accent-soft = the bulk sibling, danger/warn =
+   destructive or interrupting, ghost = clear/reset. */
+.nb-act {
+  height: 30px; min-height: 30px; padding: 0 12px; gap: 6px;
+  border-radius: 999px; border: 1px solid var(--border);
+  background: var(--card); color: var(--fg);
+  font-size: 12.5px; font-weight: 600;
+}
+.nb-act:hover:not(:disabled) {
+  background: var(--hover); border-color: var(--accent); color: var(--accent);
+  transform: translateY(-1px); filter: none;
+}
+.nb-act:active:not(:disabled) { transform: translateY(0); }
+.nb-act--primary { background: var(--accent); border-color: transparent; color: #fff; }
+.nb-act--primary:hover:not(:disabled) {
+  background: var(--tab-active-hover); border-color: transparent; color: #fff;
+}
+.nb-act--accent { background: var(--accent-soft); border-color: var(--accent); color: var(--accent); }
+.nb-act--accent:hover:not(:disabled) {
+  background: var(--accent); border-color: transparent; color: #fff;
+}
+.nb-act--danger { background: var(--danger-soft); border-color: transparent; color: var(--danger); }
+.nb-act--danger:hover:not(:disabled) {
+  background: var(--danger); border-color: transparent; color: #fff;
+}
+.nb-act--warn { background: var(--warn-soft); border-color: transparent; color: var(--warn); }
+.nb-act--warn:hover:not(:disabled) {
+  background: var(--warn-soft); border-color: var(--warn); color: var(--warn);
+}
+.nb-act--ghost { background: transparent; border-color: transparent; color: var(--muted); }
+.nb-act--ghost:hover:not(:disabled) {
+  background: var(--hover); border-color: transparent; color: var(--fg);
+}
+/* Dense rows (connections list, scan results) get a compact pill. */
+.nb-act--sm { height: 26px; min-height: 26px; padding: 0 10px; font-size: 12px; gap: 5px; }
+.nb-px-count {
+  padding: 2px 10px; border: 1px solid var(--border); border-radius: 999px;
+  background: var(--input); font-size: 11.5px; font-weight: 600;
+  white-space: nowrap;
+}
+
+/* Pill fields: text/number inputs that sit next to chip selects keep the
+   same 32px fully-rounded silhouette instead of the stock white box.
+   The :not() chain outranks the global 38px form-control rule in
+   v2rayn-like.css (which also loads first). */
+.form-grid > input:not([type="checkbox"]):not([type="radio"]),
+.nb-sub-add > input:not([type="checkbox"]):not([type="radio"]),
+input.stg-num:not([type="checkbox"]):not([type="radio"]),
+input.stg-text:not([type="checkbox"]):not([type="radio"]) {
+  height: 32px; min-height: 32px;
+  border-radius: 999px; border: 1px solid var(--border);
+  background: var(--card); padding: 0 14px;
+  font-size: 13px; outline: none;
+}
+.form-grid > input:not([type="checkbox"]):not([type="radio"]) {
+  width: 100%; max-width: 220px;
+}
+input.stg-num:not([type="checkbox"]):not([type="radio"]),
+input.stg-text:not([type="checkbox"]):not([type="radio"]) {
+  width: 140px;
+}
+.form-grid > input:not([type="checkbox"]):not([type="radio"]):focus,
+.nb-sub-add > input:not([type="checkbox"]):not([type="radio"]):focus,
+input.stg-num:not([type="checkbox"]):not([type="radio"]):focus,
+input.stg-text:not([type="checkbox"]):not([type="radio"]):focus {
+  outline: none; border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-soft);
+}
+/* Free-standing toolbar/fieldset inputs (URL and cache fields) share the
+   same pill silhouette. */
+input.nb-field:not([type="checkbox"]):not([type="radio"]) {
+  height: 30px; min-height: 30px;
+  border-radius: 999px; border: 1px solid var(--border);
+  background: var(--card); padding: 0 14px;
+  font-size: 13px; outline: none;
+}
+input.nb-field:not([type="checkbox"]):not([type="radio"]):focus {
+  outline: none; border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-soft);
+}
+
+/* Sticky toolbar + filter bar: one visual unit above the card list. */
+.nb-px-toolbar {
+  position: sticky; top: 0; z-index: 5;
+  background: var(--card); padding-top: 2px; padding-bottom: 10px;
+}
+/* The +Add dropdown is trapped inside this toolbar's stacking context
+   (z-20 means nothing once the toolbar itself sits at z-5); the later
+   sticky filters bar painted over its options. Lifting the main
+   toolbar above the filters bar (z 8 > 5) re-raises the whole menu. */
+.nb-px-toolbar--main { z-index: 8; }
+.nb-px-name { font-weight: 600; font-size: 14px; }
+.nb-px-sub { color: var(--muted); font-size: 12px; }
+.nb-px-group { font-weight: 700; font-size: 13px; padding: 12px 6px 8px; color: var(--accent); }
+/* Dense v2rayN-style grid: one shared column template for the header
+   row and every proxy row; grouped sections slice the same grid. */
+.nb-px-grid-head, .nb-px-row {
+  display: grid; align-items: center; gap: 10px;
+  grid-template-columns: 26px minmax(0, 1.7fr) 86px minmax(0, 1.3fr) 104px 116px max-content;
+}
+.nb-px-grid-head {
+  padding: 4px 10px 6px; border-bottom: 1px solid var(--border);
+  color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: 0.04em;
+}
+.nb-px-rows { display: flex; flex-direction: column; }
+.nb-px-row {
+  min-height: 34px; padding: 3px 10px;
+  border-bottom: 1px solid var(--border);
+  border-left: 3px solid transparent;
+  transition: background 120ms ease, border-color 120ms ease;
+}
+.nb-px-row:hover { background: var(--hover); }
+.nb-px-row:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+/* Selected / live rows: accent rail + faint tint (no layout shift). */
+.nb-px-row.selected, .nb-px-row.active { background: var(--accent-soft); border-left-color: var(--accent); }
+/* Failed rows: danger rail + faint danger tint (color-mix, token-only). */
+.nb-px-row.failed { border-left-color: var(--danger); }
+@supports (background: color-mix(in srgb, red 8%, transparent)) {
+  .nb-px-row.failed { background: color-mix(in srgb, var(--danger) 8%, transparent); }
+}
+/* Stale measurements are flagged by the dot + muted latency only;
+   the row itself keeps full contrast (no dimming). */
+/* The open row menu must paint above neighboring rows. */
+.nb-px-row.is-menu-open { position: relative; z-index: 50; }
+.nb-px-row .nb-px-name, .nb-px-row .nb-px-sub { user-select: text; -webkit-user-select: text; }
+.nb-px-remarks { display: flex; align-items: center; gap: 6px; min-width: 0; }
+.nb-px-remarks .nb-px-name {
+  font-size: 13px; font-weight: 600; min-width: 0;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.nb-px-remarks .nb-px-sub { flex: 0 0 auto; }
+.nb-px-remarks .nb-px-flag { font-size: 20px; line-height: 1; flex: 0 0 auto; }
+.nb-px-proto, .nb-px-net {
+  color: var(--muted); font-size: 12px; white-space: nowrap;
+  overflow: hidden; text-overflow: ellipsis;
+}
+.nb-px-addr {
+  font-size: 12.5px; font-variant-numeric: tabular-nums;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.nb-px-check { flex: 0 0 auto; }
+.nb-px-flag { font-size: 28px; line-height: 1; flex: 0 0 auto; }
+.nb-px-lat { display: inline-flex; align-items: center; gap: 6px; min-width: 0; }
+.nb-px-row .nb-px-actions { justify-content: flex-end; }
+.nb-px-row .nb-px-actions .nb-icon-btn { width: 28px; height: 28px; min-height: 28px; }
+/* A config being pinged keeps full contrast: locked row actions and the
+   right-panel test button must not fade out (the latency spinner is the
+   only busy cue; cursor/tooltip still signal the temporary lock). */
+.nb-px-row .nb-px-actions .nb-icon-btn:disabled,
+.nb-srv .nb-srv-test:disabled { opacity: 1; }
+/* The table sits between the sidebar and the server rail, so window width
+   says nothing about how much room it actually has: at a 1176px window the
+   grid is only ~580px wide, and the fr tracks collapsed to ~0 (name
+   invisible, address 0px) while the viewport-based rule stayed out of
+   range. Key the compact layouts off the card's own width instead. */
+.nb-card.nb-px { container-type: inline-size; }
+@container (max-width: 820px) {
+  .nb-px-grid-head, .nb-px-row { grid-template-columns: 26px minmax(0, 1.6fr) minmax(0, 1.3fr) 104px max-content; }
+  .nb-px-grid-head > :nth-child(3), .nb-px-grid-head > :nth-child(5),
+  .nb-px-proto, .nb-px-net { display: none; }
+}
+@container (max-width: 520px) {
+  .nb-px-grid-head, .nb-px-row { grid-template-columns: 26px minmax(0, 1fr) 104px max-content; }
+  .nb-px-grid-head > :nth-child(4), .nb-px-addr { display: none; }
+}
+.nb-stale-dot {
+  display: inline-block; width: 7px; height: 7px; border-radius: 9999px;
+  background: var(--muted);
+}
+.nb-px-actions, .nb-sub-actions { display: flex; gap: 6px; flex: 0 0 auto; align-items: center; }
+/* Glass action buttons: 32px round, bordered, accent tint on hover. */
+.nb-px-actions .nb-icon-btn, .nb-sub-actions .nb-icon-btn {
+  width: 32px; height: 32px; min-height: 32px; padding: 0;
+  border-radius: 9999px; border: 1px solid var(--border);
+  background: transparent;
+}
+.nb-px-actions .nb-icon-btn:hover:not(:disabled),
+.nb-sub-actions .nb-icon-btn:hover:not(:disabled) { background: var(--accent-soft); color: var(--accent); }
+.nb-px-bar {
+  display: flex; gap: 12px; align-items: center; flex-wrap: wrap;
+  margin-top: 12px; padding: 12px 16px;
+  background: var(--card); border: 1px solid var(--border);
+  border-radius: var(--radius);
+  color: var(--muted); font-size: 13px;
+}
+.nb-px-bar .spacer { flex: 1; }
+.nb-page p { color: var(--muted); margin: 6px 0; }
+.nb-kv { display: flex; gap: 8px; align-items: center; padding: 6px 0; border-bottom: 1px solid var(--border); }
+.nb-kv:last-child { border-bottom: none; }
+.nb-kv .k { color: var(--muted); width: 130px; flex: 0 0 130px; }
+
+/* ---------- Settings tab (hero + pill tabs + grouped rows) ---------- */
+.stg { display: flex; flex-direction: column; }
+.stg-hero {
+  position: relative;
+  display: flex; align-items: center; gap: 16px;
+  min-height: 130px; padding: 20px 24px; margin-bottom: 16px;
+  border-radius: 16px;
+  background: linear-gradient(135deg, var(--hero-from), var(--hero-to));
+  box-shadow: var(--shadow);
+  overflow: hidden;
+}
+.stg-hero-chip {
+  width: 64px; height: 64px; flex: 0 0 64px;
+  border-radius: 16px; background: var(--hero-chip);
+  display: flex; align-items: center; justify-content: center;
+  color: var(--hero-gear);
+}
+.stg-hero-text { flex: 1; min-width: 0; }
+.stg-hero-text h2 { margin: 0; font-size: 24px; font-weight: 700; color: var(--hero-fg); }
+.stg-hero-text p { margin: 4px 0 0; font-size: 14px; color: var(--hero-sub); }
+.stg-hero-cloud { position: absolute; top: 14px; right: 150px; color: var(--hero-chip); }
+.stg-hero-cat {
+  position: absolute; right: 24px; top: 50%; transform: translateY(-50%);
+  width: 110px; height: 110px; border-radius: 16px; object-fit: cover;
+}
+.stg-tabs { display: flex; gap: 8px; margin-bottom: 16px; flex-wrap: wrap; }
+.stg-tab {
+  border-radius: 999px; height: 40px; min-height: 40px; padding: 8px 18px;
+  background: transparent; border-color: transparent; color: var(--muted);
+  font-size: 14px;
+  transition: background 0.15s ease, color 0.15s ease;
+}
+.stg-tab:hover { background: var(--hover); }
+.stg-tab.active {
+  background: var(--accent); border-color: transparent;
+  color: #fff; font-weight: 600;
+  box-shadow: var(--shadow);
+}
+.stg-card {
+  background: var(--card); border: 1px solid var(--border);
+  border-radius: 16px; box-shadow: var(--shadow); padding: 20px;
+}
+/* Phase F reset card: red accent border (token only, no literals). */
+.stg-card-danger { border-color: var(--danger); }
+.stg-head { display: flex; align-items: center; gap: 12px; margin-bottom: 12px; }
+.stg-head-chip {
+  width: 44px; height: 44px; flex: 0 0 44px;
+  border-radius: 12px; background: var(--chip-bg);
+  display: flex; align-items: center; justify-content: center;
+  color: var(--chip-fg);
+}
+.stg-head-text { display: flex; flex-direction: column; }
+.stg-head-title { font-size: 16px; font-weight: 600; color: var(--fg); }
+.stg-head-sub { font-size: 12px; color: var(--muted); }
+.stg-row {
+  display: grid; grid-template-columns: 40px minmax(0, 1fr) 140px;
+  gap: 12px; align-items: center; padding: 12px 0;
+}
+.stg-row + .stg-row { border-top: 1px solid var(--row-sep); }
+/* Status variant (SNI tab): no chip icon. One flexible meta column (pill +
+   sub-lines) and one auto column for Stop — a third auto column left the
+   meta text in a max-content track and wrapped it one word per line. */
+.stg-row.stg-row--status { grid-template-columns: minmax(0, 1fr) auto; }
+.stg-row--status .stg-ctl { justify-content: flex-start; flex-wrap: wrap; min-width: 0; }
+.stg-row--status .stg-ctl select { width: auto; max-width: 300px; min-width: 0; }
+.stg-chip {
+  width: 36px; height: 36px;
+  border-radius: 8px; background: var(--chip-bg);
+  display: flex; align-items: center; justify-content: center;
+  color: var(--chip-fg);
+}
+.stg-meta { display: flex; flex-direction: column; min-width: 0; }
+.stg-title { font-size: 14px; font-weight: 500; color: var(--fg); }
+.stg-sub { font-size: 12px; color: var(--muted); }
+.stg-ctl { display: flex; justify-content: flex-end; align-items: center; }
+.stg-toggle {
+  width: 44px; height: 24px; min-height: 24px; padding: 0;
+  border-radius: 999px; border: none; background: var(--tgl-off);
+  position: relative;
+}
+.stg-toggle .knob {
+  position: absolute; top: 3px; left: 3px;
+  width: 18px; height: 18px; border-radius: 50%;
+  background: #fff; box-shadow: 0 1px 3px rgba(0, 0, 0, 0.25);
+  transition: left 0.15s ease;
+}
+.stg-toggle.on { background: var(--tab-active); }
+.stg-toggle.on .knob { left: 23px; }
+/* Icon buttons inside the Settings tab (none currently rendered;
+   kept consistent so future ones match the 10px control scale). */
+.stg .nb-icon-btn {
+  width: 38px; height: 38px; min-height: 38px; padding: 0;
+  border-radius: 10px; background: var(--input);
+}
+.stg .nb-icon-btn:hover:not(:disabled) { background: var(--hover); color: var(--accent); }
+
+/* ---------- Console tab (Traffic + Logs) ---------- */
+.console-tabs { display: flex; gap: 8px; margin-bottom: 16px; flex-wrap: wrap; }
+.console-fill { display: flex; flex-direction: column; flex: 1 1 auto; min-height: 0; }
+.console-fill > .panel { display: flex; flex-direction: column; flex: 1 1 auto; min-height: 0; overflow: hidden; }
+.console-fill .ts-cards, .console-fill .ts-rate { flex: 0 0 auto; }
+.console-tab {
+  display: inline-flex; align-items: center; gap: 8px;
+  border-radius: 999px; min-height: 40px; padding: 8px 18px;
+  background: transparent; border-color: transparent; color: var(--muted);
+  font-size: 14px;
+  transition: background 0.15s ease, color 0.15s ease;
+}
+.console-tab:hover { background: var(--hover); }
+.console-tab.active {
+  background: var(--accent); border-color: transparent;
+  color: #fff; font-weight: 600;
+  box-shadow: var(--shadow);
+}
+/* Phase C Network tools: three stacked cards in the tab scroll area. */
+.net-stack { display: flex; flex-direction: column; gap: 16px; }
+
+/* TrafficStats: summary cards in the Settings card style. */
+.ts-cards { display: flex; gap: 12px; flex-wrap: wrap; }
+.ts-card {
+  flex: 1; min-width: 160px;
+  background: var(--card); border: 1px solid var(--border);
+  border-radius: 14px; padding: 16px; box-shadow: var(--shadow);
+}
+.ts-card .k { color: var(--muted); font-size: 12px; }
+.ts-card .v { font-size: 20px; font-weight: 600; display: flex; align-items: center; gap: 8px; }
+.ts-card .v.up { color: var(--up); }
+.ts-card .v.down { color: var(--down); }
+.ts-dot { width: 10px; height: 10px; border-radius: 50%; background: var(--muted); flex: 0 0 10px; }
+.ts-dot.on { background: var(--accent2); }
+.ts-rate { display: flex; gap: 16px; margin: 12px 0 4px; font-size: 14px; font-weight: 600; }
+.ts-rate .up { color: var(--up); }
+.ts-rate .down { color: var(--down); }
+.ts-rate .idle { color: var(--muted); }
+.ts-tags th.num, .ts-tags td.num { text-align: right; }
+.ts-scroll { flex: 1 1 auto; min-height: 0; overflow: auto; }
+
+/* LogViewer toolbar + level colors. */
+.lv-toolbar { flex-wrap: wrap; flex: 0 0 auto; padding: 0 0 12px; }
+/* Query + include/exclude regex as one pill family: leading glyph, clear
+   affordance. A pattern that does not compile tints the box red and is
+   skipped by the filter (it never breaks the list). */
+.lv-field {
+  position: relative; display: flex; align-items: center;
+  flex: 1 1 140px; min-width: 118px; max-width: 300px;
+}
+.lv-field > svg {
+  position: absolute; left: 12px; color: var(--search-ico); pointer-events: none;
+}
+.lv-field input {
+  width: 100%; height: 32px; min-height: 32px;
+  border-radius: 999px; border: 1px solid var(--border);
+  background: var(--card); padding: 0 30px 0 33px;
+  font-size: 12.5px; outline: none;
+  transition: border-color 0.15s ease, box-shadow 0.15s ease;
+}
+.lv-field input::placeholder { color: var(--muted); }
+.lv-field input:focus {
+  outline: none; border-color: var(--accent);
+  box-shadow: 0 0 0 3px rgba(99, 102, 241, 0.14);
+}
+.lv-field.is-bad input { border-color: var(--danger); }
+.lv-field.is-bad input:focus { box-shadow: 0 0 0 3px var(--danger-soft); }
+.lv-clear {
+  position: absolute; right: 3px; top: 50%; transform: translateY(-50%);
+  width: 24px; height: 24px; min-height: 24px; padding: 0;
+  display: inline-flex; align-items: center; justify-content: center;
+  border-radius: 999px; border: 1px solid transparent; background: transparent;
+  color: var(--muted);
+}
+.lv-clear:hover:not(:disabled) { background: var(--hover); color: var(--fg); }
+.lv-count { margin-left: auto; }
+.lv-box { min-height: 0; flex: 1 1 auto; }
+.lv-box::-webkit-scrollbar { width: 6px; }
+.lv-box::-webkit-scrollbar-track { background: transparent; }
+.lv-box::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+.lv-time { color: var(--muted); }
+.lv-src.lv-error { color: var(--danger); }
+.lv-src.lv-warn { color: var(--warn); }
+.lv-src.lv-info { color: var(--muted); }
+.lv-src.lv-debug { color: var(--chev); }
+
+/* ---------- About tab (identity page) ---------- */
+.about { display: flex; flex-direction: column; gap: 16px; }
+.about-hero {
+  display: flex; align-items: center; gap: 16px;
+  padding: 20px 24px; border-radius: 16px;
+  background: linear-gradient(135deg, var(--hero-from), var(--hero-to));
+  box-shadow: var(--shadow);
+}
+.about-hero-icon { width: 64px; height: 64px; border-radius: 14px; flex: 0 0 64px; }
+.about-hero-text { min-width: 0; }
+.about-hero-text h2 { margin: 0; font-size: 24px; font-weight: 700; color: var(--fg); }
+.about-hero-text p { margin: 4px 0 0; font-size: 14px; color: var(--muted); }
+.about-hero-text .about-version { font-size: 12px; }
+.about-card {
+  background: var(--card); border: 1px solid var(--border);
+  border-radius: 16px; box-shadow: var(--shadow); padding: 20px;
+}
+.about-title { font-size: 16px; font-weight: 600; color: var(--fg); margin-bottom: 12px; }
+.about-link {
+  display: flex; align-items: center; gap: 12px; width: 100%;
+  min-height: 44px; border-radius: 10px; padding: 10px 12px;
+  background: transparent; border-color: transparent; color: var(--fg);
+  font-size: 14px; text-align: left;
+}
+.about-link:hover { background: var(--hover); }
+.about-link-meta { display: flex; flex-direction: column; min-width: 0; flex: 1; }
+.about-link-label { font-size: 14px; }
+.about-link-hint { font-size: 12px; color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.about-link-chev { color: var(--muted); flex: 0 0 auto; }
+.about-credits { margin: 0; padding-left: 20px; font-size: 13px; color: var(--muted); }
+.about-credits li { margin: 2px 0; }
+.about-credit {
+  background: none; border: none; padding: 0; min-height: 0;
+  color: var(--accent); font-size: 13px;
+}
+.about-credit:hover { text-decoration: underline; }
+.about-footer { font-size: 12px; color: var(--muted); margin: 0; }
+
+/* ---------- Updates panel (manual component updates) ---------- */
+.upd { display: flex; flex-direction: column; }
+.upd-top { display: flex; gap: 12px; align-items: center; margin-bottom: 12px; flex-wrap: wrap; }
+.upd-card { margin-bottom: 12px; }
+.upd-card:last-child { margin-bottom: 0; }
+.upd-head { display: flex; gap: 12px; align-items: center; }
+.upd-name { font-size: 15px; font-weight: 600; color: var(--fg); }
+.upd-pill {
+  font-size: 12px; color: var(--muted); background: var(--accent-soft);
+  border-radius: 9999px; padding: 2px 10px; white-space: nowrap;
+  overflow: hidden; text-overflow: ellipsis; max-width: 280px;
+}
+.upd-sub { font-size: 13px; color: var(--muted); margin-top: 6px; }
+.upd-avail { color: var(--accent2); font-weight: 600; }
+.upd-ok { color: var(--accent2); font-weight: 600; }
+.upd-err { color: var(--danger); }
+.upd-actions { display: flex; gap: 8px; align-items: center; margin-top: 10px; }
+
+/* ---------- Phase H: distributed advanced tools ---------- */
+.nb-traffic-chart, .nb-inspector { margin-top: 12px; }
+.nb-chart-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 8px; }
+.nb-chart-legend { display: flex; align-items: center; gap: 6px; color: var(--muted); font-size: 12px; }
+.nb-dot { display: inline-block; width: 8px; height: 8px; border-radius: 9999px; }
+.nb-dot.down { background: var(--accent); }
+.nb-dot.up { background: var(--accent2); }
+.nb-chart-svg { width: 100%; height: 64px; display: block; }
+.nb-chart-svg .nb-line { fill: none; stroke-width: 1.5; }
+.nb-chart-svg .nb-line.down { stroke: var(--accent); }
+.nb-chart-svg .nb-line.up { stroke: var(--accent2); }
+.nb-insp-row { border-top: 1px solid var(--border); padding: 6px 0; }
+.nb-insp-row:first-of-type { border-top: none; }
+.nb-insp-top {
+  border: none; background: transparent; width: 100%;
+  display: flex; gap: 8px; align-items: baseline; text-align: left;
+  padding: 2px 0; cursor: pointer; color: var(--fg);
+}
+.nb-insp-top:hover .nb-px-name { color: var(--accent); }
+.nb-insp-meta { font-size: 12px; color: var(--muted); padding: 4px 0 4px 2px; }
+
+/* ---------- Proxies tab polish (sticky header/footer, overflow menu) ---------- */
+.nb-px-sep-v { width: 1px; align-self: stretch; background: var(--border); margin: 2px 0; }
+.nb-px-msg { margin-bottom: 8px; }
+.nb-empty-icon { color: var(--muted); margin-bottom: 4px; }
+/* Empty state inside a subtle dashed card-like container. */
+.nb-px-empty { border: 1px dashed var(--border); border-radius: var(--radius); padding: 32px 16px; margin: 4px 0; }
+/* Group headers: full-row button look with count pill. */
+.nb-px-group {
+  display: flex; align-items: center; gap: 8px;
+  padding: 10px 6px 6px; border-radius: 8px;
+  font-weight: 700; font-size: 13px; color: var(--accent);
+  cursor: pointer; user-select: none;
+}
+.nb-px-group:hover { background: var(--row-hover); }
+.nb-px-group:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+.nb-px-chev { color: var(--muted); width: 14px; }
+.nb-px-group-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.nb-px-pill {
+  font-size: 11px; font-weight: 600; color: var(--muted);
+  background: var(--accent-soft); border-radius: 9999px; padding: 1px 9px;
+}
+.nb-active-pill {
+  font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.05em;
+  color: var(--accent2); border: 1px solid var(--accent2);
+  border-radius: 9999px; padding: 0 7px; margin-left: 6px; white-space: nowrap;
+}
+/* Primary actions stay inline; the connect button glows when live. */
+.nb-px-actions .nb-icon-btn.is-on { color: var(--accent2); }
+.nb-px-actions .nb-icon-btn.nb-danger:hover:not(:disabled),
+.nb-sub-actions .nb-icon-btn.nb-danger:hover:not(:disabled) { color: var(--danger); }
+/* Overflow menu items: icon + label rows, sub-indent for groups. */
+.nb-px-rowmenu { right: 0; left: auto; }
+/* Hotfix: every menu sub-surface explicitly opaque (same token as the
+   panel) so no card behind can bleed through any item, separator,
+   or padding gap. Backgrounds only — dimensions, spacing, radius,
+   shadow, and stacking are untouched. */
+.nb-px-rowmenu .nb-mi {
+  display: flex; align-items: center; gap: 9px; width: 100%;
+  border: none; background: var(--card); text-align: left;
+  padding: 8px 10px; border-radius: 6px; font-weight: 500;
+  color: var(--fg); cursor: pointer;
+}
+.nb-px-rowmenu .nb-mi:hover:not(:disabled) { background: var(--hover); }
+.nb-px-rowmenu .nb-mi:disabled { opacity: 0.45; cursor: not-allowed; }
+.nb-px-sep { border-top: 1px solid var(--border); margin: 5px 4px; background: var(--card); }
+/* Sticky batch bar: bulk actions stay reachable at the list end. */
+.nb-px-bar {
+  position: sticky; bottom: 0; z-index: 2;
+  background: var(--card); padding-bottom: 4px;
+}
+/* Filter bar: second toolbar row, tighter spacing. */
+.nb-px-filters { margin-top: -4px; }
+/* Subscription tab: add bar + v2rayN-style feed grid (header row +
+   one row per feed; per-row actions in the last column). */
+.nb-sub-add { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-top: 12px; }
+.nb-sub-add .grow { flex: 1; min-width: 200px; }
+.nb-sub-msg { margin-top: 8px; }
+.nb-sub-list { margin-top: 12px; }
+.nb-sub-lead { font-size: 12px; }
+.nb-sub-grid-head, .nb-sub-row {
+  display: grid; align-items: center; gap: 10px;
+  grid-template-columns: 26px minmax(0, 1fr) minmax(0, 1.6fr) 92px 64px minmax(0, 1fr) max-content;
+}
+.nb-sub-grid-head {
+  padding: 4px 10px 6px; border-bottom: 1px solid var(--border);
+  color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: 0.04em;
+}
+.nb-sub-rows { display: flex; flex-direction: column; }
+.nb-sub-row {
+  min-height: 34px; padding: 6px 10px;
+  border-bottom: 1px solid var(--border);
+  transition: background 120ms ease;
+}
+.nb-sub-row:hover { background: var(--hover); }
+/* Disabled feed: dimmed like a paused row; manual actions still work. */
+.nb-sub-row.off { opacity: 0.6; }
+.nb-sub-row.off:hover { opacity: 1; }
+.nb-sub-name {
+  font-weight: 600; font-size: 13px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.nb-sub-cell { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.nb-sub-url {
+  font-size: 12.5px; overflow: hidden; text-overflow: ellipsis;
+  white-space: nowrap; max-width: 100%;
+}
+.nb-sub-note {
+  color: var(--warn); font-size: 11px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.nb-sub-when, .nb-sub-quota, .nb-sub-counts {
+  color: var(--muted); font-size: 12px; font-variant-numeric: tabular-nums;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.nb-sub-counts { text-align: center; }
+.nb-sub-row .nb-sub-actions { justify-content: flex-end; }
+.nb-sub-row .nb-sub-actions .nb-icon-btn { width: 28px; height: 28px; min-height: 28px; }
+.nb-sub-field { display: flex; flex-direction: column; gap: 4px; margin-top: 8px; }
+.nb-sub-field input { width: 100%; }
+@media (max-width: 1000px) {
+  .nb-sub-grid-head, .nb-sub-row { grid-template-columns: 26px minmax(0, 1fr) minmax(0, 1.6fr) 64px max-content; }
+  .nb-sub-grid-head > :nth-child(4), .nb-sub-grid-head > :nth-child(6),
+  .nb-sub-row > :nth-child(4), .nb-sub-row > :nth-child(6) { display: none; }
+}
+/* Thin router splash. */
+.nb-splash {
+  display: flex; flex-direction: column; align-items: center; justify-content: center;
+  gap: 16px; height: 100vh; background: var(--bg); color: var(--muted);
+}
+.nb-splash .nb-logo-img { width: 64px; height: 64px; }
+/* Simple shell wrapper: sidebar column + scrolling center + servers. */
+.nb-simple { display: flex; flex-direction: column; height: 100vh; overflow: hidden; }
+.nb-simple > .nb-shell { height: auto; flex: 1; min-height: 0; }
+/* Shared mode switch: token track, token knob. */
+.adv-switch:focus-visible {
+  outline: 2px solid var(--accent); outline-offset: -2px;
+}
+.adv-switch {
+  width: 32px; height: 18px; min-height: 18px; padding: 2px;
+  border: none; border-radius: 9999px; background: var(--tgl-off);
+  display: inline-flex; align-items: center; cursor: pointer;
+}
+.adv-switch::after {
+  content: ""; width: 14px; height: 14px; border-radius: 9999px;
+  background: var(--card); border: 1px solid var(--border);
+  transition: transform 120ms ease-out;
+}
+.adv-switch.on { background: var(--accent); }
+.adv-switch.on::after { transform: translateX(14px); border-color: transparent; }
+/* Technical values render monospace with aligned numerals. */
+.nb-mono { font-family: ui-monospace, Consolas, monospace; font-size: 12px; font-variant-numeric: tabular-nums; }
+
+/* ---------- Unified client polish (Simple <-> Advanced sync) ----------
+   Both shells stay mounted (v-show) and share one data layer (see
+   stores/sync.ts). No enter animation on purpose: it replayed on
+   every mode switch and read as a flash. Only static affordances. */
+.nb-side-advrow {
+  border: 1px solid transparent;
+  transition: background 120ms ease-out, border-color 120ms ease-out;
+}
+.nb-side-advrow:hover { border-color: var(--border); }
+.nb-side-advrow .adv-switch {
+  box-shadow: inset 0 0 0 1px var(--border);
+}
+.nb-card, .stg-card {
+  transition: box-shadow 150ms ease-out, border-color 150ms ease-out;
+}
+.nb-conn .nb-power-btn:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 3px;
+}
+/* Subscription feed URLs: keep long URLs on one line (Simple feed
+   grid; the rule is generic so Advanced surfaces can reuse it). */
+.nb-sub-url {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 100%;
+}
+/* Per-feed quota bar (Throne parity: subscription progress). Thin
+   token track with an accent fill; width set inline per feed. */
+.nb-quota {
+  display: block;
+  height: 4px;
+  border-radius: 9999px;
+  background: var(--tgl-off);
+  overflow: hidden;
+  max-width: 100%;
+}
+.nb-quota-fill {
+  display: block;
+  height: 100%;
+  border-radius: 9999px;
+  background: var(--accent2);
+}
+
+/* ---------- SNI Spoofing tab (stats tiles, method bars, logs) ---------- */
+.mono { font-family: Consolas, "Cascadia Mono", monospace; }
+.sni-count { color: var(--muted); font-weight: 600; font-size: 12px; margin-left: 4px; }
+/* Starred marker on SNI-tab rows (the engine's primary dial target). */
+.sni-primary-badge {
+  margin-left: 6px; padding: 1px 6px; border-radius: 9999px;
+  border: 1px solid var(--accent2); color: var(--accent2);
+  font-size: 10px; font-weight: 700; letter-spacing: 0.04em;
+  text-transform: uppercase; vertical-align: 1px;
+}
+.sni-toolbar { flex-wrap: wrap; padding: 4px 0 8px; }
+.sni-list-search { flex: 1 1 160px; min-width: 130px; max-width: 260px; }
+.sni-list { max-height: 320px; }
+.sni-more { display: flex; justify-content: center; padding-top: 10px; }
+/* SNI-tab lists: checklist rows — checked = handed to the engine
+   (accent tint), primary = the starred dial target (green rail). */
+.sni-list .stg-row {
+  cursor: pointer; padding: 8px 10px; border-radius: 8px;
+  transition: background 120ms ease;
+}
+.sni-list .stg-row + .stg-row { border-top: none; }
+.sni-list .stg-row:hover { background: var(--hover); }
+.sni-list .stg-row.checked { background: var(--accent-soft); }
+.sni-list .stg-row.primary { box-shadow: inset 3px 0 0 var(--accent2); }
+.sni-list .stg-ctl { gap: 6px; }
+.sni-star svg polygon { fill: none; }
+.sni-star:hover:not(:disabled) svg polygon { fill: currentColor; }
+/* Status card environment readout (endpoint / pins / elevation). */
+.sni-status-grid {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: 6px 14px;
+  margin-top: 12px;
+  padding-top: 12px;
+  border-top: 1px solid var(--row-sep);
+  font-size: 13px;
+}
+.sni-status-k {
+  color: var(--muted); font-size: 11.5px; font-weight: 600;
+  letter-spacing: 0.04em; text-transform: uppercase; padding-top: 2px;
+  white-space: nowrap;
+}
+.sni-status-v {
+  min-width: 0; display: flex; align-items: baseline; gap: 8px;
+  flex-wrap: wrap; overflow-wrap: anywhere;
+}
+.sni-status-sub { color: var(--muted); font-size: 12px; }
+.sni-env-btn { flex: 0 0 auto; }
+/* Psiphon-chain toggle row (label + checkbox). */
+.sni-chain-row {
+  display: flex; align-items: center; gap: 8px;
+  font-size: 13px; font-weight: 600; cursor: pointer;
+}
+.sni-chain-row input { margin: 0; }
+.sni-stat-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  gap: 10px;
+}
+.sni-stat {
+  border: 1px solid var(--border);
+  background: var(--input);
+  border-radius: 10px;
+  padding: 10px 12px;
+  min-width: 0;
+}
+.sni-stat .k {
+  font-size: 11.5px; font-weight: 600; letter-spacing: 0.04em;
+  text-transform: uppercase; color: var(--muted);
+}
+.sni-stat .v {
+  margin-top: 3px; font-size: 16px; font-weight: 700;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.sni-methods { margin-top: 14px; }
+.sni-methods-title {
+  font-size: 12px; font-weight: 600; color: var(--muted);
+  text-transform: uppercase; letter-spacing: 0.04em; margin-bottom: 6px;
+}
+.sni-method {
+  display: grid;
+  grid-template-columns: minmax(90px, 160px) minmax(60px, 1fr) 56px auto;
+  align-items: center; gap: 10px; padding: 6px 0;
+}
+.sni-method + .sni-method { border-top: 1px solid var(--row-sep); }
+.sni-method-name { font-size: 12px; overflow: hidden; text-overflow: ellipsis; }
+.sni-method-rate { font-size: 12px; font-weight: 600; text-align: right; }
+.sni-method-counts { font-size: 12px; color: var(--muted); white-space: nowrap; }
+.sni-log {
+  font-family: Consolas, "Cascadia Mono", monospace; font-size: 12px;
+  background: var(--logbox-bg); color: var(--logbox-fg);
+  border-radius: 10px; padding: 10px 12px; max-height: 320px; overflow: auto;
+  user-select: text; -webkit-user-select: text;
+}
+.sni-log-line { display: flex; gap: 8px; align-items: baseline; padding: 1px 0; }
+.sni-log-time { flex: 0 0 auto; opacity: 0.6; }
+.sni-log-msg { min-width: 0; white-space: pre-wrap; word-break: break-word; }
+.sni-chip {
+  flex: 0 0 auto; min-width: 46px; text-align: center;
+  font-size: 10px; font-weight: 700; letter-spacing: 0.04em; text-transform: uppercase;
+  padding: 1px 6px; border-radius: 6px;
+}
+.sni-chip.info { color: var(--qa-blue-fg); background: var(--qa-blue-bg); }
+.sni-chip.warn { color: var(--warn); background: var(--warn-soft); }
+.sni-chip.error { color: var(--danger); background: var(--danger-soft); }
+.sni-chip.debug { color: var(--muted); background: var(--hover); }
+
+/* ---------- Windowed / narrow-viewport responsiveness ----------
+   Wails MinWidth is 940px, so the layout must stay usable from ~940px
+   up without horizontal scrolling. Strategy: shrink chrome first,
+   then stack content rows, then collapse the sidebar to icons. */
+.nb-center, .nb-servers, .nb-sidebar { min-width: 0; }
+.stg-row { grid-template-columns: 40px minmax(0, 1fr) auto; }
+.stg-ctl { flex-wrap: wrap; min-width: 0; }
+.nb-conn-top, .stg-hero, .stg-head, .sniw-sec-head { flex-wrap: wrap; }
+
+@media (max-width: 1150px) {
+  .nb-sidebar { width: 160px; flex-basis: 160px; }
+  .nb-servers { width: 280px; flex-basis: 280px; }
+  .nb-qa-grid { grid-template-columns: repeat(2, 1fr); }
+  .stg-hero-cat { width: 84px; height: 84px; }
+}
+
+@media (max-width: 980px) {
+  /* Icon-rail sidebar: labels hide, status pill keeps its dot. */
+  .nb-sidebar { width: 64px; flex: 0 0 64px; padding: 14px 8px 10px; align-items: center; }
+  .nb-logo { padding: 0 0 14px; }
+  .nb-logo-text { display: none; }
+  .nb-nav-item { justify-content: center; padding: 10px 0; }
+  .nb-nav-item span:last-child { display: none; }
+  .nb-side-foot { width: 100%; }
+  .nb-side-advrow { justify-content: center; padding: 0; }
+  .nb-side-advlabel { display: none; }
+  .nb-side-status { justify-content: center; padding: 0 6px; }
+  .nb-side-state { display: none; }
+  .nb-servers { width: 250px; flex-basis: 250px; padding: 0 10px 12px; }
+  .nb-servers-head { padding: 14px 0 6px; }
+  /* At this rail width the flag+lat+test+radio fixed set overflows the
+     card (radio bled off the border). The accent border already marks
+     the selection, so drop the redundant radio and reclaim ~26px. */
+  .nb-srv .nb-radio { display: none; }
+  .nb-center { padding: 14px 12px; }
+  .nb-conn-top { flex-wrap: wrap; }
+  .nb-power-btn { width: 72px; height: 72px; flex-basis: 72px; }
+  /* Settings/SNI rows stack controls under the label instead of
+     squeezing them into a 140px column that overflows. */
+  .stg-row { grid-template-columns: 40px minmax(0, 1fr); }
+  .stg-row .stg-ctl { grid-column: 2; justify-content: flex-start; }
+  .stg-row.stg-row--status { grid-template-columns: minmax(0, 1fr) auto; }
+  .stg-head .stg-ctl { flex-wrap: wrap; }
+  .stg-hero-cloud, .stg-hero-cat { display: none; }
+  .stg-hero-text h2 { font-size: 20px; }
+  .nb-sub-add .grow { min-width: 140px; }
+}
+
+@media (max-width: 760px) {
+  .nb-servers { width: 210px; flex-basis: 210px; padding: 0 8px 10px; }
+  .nb-servers-head { padding: 12px 0 6px; }
+  .nb-srv .nb-lat-slot { min-width: 64px; }
+  .nb-card, .stg-card { padding: 14px; }
+  .nb-qa-grid { grid-template-columns: 1fr 1fr; }
+  .ts-cards { flex-direction: column; }
+}

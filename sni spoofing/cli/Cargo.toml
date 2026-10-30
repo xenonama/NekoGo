@@ -1,0 +1,30 @@
+[package]
+name = "sni-spoof"
+version = "2.0.0"
+edition = "2021"
+description = "Standalone core exe (xray.exe role): version / run -c / help, stdout logs, clean signal shutdown"
+
+[[bin]]
+name = "sni-spoof"
+path = "src/main.rs"
+
+[dependencies]
+sni-core = { path = "../core" }
+sni-engine = { path = "../engine-ffi" }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+# FIX(nested-runtime): no async runtime here on purpose (EngineHandle::start owns the
+# only runtime). Unix signals via signal-hook; Windows console events via the
+# already-workspace-pinned windows crate (same pattern as windivert/).
+[target.'cfg(unix)'.dependencies]
+signal-hook = "0.3"
+
+[target.'cfg(windows)'.dependencies]
+windows = { workspace = true, features = ["Win32_Foundation", "Win32_System_Console"] }
+
+# Temporary loopback harness (STEP 3: T4/T5/T6). Integration tests only —
+# never part of the release build (`cargo build` ignores tests/).
+[dev-dependencies]
+tokio = { workspace = true }

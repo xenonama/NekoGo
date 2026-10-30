@@ -1,0 +1,57 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* FIX(design): modern base — Inter, slimmer scrollbar, unified utilities */
+@layer base {
+  html, body, #root { @apply h-full w-full overflow-hidden; }
+  body {
+    @apply bg-bg text-white antialiased;
+    font-family: 'Inter', 'Segoe UI Variable', system-ui, sans-serif;
+    font-feature-settings: 'cv11', 'ss01';
+  }
+  ::-webkit-scrollbar { width: 8px; height: 8px; }
+  ::-webkit-scrollbar-track { background: transparent; }
+  ::-webkit-scrollbar-thumb {
+    background: #1F2530;
+    border-radius: 4px;
+  }
+  ::-webkit-scrollbar-thumb:hover { background: #2A3240; }
+}
+
+@layer components {
+  .btn {
+    @apply inline-flex items-center justify-center gap-2
+           px-3.5 py-2 rounded-lg text-sm font-medium
+           transition-colors duration-150
+           focus:outline-none focus:ring-2 focus:ring-accent/50
+           disabled:opacity-40 disabled:cursor-not-allowed;
+  }
+  .btn-primary {
+    @apply btn bg-accent text-black hover:bg-[#22C6E8] active:bg-[#00A0C2];
+  }
+  .btn-ghost {
+    @apply btn bg-white/5 text-white hover:bg-white/10 active:bg-white/[0.15]
+           border border-white/10;
+  }
+  .btn-danger {
+    @apply btn bg-danger/15 text-danger hover:bg-danger/25
+           border border-danger/30;
+  }
+  .input {
+    @apply w-full px-3 py-2 rounded-lg bg-[#0F1319] border border-[#1F2530]
+           text-sm text-white placeholder:text-[#5C6575]
+           focus:outline-none focus:border-accent/50 focus:ring-2 focus:ring-accent/20
+           transition-colors;
+  }
+  .label {
+    @apply text-[10px] font-semibold uppercase tracking-[0.15em] text-[#5C6575] mb-1.5 block;
+  }
+  /* FIX(layout): slim scrollbar for inner fixed-height containers */
+  .scroll-thin::-webkit-scrollbar { width: 6px; height: 6px; }
+  .scroll-thin::-webkit-scrollbar-thumb {
+    background: #2A3240;
+    border-radius: 3px;
+  }
+  .scroll-thin::-webkit-scrollbar-thumb:hover { background: #3A4252; }
+}

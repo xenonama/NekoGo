@@ -1,0 +1,50 @@
+# Rust
+/target/
+**/target/
+Cargo.lock.bak
+
+# Node
+node_modules/
+**/node_modules/
+frontend/dist/
+gui/frontend/dist/
+
+# Build artifacts
+gui/build/
+gui/build/bin/
+*.exe
+
+# Logs
+*.log
+logs/
+sni_log_*.txt
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Temp
+*.tmp
+*.bak
+~$*
+
+# FIX(pkg): portable ZIP packaging — keep build/dist outputs and local
+# runtime files out of git so `build.bat` artifacts are never committed.
+# Build outputs
+/dist/
+*.syso
+
+# Node
+gui/frontend/node_modules/
+
+# Runtime
+config.json
+log.txt
+audit_report.md

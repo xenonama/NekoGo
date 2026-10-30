@@ -1,0 +1,6 @@
+[submodule "src/3rdparty/qjs"]
+	path = src/3rdparty/qjs
+	url = https://github.com/quickjs-ng/quickjs
+[submodule "src/3rdparty/cpr"]
+	path = src/3rdparty/cpr
+	url = https://github.com/libcpr/cpr

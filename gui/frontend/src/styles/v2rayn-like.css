@@ -1,0 +1,254 @@
+/* NekoBox design system: light default, dark via `:root.dark`.
+   Only the variables below change between themes; components must use
+   var() tokens, never hardcoded colors. */
+:root {
+  color-scheme: light;
+  --bg: #f3f3f3;
+  --card: #ffffff;
+  --sidebar: #f9f9f9;
+  --input: #fdfdfd;
+  --hover: #eef0f6;
+  --row-hover: #f3f4ff;
+  --cur: #f8fafc;
+  --btn-hover: #f6f7fb;
+  --appinfo-hover: #e3e9ff;
+  --tab-active-hover: #5457e8;
+  --fg: #1f2937;
+  --muted: #6b7280;
+  --accent: #6366f1;
+  --accent-soft: #eef2ff;
+  --accent2: #10b981;
+  --warn: #f59e0b;
+  --warn-soft: #fef3c7;
+  --danger: #ef4444;
+  --danger-soft: #fee2e2;
+  --border: #e4e4e4;
+  --border-strong: #8a8a8a;
+  --scroll-thumb: #c6c6c6;
+  --scroll-thumb-hover: #a0a0a0;
+  --gray-btn: #d1d5db;
+  --off-text: #9ca3af;
+  --search-ico: #9ca3af;
+  --chev: #c3c9d4;
+  --flag-bg: #eef2ff;
+  --down: #3b82f6;
+  --up: #ef4444;
+  --qa-blue-bg: #dbeafe;
+  --qa-blue-fg: #2563eb;
+  --qa-green-bg: #d1fae5;
+  --qa-green-fg: #059669;
+  --qa-purple-bg: #ede9fe;
+  --qa-purple-fg: #7c3aed;
+  --qa-pink-bg: #fce7f3;
+  --qa-pink-fg: #db2777;
+  --logbox-bg: #1f2937;
+  --logbox-fg: #e5e7eb;
+  --shadow: 0 1px 3px rgba(16, 24, 40, 0.08), 0 4px 12px rgba(16, 24, 40, 0.06);
+  --shadow-lg: 0 2px 6px rgba(16, 24, 40, 0.1), 0 10px 28px rgba(99, 102, 241, 0.18);
+  --radius: 14px;
+  /* Settings tab tokens (hero gradient, chips, rows, toggles, tabs). */
+  --hero-from: #dbeafe;
+  --hero-to: #eff6ff;
+  --hero-fg: #0f172a;
+  --hero-sub: #64748b;
+  --hero-chip: rgba(255, 255, 255, 0.7);
+  --hero-gear: #3b82f6;
+  --chip-bg: #dbeafe;
+  --chip-fg: #3b82f6;
+  --row-sep: #f1f5f9;
+  --tgl-off: #e5e7eb;
+  --tab-active: #3b82f6;
+}
+
+:root.dark {
+  color-scheme: dark;
+  --bg: #0f1115;
+  --card: #1a1d23;
+  --sidebar: #14171c;
+  --input: #242932;
+  --hover: #232a36;
+  --row-hover: #222839;
+  --cur: #14171c;
+  --btn-hover: #242b38;
+  --appinfo-hover: #2c3350;
+  --tab-active-hover: #6d74f2;
+  --fg: #e5e7eb;
+  --muted: #9ca3af;
+  --accent: #818cf8;
+  --accent-soft: #262c46;
+  --accent2: #34d399;
+  --warn: #fbbf24;
+  --warn-soft: #43320a;
+  --danger: #f87171;
+  --danger-soft: #3f242c;
+  --border: #2a2f38;
+  --border-strong: #5d5d5d;
+  --scroll-thumb: #4d4d4d;
+  --scroll-thumb-hover: #6b6b6b;
+  --gray-btn: #4b5563;
+  --off-text: #6b7280;
+  --search-ico: #6b7280;
+  --chev: #4b5563;
+  --flag-bg: #262c46;
+  --down: #60a5fa;
+  --up: #f87171;
+  --qa-blue-bg: #1e3a5f;
+  --qa-blue-fg: #93c5fd;
+  --qa-green-bg: #123f31;
+  --qa-green-fg: #6ee7b7;
+  --qa-purple-bg: #35295e;
+  --qa-purple-fg: #c4b5fd;
+  --qa-pink-bg: #54283c;
+  --qa-pink-fg: #f9a8d4;
+  --logbox-bg: #0b0d11;
+  --logbox-fg: #d1d5db;
+  --shadow: 0 1px 3px rgba(0, 0, 0, 0.4), 0 4px 12px rgba(0, 0, 0, 0.35);
+  --shadow-lg: 0 2px 6px rgba(0, 0, 0, 0.45), 0 10px 28px rgba(129, 140, 248, 0.25);
+  /* Settings tab tokens (dark variants). */
+  --hero-from: #1e3a8a;
+  --hero-to: #172554;
+  --hero-fg: #f1f5f9;
+  --hero-sub: #94a3b8;
+  --hero-chip: rgba(255, 255, 255, 0.14);
+  --hero-gear: #93c5fd;
+  --chip-bg: #1e3a8a;
+  --chip-fg: #93c5fd;
+  --row-sep: #2a2f38;
+  --tgl-off: #4b5563;
+  --tab-active: #3b82f6;
+}
+
+* { box-sizing: border-box; }
+
+html, body, #app {
+  margin: 0;
+  padding: 0;
+  height: 100%;
+  background: var(--bg);
+  color: var(--fg);
+  font-family: "Segoe UI Variable Text", "Segoe UI Variable", "Segoe UI", system-ui, sans-serif;
+  font-size: 14px;
+  font-weight: 400;
+  /* UI chrome is not selectable (see theme.css for explicit rules). */
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+/* Re-enable selection only for user data, logs and editable fields.
+ * BUG-027: the Proxies grid re-enables its own rows in theme.css
+ * (.nb-px-row .nb-px-name/.nb-px-sub); table.grid covers the legacy
+ * tables. */
+input, textarea, .selectable, table.grid td, .logbox {
+  user-select: text;
+  -webkit-user-select: text;
+}
+
+button, input, select, textarea {
+  font: inherit;
+  color: var(--fg);
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-bottom-color: var(--border-strong);
+  border-radius: 10px;
+  padding: 7px 12px;
+  transition: box-shadow 0.15s ease, background 0.15s ease, transform 0.15s ease, filter 0.15s ease;
+}
+
+/* Form controls (not checkboxes/radios): 38px minimum height. */
+input:not([type="checkbox"]):not([type="radio"]), select, textarea {
+  min-height: 38px;
+}
+
+/* Focus ring: 2px accent with 2px offset on all form controls. */
+input:focus, select:focus, textarea:focus {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+  border-color: var(--accent);
+}
+
+/* Native dropdowns: custom chevron using the Icon.vue 'chevron' path,
+   tinted via currentColor so it follows light/dark themes. */
+select {
+  appearance: none;
+  -webkit-appearance: none;
+  padding-right: 32px;
+  background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='16' height='16' viewBox='0 0 24 24' fill='none' stroke='currentColor' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'><polyline points='9 18 15 12 9 6'/></svg>");
+  background-repeat: no-repeat;
+  background-position: right 10px center;
+  background-size: 16px;
+}
+
+/* Keyboard focus ring for buttons (inputs/selects/textarea are covered above). */
+button:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+/* Native checks follow the app accent in both themes. */
+input[type="checkbox"], input[type="radio"] { accent-color: var(--accent); }
+
+/* Thin Win11-style scrollbars (Chromium/WebView2). */
+::-webkit-scrollbar { width: 10px; height: 10px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb {
+  background: var(--scroll-thumb);
+  border: 3px solid transparent;
+  background-clip: content-box;
+  border-radius: 8px;
+}
+::-webkit-scrollbar-thumb:hover { background: var(--scroll-thumb-hover); border: 2px solid transparent; background-clip: content-box; }
+
+/* Standard buttons: 36px target, 10px radius. */
+button {
+  cursor: pointer;
+  min-height: 36px;
+  padding: 10px 18px;
+  border-radius: 10px;
+  font-weight: 500;
+  font-size: 14px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+}
+button:hover { background: var(--btn-hover); filter: brightness(0.99); }
+button:active { transform: translateY(1px); filter: brightness(0.96); }
+button:disabled { opacity: 0.5; cursor: not-allowed; transform: none; }
+button.primary { background: var(--accent); border-color: transparent; color: #fff; font-weight: 600; }
+button.primary:hover { background: var(--tab-active-hover); filter: none; }
+button.primary:active { filter: brightness(0.92); }
+button.danger { background: var(--danger); border-color: var(--danger); color: #fff; }
+button.danger:hover { filter: brightness(0.95); }
+
+/* Compact buttons (menus, table actions): 32px target. */
+.nb-px-menu button,
+.nb-px-actions .nb-icon-btn {
+  min-height: 32px;
+  padding: 8px 14px;
+  font-size: 13.5px;
+}
+
+table.grid { width: 100%; border-collapse: collapse; }
+table.grid th, table.grid td {
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--border);
+  text-align: left;
+  white-space: nowrap;
+}
+table.grid th { color: var(--muted); font-weight: 600; font-size: 12px; text-transform: uppercase; letter-spacing: 0.04em; }
+table.grid tr:hover td { background: var(--row-hover); }
+table.grid tr.active td { background: var(--accent-soft); }
+
+.toolbar { display: flex; gap: 8px; align-items: center; padding: 10px 12px; }
+.toolbar .spacer { flex: 1; }
+.badge { display: inline-block; padding: 1px 8px; border-radius: 10px; font-size: 12px; background: var(--input); border: 1px solid var(--border); }
+.badge.xray { color: var(--accent); border-color: var(--accent); background: var(--accent-soft); }
+.badge.singbox { color: var(--warn); border-color: var(--warn); background: var(--accent-soft); }
+.badge.on { color: var(--accent2); border-color: var(--accent2); }
+.latency-bad { color: var(--danger); }
+.muted { color: var(--muted); }
+
+/* Legacy layout helpers kept for older views (LogViewer, TrafficStats, ...). */
+.panel { background: var(--card); border-radius: var(--radius); box-shadow: var(--shadow); padding: 16px; overflow: auto; }
+.logbox { font-family: Consolas, monospace; font-size: 12px; background: var(--logbox-bg); color: var(--logbox-fg); padding: 10px; border-radius: 8px; height: 100%; overflow: auto; white-space: pre-wrap; }
+.form-grid { display: grid; grid-template-columns: 150px 1fr; gap: 8px 10px; align-items: center; max-width: 720px; }
