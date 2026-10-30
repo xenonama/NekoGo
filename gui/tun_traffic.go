@@ -25,8 +25,8 @@ const tunTrafficTag = "tun-in"
 
 // tunTraffic turns the adapter's lifetime counters into per-session
 // totals. The counters keep growing across connects because Windows
-// reuses the adapter, so the first sample of a session becomes the
-// baseline and only the growth after it is reported.
+// reuses the adapter, so the session needs a baseline taken at connect
+// (begin); only the growth after it is reported.
 type tunTraffic struct {
 	mu      sync.Mutex
 	based   bool
@@ -34,8 +34,13 @@ type tunTraffic struct {
 	baseOut uint64
 	lastIn  uint64
 	lastOut uint64
-	up      int64
-	down    int64
+	// seed is the byte count already reported for this session by the
+	// engine's counters while the adapter was not readable/sampled yet.
+	// The handoff continues the total instead of restarting it.
+	seedUp   int64
+	seedDown int64
+	up       int64
+	down     int64
 }
 
 // reset starts a new session: the next sample re-baselines.
@@ -45,25 +50,47 @@ func (t *tunTraffic) reset() {
 	t.based = false
 	t.baseIn, t.baseOut = 0, 0
 	t.lastIn, t.lastOut = 0, 0
+	t.seedUp, t.seedDown = 0, 0
+	t.up, t.down = 0, 0
+}
+
+// begin pre-baselines a session on the adapter counters read at
+// connect. Without it the baseline would be the first stats poll, which
+// can land well after the connect: the lifetime counters do not know
+// the session start, so every byte carried in between was dropped and
+// the reported total fell when the adapter reading replaced the
+// engine's fallback.
+func (t *tunTraffic) begin(in, out uint64) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.based = true
+	t.baseIn, t.baseOut = in, out
+	t.lastIn, t.lastOut = in, out
+	t.seedUp, t.seedDown = 0, 0
 	t.up, t.down = 0, 0
 }
 
 // sample folds one adapter reading into the session totals and returns
-// the cumulative uplink/downlink bytes. The first reading (and a
-// counter that went backwards, i.e. a recreated adapter) only sets the
-// baseline.
-func (t *tunTraffic) sample(in, out uint64) (up, down int64) {
+// the cumulative uplink/downlink bytes.
+//
+// An unbased session starts from [seedUp]/[seedDown] (what the engine
+// already reported before the adapter became readable), so the total is
+// continuous across the source handoff. A counter that went backwards
+// means a recreated adapter: the session's own total is kept and the
+// measurement restarts on the new counters.
+func (t *tunTraffic) sample(in, out uint64, seedUp, seedDown int64) (up, down int64) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	if !t.based || in < t.lastIn || out < t.lastOut {
+	if !t.based {
 		t.based = true
 		t.baseIn, t.baseOut = in, out
-		t.lastIn, t.lastOut = in, out
-		t.up, t.down = 0, 0
-		return 0, 0
+		t.seedUp, t.seedDown = seedUp, seedDown
+	} else if in < t.lastIn || out < t.lastOut {
+		t.baseIn, t.baseOut = in, out
+		t.seedUp, t.seedDown = t.up, t.down
 	}
 	t.lastIn, t.lastOut = in, out
-	t.up = int64(out - t.baseOut)
-	t.down = int64(in - t.baseIn)
+	t.up = t.seedUp + int64(out-t.baseOut)
+	t.down = t.seedDown + int64(in-t.baseIn)
 	return t.up, t.down
 }

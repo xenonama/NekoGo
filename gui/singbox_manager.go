@@ -1323,13 +1323,16 @@ func mapProfileToSingBoxOutbound(p *Profile) (map[string]any, error) {
 		addProxyAuth(base, p.IDOrPassword)
 	case "aether":
 		// Aether engine (PattNG parity): the profile's outbound is a
-		// SOCKS connection to the engine's dialed listener. While an
-		// engine runs its published port is used (CoreManager.Start
-		// guarantees it before this renders); when none does the
-		// default engine port is rendered, like PattNG's config export
-		// dials the settings' Aether listen port.
+		// SOCKS connection to the engine's dialed listener. A throwaway
+		// probe pins its own engine port on the profile; otherwise the
+		// live published port is used (CoreManager.Start guarantees it
+		// before this renders), and with no engine at all the default
+		// engine port is rendered, like PattNG's config export dials the
+		// settings' Aether listen port.
 		port := aetherDefaultCommandPort
-		if pCurr, ok := currentAetherActivePort(); ok {
+		if p.AetherEnginePort > 0 {
+			port = p.AetherEnginePort
+		} else if pCurr, ok := currentAetherActivePort(); ok {
 			port = pCurr
 		}
 		base["type"] = "socks"

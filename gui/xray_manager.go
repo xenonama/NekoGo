@@ -864,11 +864,14 @@ func chainXrayProxy(outbound map[string]any) []any {
 func mapProfileToXrayOutbound(p *Profile) (map[string]any, error) {
 	if p.Protocol == "aether" && strings.TrimSpace(p.RawOutbound) == "" {
 		// Aether engine (PattNG parity): a SOCKS outbound dialing the
-		// engine's listener — the live port, or the default engine port
-		// when no engine runs (config export, like PattNG dials the
+		// engine's listener — the port a throwaway probe pinned on the
+		// profile, else the live published port, else the default engine
+		// port when no engine runs (config export, like PattNG dials the
 		// settings' Aether listen port).
 		port := aetherDefaultCommandPort
-		if live, ok := currentAetherActivePort(); ok {
+		if p.AetherEnginePort > 0 {
+			port = p.AetherEnginePort
+		} else if live, ok := currentAetherActivePort(); ok {
 			port = live
 		}
 		return map[string]any{

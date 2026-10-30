@@ -6,7 +6,9 @@ package main
 // hand-written command reading.
 
 import (
+	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -722,16 +724,60 @@ func TestBeginAetherProbeReusesLiveEngine(t *testing.T) {
 	m := &CoreManager{aetherMgr: mgr, running: true, aetherActive: true, activeID: "a1"}
 	setAetherActivePort(55555)
 	defer clearAetherActivePort()
-	restore, err := m.beginAetherProbe(p, DefaultSettings())
+	port, restore, err := m.beginAetherProbe(p, DefaultSettings())
 	if err != nil {
 		t.Fatalf("beginAetherProbe: %v", err)
 	}
-	if port, ok := currentAetherActivePort(); !ok || port != 55555 {
-		t.Fatalf("live engine port replaced: port=%d ok=%v", port, ok)
+	if port != 55555 {
+		t.Fatalf("probe port = %d, want the live engine port 55555", port)
+	}
+	if live, ok := currentAetherActivePort(); !ok || live != 55555 {
+		t.Fatalf("live engine port replaced: port=%d ok=%v", live, ok)
 	}
 	restore()
-	if port, ok := currentAetherActivePort(); !ok || port != 55555 {
-		t.Fatalf("restore dropped the live port: port=%d ok=%v", port, ok)
+	if live, ok := currentAetherActivePort(); !ok || live != 55555 {
+		t.Fatalf("restore dropped the live port: port=%d ok=%v", live, ok)
+	}
+}
+
+// TestBeginAetherProbeRefusesSecondTunnel: testing a different aether
+// profile while a tunnel runs must not open a second one on the same
+// WARP identity (the shared aether work-dir files) — the scan refuses
+// for the same reason.
+func TestBeginAetherProbeRefusesSecondTunnel(t *testing.T) {
+	live := &Profile{ID: "a1", Protocol: "aether", Aether: aetherSettings{Protocol: "wg"}}
+	other := &Profile{ID: "a2", Protocol: "aether", Aether: aetherSettings{Protocol: "wg"}}
+	mgr := NewAetherManager(nil)
+	mgr.mu.Lock()
+	mgr.running = true
+	mgr.mu.Unlock()
+	m := &CoreManager{aetherMgr: mgr, running: true, aetherActive: true, activeID: live.ID}
+	if _, _, err := m.beginAetherProbe(other, DefaultSettings()); err == nil || !strings.Contains(err.Error(), "disconnect the running Aether tunnel") {
+		t.Fatalf("second-tunnel probe err = %v, want the disconnect refusal", err)
+	}
+}
+
+// TestAetherProfilePinnedEnginePort: a probe's profile carries its own
+// engine port, which both config builders render instead of the
+// process-wide live port.
+func TestAetherProfilePinnedEnginePort(t *testing.T) {
+	setAetherActivePort(40123)
+	defer clearAetherActivePort()
+	p := &Profile{Protocol: "aether", Core: CoreSingBox, Name: "probe",
+		Aether: aetherSettings{Protocol: "wg"}, AetherEnginePort: 40999}
+	raw, err := BuildSingBoxConfig(p, DefaultSettings())
+	if err != nil {
+		t.Fatalf("BuildSingBoxConfig: %v", err)
+	}
+	if !strings.Contains(raw, "40999") || strings.Contains(raw, "40123") {
+		t.Fatalf("sing-box outbound did not pin the probe port: %s", raw)
+	}
+	out, err := mapProfileToXrayOutbound(p)
+	if err != nil {
+		t.Fatalf("mapProfileToXrayOutbound: %v", err)
+	}
+	if view := fmt.Sprint(out); !strings.Contains(view, "40999") || strings.Contains(view, "40123") {
+		t.Fatalf("xray outbound did not pin the probe port: %s", view)
 	}
 }
 
@@ -753,6 +799,60 @@ func TestWaitAetherPsiphonTunnelAborts(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "concurrent stop") {
 		t.Fatalf("stale epoch = %v", err)
 	}
+}
+
+// TestAetherReadinessFailureSparesNewerSpawn: a warmup failure stops
+// only the child its own Start spawned. When a newer Start owns the
+// manager by then, the failed probe must leave it alone — the rollback
+// used to call Stop, which ignores the spawn token and killed the newer
+// engine while clearing the port it published.
+func TestAetherReadinessFailureSparesNewerSpawn(t *testing.T) {
+	bin, pidFile := lingerHelperBinary(t)
+	withAetherLingerExe(t, bin)
+	m := NewPsiphonManager(make(chan LogEntry, 512))
+	psiphonPort, err := freePort()
+	if err != nil {
+		t.Fatalf("freePort: %v", err)
+	}
+	upstreamPort, err := freePort()
+	if err != nil {
+		t.Fatalf("freePort: %v", err)
+	}
+	startErr := make(chan error, 1)
+	go func() {
+		_, serr := m.StartPsiphonOnly(DefaultSettings(), psiphonPort, upstreamPort, 1200*time.Millisecond)
+		startErr <- serr
+	}()
+	// The helper never listens, so this Start sits in its warmup probe.
+	pid := waitHelperPID(t, pidFile, 10*time.Second)
+	t.Cleanup(func() { killProcessTree(pid) })
+
+	// A newer spawn replaced this one while its probe was still running.
+	newer := exec.Command(bin)
+	newerJob := newProcJob()
+	m.mu.Lock()
+	m.token++
+	m.cmd = newer
+	m.job = newerJob
+	m.running = true
+	m.mu.Unlock()
+
+	select {
+	case err := <-startErr:
+		if err == nil {
+			t.Fatal("the warmup probe reported success for a non-listening engine")
+		}
+	case <-time.After(15 * time.Second):
+		t.Fatal("the warmup failure did not return")
+	}
+
+	m.mu.Lock()
+	alive, own := m.running, m.cmd == newer
+	m.mu.Unlock()
+	if !alive || !own {
+		t.Fatal("the failed probe rolled back the newer spawn (Stop swallowed a stale token)")
+	}
+	newerJob.close()
 }
 
 // TestStopTokenSparesNewerSpawn: an aborted connect stops only the

@@ -703,7 +703,7 @@ input.nb-field:not([type="checkbox"]):not([type="radio"]):focus {
   font-size: 12.5px; font-variant-numeric: tabular-nums;
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
-.nb-px-check { flex: 0 0 auto; }
+.nb-px-check { flex: 0 0 auto; accent-color: var(--accent); cursor: pointer; }
 .nb-px-flag { font-size: 28px; line-height: 1; flex: 0 0 auto; }
 .nb-px-lat { display: inline-flex; align-items: center; gap: 6px; min-width: 0; }
 .nb-px-row .nb-px-actions { justify-content: flex-end; }

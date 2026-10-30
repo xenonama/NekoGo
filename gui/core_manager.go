@@ -87,6 +87,12 @@ type CoreManager struct {
 	// at zero in TUN mode while the tunnel carries the system.
 	tunActive  bool
 	tunTraffic tunTraffic
+	// tunEngineUp/Down keep the engine's last cumulative reading of this
+	// TUN session. When the adapter only becomes readable after a poll,
+	// the adapter ledger starts from these numbers instead of zero, so
+	// the reported total never falls at the source handoff.
+	tunEngineUp   int64
+	tunEngineDown int64
 }
 
 // Probe owners for EphemeralURLTest scoping.
@@ -430,11 +436,20 @@ func (m *CoreManager) Start(profile *Profile, settings Settings) error {
 }
 
 // setTunSessionLocked records whether this connect renders the TUN
-// inbound and starts a fresh adapter-counter baseline. Callers hold
-// m.mu.
+// inbound and starts a fresh adapter-counter baseline. The baseline is
+// read here, at connect, not on the first stats poll: the adapter's
+// counters are lifetime totals, so a late baseline silently drops every
+// byte carried in between. Callers hold m.mu.
 func (m *CoreManager) setTunSessionLocked(on bool) {
 	m.tunActive = on
 	m.tunTraffic.reset()
+	m.tunEngineUp, m.tunEngineDown = 0, 0
+	if !on {
+		return
+	}
+	if in, out, ok, _ := tunCountersFunc(tunInterfaceName); ok {
+		m.tunTraffic.begin(in, out)
+	}
 }
 
 // waitAetherPsiphonTunnel blocks until the aether engine's Psiphon chain
@@ -891,6 +906,7 @@ func (m *CoreManager) GetStats() (*Stats, error) {
 	running := m.running
 	upstreamActive := m.upstreamActive
 	tunActive := m.tunActive
+	tunSeedUp, tunSeedDown := m.tunEngineUp, m.tunEngineDown
 	singboxMgr := m.singboxMgr
 	xrayMgr := m.xrayMgr
 	spoofMgr := m.spoofMgr
@@ -900,10 +916,28 @@ func (m *CoreManager) GetStats() (*Stats, error) {
 		return &Stats{Running: false, Core: core.String()}, nil
 	}
 	if tunActive {
-		if st := m.tunStats(core, upstreamActive); st != nil {
+		if st := m.tunStats(core, upstreamActive, tunSeedUp, tunSeedDown); st != nil {
 			return st, nil
 		}
 	}
+	st, err := m.engineStats(core, upstreamActive, spoofMgr, xrayMgr, upstreamMgr, singboxMgr)
+	// A TUN session that is still on the engine fallback (the adapter is
+	// not readable yet) remembers that reading: when the adapter takes
+	// over, its ledger starts from it instead of restarting at zero.
+	if tunActive && err == nil && st != nil && st.Running && !st.ApiDown {
+		m.mu.Lock()
+		if m.tunActive {
+			m.tunEngineUp, m.tunEngineDown = st.Uplink, st.Downlink
+		}
+		m.mu.Unlock()
+	}
+	return st, err
+}
+
+// engineStats reports the active engine's own counters: the non-TUN
+// source, and the fallback for a TUN session whose adapter cannot be
+// read (yet).
+func (m *CoreManager) engineStats(core CoreType, upstreamActive bool, spoofMgr *SpoofManager, xrayMgr *XrayManager, upstreamMgr *UpstreamSingBoxManager, singboxMgr *SingBoxManager) (*Stats, error) {
 	if core == CoreSpoof {
 		if spoofMgr == nil {
 			return nil, fmt.Errorf("sni-spoof manager is nil")
@@ -941,12 +975,12 @@ func (m *CoreManager) GetStats() (*Stats, error) {
 // session. nil means "no reading yet": the adapter is not up, has
 // carried nothing this session, or cannot be enumerated — the caller
 // then asks the engine, exactly as before this source existed.
-func (m *CoreManager) tunStats(core CoreType, upstream bool) *Stats {
+func (m *CoreManager) tunStats(core CoreType, upstream bool, seedUp, seedDown int64) *Stats {
 	in, out, ok, _ := tunCountersFunc(tunInterfaceName)
 	if !ok {
 		return nil
 	}
-	up, down := m.tunTraffic.sample(in, out)
+	up, down := m.tunTraffic.sample(in, out, seedUp, seedDown)
 	if up <= 0 && down <= 0 {
 		return nil
 	}
@@ -1040,48 +1074,65 @@ func (m *CoreManager) ProxiedURLTest(url string, timeoutMs int) (*TestResult, er
 }
 
 // beginAetherProbe makes an aether engine available for [profile] and
-// publishes its port for the ephemeral config builders, returning the
-// restore func. Err for profiles that need no engine.
+// returns the engine port the throwaway config must dial, plus the
+// restore func. Port 0 means the profile needs no engine.
 //
 // The live connection's own engine is reused when it runs the same
-// profile (never a second aether.exe for a ping), and its port is left
-// alone. Otherwise one temporary engine runs at a time: aether.exe is
-// the heaviest child, and a Test All used to spawn one per row.
-// A probe never arms the Psiphon chain: it measures the profile itself,
-// and a cold chain would fail every ping.
-func (m *CoreManager) beginAetherProbe(profile *Profile, settings Settings) (func(), error) {
+// profile (never a second aether.exe for a ping), and its published
+// port is left alone. Any other running aether engine shares this
+// app's WARP identity files, so a second tunnel would disturb it:
+// testing another profile then refuses, the same rule the scan follows
+// (AetherScan). Otherwise one temporary engine runs at a time:
+// aether.exe is the heaviest child, and a Test All used to spawn one
+// per row. A probe never arms the Psiphon chain: it measures the
+// profile itself, and a cold chain would fail every ping.
+//
+// The temporary engine's port is handed back to the caller instead of
+// being published process-wide, so a Connect racing the probe can never
+// have its published port replaced or cleared by it.
+func (m *CoreManager) beginAetherProbe(profile *Profile, settings Settings) (int, func(), error) {
 	noRestore := func() {}
 	if !aetherDriverProfile(profile) {
-		return noRestore, nil
+		return 0, noRestore, nil
 	}
 	m.mu.RLock()
 	aetherMgr := m.aetherMgr
-	liveProfile := m.running && m.aetherActive && profile.ID != "" && m.activeID == profile.ID
+	running := m.running
+	aetherActive := m.aetherActive
+	activeID := m.activeID
 	m.mu.RUnlock()
 	if aetherMgr == nil {
-		return noRestore, fmt.Errorf("aether manager not wired")
+		return 0, noRestore, fmt.Errorf("aether manager not wired")
 	}
-	if liveProfile && aetherMgr.Running() {
-		if _, ok := currentAetherActivePort(); ok {
-			return noRestore, nil
+	// The connected profile reuses the live engine. Port() is the
+	// engine's own listener; the published port holds the same value and
+	// is what the live config dials.
+	if running && aetherActive && profile.ID != "" && activeID == profile.ID && aetherMgr.Running() {
+		if p := aetherMgr.Port(); p > 0 {
+			return p, noRestore, nil
 		}
+		if p, ok := currentAetherActivePort(); ok {
+			return p, noRestore, nil
+		}
+		return 0, noRestore, fmt.Errorf("aether engine is running but its listener port is unknown")
+	}
+	// Any other aether engine — a committed aether connect, or one still
+	// warming — shares this app's WARP identity files (aetherWorkDir).
+	// A second tunnel on the same identity disturbs the live session
+	// (the scan refuses for the same reason), so testing another aether
+	// profile has to wait for the disconnect.
+	if aetherMgr.Running() {
+		return 0, noRestore, fmt.Errorf("disconnect the running Aether tunnel before testing another Aether profile")
 	}
 	aetherProbeMu.Lock()
 	tmp := NewAetherManager(nil)
 	port, err := tmp.Start(profile, settings)
 	if err != nil {
 		aetherProbeMu.Unlock()
-		return noRestore, fmt.Errorf("aether probe engine: %w", err)
+		return 0, noRestore, fmt.Errorf("aether probe engine: %w", err)
 	}
-	prev, prevOK := currentAetherActivePort()
-	setAetherActivePort(port)
-	return func() {
+	return port, func() {
 		_ = tmp.Stop()
-		if prevOK {
-			setAetherActivePort(prev)
-		} else {
-			clearAetherActivePort()
-		}
 		aetherProbeMu.Unlock()
 	}, nil
 }
@@ -1226,13 +1277,20 @@ func (m *CoreManager) EphemeralURLTest(profile *Profile, settings Settings, url 
 	timeout := time.Duration(timeoutMs) * time.Millisecond
 	// Aether profiles probe THROUGH their own thrownaway engine: the
 	// ephemeral config dials 127.0.0.1:<engine port>, so a temp engine
-	// runs while the probe does (the live connection is untouched —
-	// its published port is restored after).
-	restoreAether, err := m.beginAetherProbe(profile, settings)
+	// runs while the probe does. The port is pinned on a copy of the
+	// profile, never published, so the live connection's port is not
+	// touched even when a Connect races the probe.
+	aetherPort, restoreAether, err := m.beginAetherProbe(profile, settings)
 	if err != nil {
 		return nil, err
 	}
 	defer restoreAether()
+	probeProfile := profile
+	if aetherPort > 0 {
+		clone := *profile
+		clone.AetherEnginePort = aetherPort
+		probeProfile = &clone
+	}
 
 	m.mu.RLock()
 	xrayMgr, singboxMgr, spoofMgr := m.xrayMgr, m.singboxMgr, m.spoofMgr
@@ -1297,7 +1355,7 @@ func (m *CoreManager) EphemeralURLTest(profile *Profile, settings Settings, url 
 		m.ephProbeAddStop(gen, probe.StopEphemeral)
 		defer probe.StopEphemeral()
 		port, teardown, err := startEphemeralProbe(ctx, prepare, func(mixedPort int) (int, error) {
-			return probe.EphemeralRun(profile, settings, mixedPort)
+			return probe.EphemeralRun(probeProfile, settings, mixedPort)
 		})
 		if teardown != nil {
 			defer teardown()
@@ -1319,7 +1377,7 @@ func (m *CoreManager) EphemeralURLTest(profile *Profile, settings Settings, url 
 	m.ephProbeAddStop(gen, probe.StopEphemeral)
 	defer probe.StopEphemeral()
 	port, teardown, err := startEphemeralProbe(ctx, prepare, func(mixedPort int) (int, error) {
-		return probe.EphemeralRun(profile, settings, mixedPort)
+		return probe.EphemeralRun(probeProfile, settings, mixedPort)
 	})
 	if teardown != nil {
 		defer teardown()

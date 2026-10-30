@@ -109,6 +109,12 @@ type Profile struct {
 	// listener. Typed settings live in Aether, imported PattNG share
 	// links carry the same fields (gui/aether.go).
 	Aether aetherSettings `json:"aether,omitempty"`
+	// AetherEnginePort pins the engine port a throwaway probe core dials.
+	// A probe renders its config against its own temporary engine this
+	// way instead of publishing (and later clearing) the process-wide
+	// live port, so a Connect racing a probe can never have its port
+	// replaced. Never persisted or exposed (json:"-").
+	AetherEnginePort int `json:"-"`
 
 	// Last measured latency in ms (0 = never tested).
 	LastLatency int `json:"lastLatency,omitempty"`

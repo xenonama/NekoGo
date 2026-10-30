@@ -1,9 +1,10 @@
 <!-- Proxies list: v2rayN-style dense grid (Remarks / Protocol / Address /
      Network / Latency columns) with grouped collapsible sections.
-     Single click selects one config (single-select only), double-click
-     or Enter connects, arrows/Home/End navigate, right-click per-row
-     menu. Toolbar: search, + menu, filters, sort, subscription refresh,
-     country refresh. All persistence via backend. -->
+     Click selects one config; Ctrl/Cmd+click toggles a config in the
+     multi-selection, and Delete/Test/Export Selected act on the whole
+     selection. Double-click or Enter connects, arrows/Home/End navigate,
+     right-click per-row menu. Toolbar: search, + menu, filters, sort,
+     subscription refresh, country refresh. All persistence via backend. -->
 <template>
   <div class="nb-card nb-px">
     <div v-if="profiles.profiles.length === 0" class="nb-empty nb-px-empty">
@@ -72,7 +73,7 @@
         <span>Latency</span>
         <span />
       </div>
-      <div class="nb-px-grid" role="listbox" aria-label="Proxy profiles">
+      <div class="nb-px-grid" role="listbox" aria-multiselectable="true" aria-label="Proxy profiles">
         <template v-for="g in visibleGroups" :key="g.name">
         <div
           v-if="g.total > 1"
@@ -105,7 +106,7 @@
             @keydown="onRowKeydown(r.profile, $event)"
             @contextmenu.prevent="openProxyCtx(r.profile, $event)"
           >
-            <input type="radio" class="nb-px-check" :checked="r.selected" :aria-label="`Select ${r.name}`" @click.stop @change="selectOne(r.id)" />
+            <input type="checkbox" class="nb-px-check" :checked="r.selected" :aria-label="`Select ${r.name}`" @click.stop @change="toggleSelect(r.id)" />
             <span class="nb-px-remarks">
               <span class="nb-px-flag">{{ r.flag }}</span>
               <span class="nb-px-name" :title="r.lastTitle">{{ r.name }}</span>
@@ -174,14 +175,14 @@
       <div class="nb-px-bar">
         <span>Total: {{ profiles.profiles.length }}</span>
         <span v-if="hasMoreRows">Showing {{ renderedRowCount }} of {{ flatRows.length }}</span>
-        <span>Selected: {{ selectedId ? 1 : 0 }}</span>
+        <span>Selected: {{ selectedIds.size }}</span>
         <span class="spacer" />
-        <button class="nb-act nb-act--danger" :disabled="!selectedId || busy" @click="deleteSelected"><Icon name="trash" :size="14" />Delete Selected</button>
+        <button class="nb-act nb-act--danger" :disabled="selectedIds.size === 0 || busy" @click="deleteSelected"><Icon name="trash" :size="14" />Delete Selected</button>
         <button class="nb-act nb-act--danger" :disabled="busy || failedCount === 0" :title="`Delete the ${failedCount} profiles whose last test failed`" @click="deleteFailed"><Icon name="trash" :size="14" />Delete Failed ({{ failedCount }})</button>
-        <button class="nb-act nb-act--primary" :disabled="!selectedId || busy" @click="testSelected"><Icon name="bolt" :size="14" />Test Selected</button>
+        <button class="nb-act nb-act--primary" :disabled="selectedIds.size === 0 || busy" @click="testSelected"><Icon name="bolt" :size="14" />Test Selected</button>
         <button v-if="!testAllRunning" class="nb-act nb-act--accent" :disabled="busy || sortedFiltered.length === 0" @click="testAll"><Icon name="bolt" :size="14" />Test All</button>
         <button v-else class="nb-act nb-act--warn" title="Stop the Test All sweep" @click="cancelTestAll"><Icon name="x" :size="14" />Cancel ({{ testAllDone }}/{{ testAllTotal }})</button>
-        <button class="nb-act" :disabled="!selectedId" @click="exportSelected"><Icon name="upload" :size="14" />Export Selected</button>
+        <button class="nb-act" :disabled="selectedIds.size === 0" @click="exportSelected"><Icon name="upload" :size="14" />Export Selected</button>
       </div>
     </template>
     <div v-if="rowCtx.visible" ref="rowCtxMenu" class="nb-ctxmenu" :style="{ left: rowCtx.x + 'px', top: rowCtx.y + 'px' }">
@@ -254,8 +255,10 @@ function clearFilters() {
   fProto.value = ''
   fStatus.value = ''
 }
-// Single-select only (limit 1): one selected config id, empty when none.
-const selectedId = ref<string>('')
+// Multi-select: a plain click selects one row, Ctrl/Cmd+click toggles a
+// row, and the checkbox column toggles without clearing the rest. This
+// set is what Delete/Test/Export Selected act on.
+const selectedIds = ref<Set<string>>(new Set())
 // Collapsed remark groups (subscription feeds) persist in Settings so
 // both a tab switch (this component unmounts) and a restart keep the
 // list folded the way it was left.
@@ -382,6 +385,19 @@ watch(moreSentinel, (el) => {
   sentinelIO.disconnect()
   if (el) sentinelIO.observe(el)
 })
+
+// A subscription refresh or an import can remove profiles behind this
+// view's back; drop the ids that no longer exist so the footer count and
+// the selection actions never act on ghosts.
+watch(
+  () => profiles.profiles.map((p) => p.id).join('\n'),
+  () => {
+    if (selectedIds.value.size === 0) return
+    const live = new Set(profiles.profiles.map((p) => p.id))
+    const next = new Set([...selectedIds.value].filter((id) => live.has(id)))
+    if (next.size !== selectedIds.value.size) selectedIds.value = next
+  },
+)
 onMounted(() => {
   sentinelIO = new IntersectionObserver(
     (entries) => {
@@ -432,7 +448,7 @@ function makeRow(p: Profile, isSingleInGroup: boolean): PxRow {
   const failed = !!profiles.lastError[p.id]
   const failedNoLat = failed && lat < 0
   const stale = staleOf(p.id)
-  const selected = selectedId.value === p.id
+  const selected = selectedIds.value.has(p.id)
   const active = isActive(p.id)
   const spoof = p.core === 2
   const proto = p.protocol.toUpperCase()
@@ -567,14 +583,26 @@ function toggleGroup(name: string) {
 }
 
 function selectOne(id: string) {
-  selectedId.value = id
+  selectedIds.value = new Set([id])
   cursor.value = id
 }
 
-// --- Single-select: single click (or radio) picks the one config;
-// clicking another row moves the selection. No Ctrl/Shift/Ctrl+A
-// multi-select. Arrows/Home/End navigate, Enter (or double-click)
-// connects.
+function toggleSelect(id: string) {
+  const next = new Set(selectedIds.value)
+  if (next.has(id)) next.delete(id)
+  else next.add(id)
+  selectedIds.value = next
+  cursor.value = id
+}
+
+function clearSelection() {
+  selectedIds.value = new Set()
+}
+
+// --- Selection: a plain click (or a keyboard move) selects exactly one
+// config; Ctrl/Cmd+click toggles a config in the selection, so several
+// rows can be tested/deleted/exported together. Arrows/Home/End navigate,
+// Enter (or double-click) connects.
 const cursor = ref('')
 
 function rowEl(id: string): HTMLElement | null {
@@ -599,9 +627,10 @@ function moveCursor(fromId: string, delta: number) {
 function onRowClick(p: Profile, e: MouseEvent) {
   const t = e.target as HTMLElement | null
   if (t?.closest('button,input,select,a,textarea,.nb-px-menu-wrap')) return
-  // Single-select only: any click (with or without modifiers) moves the
-  // one selection to the clicked row.
-  selectOne(p.id)
+  // Ctrl/Cmd+click adds or removes this row; a plain click selects just
+  // this row (keyboard navigation behaves the same way).
+  if (e.ctrlKey || e.metaKey) toggleSelect(p.id)
+  else selectOne(p.id)
 }
 
 function onRowDbl(p: Profile, e: MouseEvent) {
@@ -711,7 +740,11 @@ async function removeOne(id: string) {
   if (!confirm('Delete this profile?')) return
   try {
     await profiles.remove(id)
-    if (selectedId.value === id) selectedId.value = ''
+    if (selectedIds.value.has(id)) {
+      const next = new Set(selectedIds.value)
+      next.delete(id)
+      selectedIds.value = next
+    }
   } catch (e) {
     msg.value = String(e)
   }
@@ -752,16 +785,26 @@ async function runCtxItem(it: RowCtxItem): Promise<void> {
 }
 
 async function deleteSelected() {
-  const id = selectedId.value
-  if (!id) return
-  if (!confirm('Delete the selected profile?')) return
+  const ids = [...selectedIds.value]
+  if (ids.length === 0) return
+  if (!confirm(ids.length === 1 ? 'Delete the selected profile?' : `Delete ${ids.length} selected profiles?`)) return
   busy.value = true
+  const failures: string[] = []
+  let deleted = 0
   try {
-    await profiles.remove(id)
-    selectedId.value = ''
-    msg.value = 'Deleted 1 profile.'
-  } catch (e) {
-    msg.value = String(e)
+    for (const id of ids) {
+      try {
+        await profiles.remove(id)
+        deleted++
+      } catch (e) {
+        failures.push(`${id}: ${e}`)
+      }
+    }
+    clearSelection()
+    msg.value =
+      failures.length === 0
+        ? `Deleted ${deleted} profile${deleted === 1 ? '' : 's'}.`
+        : `Deleted ${deleted}, failed ${failures.length}: ${failures.join('; ')}`
   } finally {
     busy.value = false
   }
@@ -786,7 +829,11 @@ async function deleteFailed() {
       try {
         await profiles.remove(id)
         deleted++
-        if (selectedId.value === id) selectedId.value = ''
+        if (selectedIds.value.has(id)) {
+          const next = new Set(selectedIds.value)
+          next.delete(id)
+          selectedIds.value = next
+        }
       } catch (e) {
         failures.push(`${id}: ${e}`)
       }
@@ -801,20 +848,34 @@ async function deleteFailed() {
 }
 
 async function testSelected() {
-  const id = selectedId.value
-  if (!id) return
+  const ids = [...selectedIds.value]
+  if (ids.length === 0) return
   busy.value = true
-  msg.value = ''
-  try {
-    markTesting(id, true)
-    try {
-      await profiles.test(id)
-    } catch {
-      /* per-row failure is non-fatal, shown via Failed badge */
-    } finally {
-      markTesting(id, false)
+  msg.value = ids.length === 1 ? '' : `Testing 0/${ids.length}…`
+  let done = 0
+  let idx = 0
+  // Same bounded sweep as Test All, over the selection instead of the
+  // filtered list: 5 concurrent probes, per-row spinner, live progress.
+  async function worker() {
+    while (true) {
+      const i = idx++
+      if (i >= ids.length) return
+      const id = ids[i]
+      markTesting(id, true)
+      try {
+        await profiles.test(id)
+      } catch {
+        /* per-row failure is non-fatal, shown via Failed badge */
+      } finally {
+        markTesting(id, false)
+      }
+      done++
+      if (ids.length > 1) msg.value = `Testing ${done}/${ids.length}…`
     }
-    msg.value = 'test done'
+  }
+  try {
+    await Promise.all(Array.from({ length: Math.min(5, ids.length) }, () => worker()))
+    msg.value = ids.length === 1 ? 'test done' : `test done (${ids.length})`
   } finally {
     busy.value = false
   }
@@ -872,7 +933,8 @@ function cancelTestAll() {
 }
 
 function exportSelected() {
-  const rows = profiles.profiles.filter((p) => p.id === selectedId.value)
+  const rows = profiles.profiles.filter((p) => selectedIds.value.has(p.id))
+  if (rows.length === 0) return
   const blob = new Blob([JSON.stringify(rows, null, 2)], { type: 'application/json' })
   const a = document.createElement('a')
   a.href = URL.createObjectURL(blob)

@@ -418,7 +418,10 @@ func (m *AetherManager) runProcess(exe string, args []string, listen int, warmup
 	// during warmup is reported at once with its own last words instead
 	// of after the full timeout (PattN CouldNotStart).
 	if err := m.waitSocksOrExit(listen, warmup, exited, ready); err != nil {
-		m.Stop()
+		// Stop only this spawn: a newer Start may own the manager by now
+		// (its own spawn reaped ours), and a plain Stop would kill it and
+		// clear the state it published.
+		_ = m.StopToken(token)
 		return 0, 0, err
 	}
 	if !m.spawnCurrent(token, cmd) {

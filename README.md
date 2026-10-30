@@ -1,17 +1,13 @@
 # NekoGo
 
-A fork of NekoBox with a completely new GUI (Go + Wails3 + Vue 3), built for Windows with advanced censorship circumvention in mind.
+A fork of NekoBox with a completely new GUI (Go + Wails3 + Vue 3).
 
 ## Tech stack
 
-- **Backend:** Go with a JSON config store (no database), using Wails3 to expose a bound `NekoGo` service to the frontend.
-- **Frontend:** Vue 3 + TypeScript with Pinia stores and Vite builds.
-- **Engines (Cores):**
-  - **sing-box** (via `nekobox_core.exe` with Thrift RPC) — the default, custom-patched engine with extra protocols.
-  - **Upstream sing-box** (optional CLI) — uses the official SagerNet binary via Clash API.
-  - **Xray-core** (`xray.exe`) — used for specific protocols (e.g., REALITY).
-  - **Aether** (`aether.exe`) — Rust-based WARP engine (MASQUE, WireGuard, Tor, Psiphon).
-  - **SNI Spoofing** (`sni-spoof.exe`) — Rust-based DPI bypass engine.
+- Go backend with a JSON config store (no database).
+- Wails3 wrapper exposing a bound `NekoGo` service to the frontend.
+- Vue 3 + TypeScript frontend with Pinia stores and Vite builds.
+- Cores: sing-box (Thrift RPC via `nekobox_core`) + Xray (gRPC stats).
 
 ## Supported protocols
 
@@ -35,56 +31,28 @@ A fork of NekoBox with a completely new GUI (Go + Wails3 + Vue 3), built for Win
 - VLESS
 - VMess
 - WireGuard
-- **Aether** (MASQUE, WireGuard, gool, mim)
-- **SNI Spoofing** (Trojan / VLESS via DPI bypass)
-
-## Key features
-
-- **Custom DPI bypass:** First-class SNI Spoofing engine with built-in scanner, IP/SNI lists, and front-layer integration.
-- **Aether integration:** Full Aether core support with scanning, SOCKS5 proxy, and Tor/Psiphon chaining.
-- **Upstream core option:** Switch between the custom `nekobox_core` (full features) and the official sing-box CLI (via Clash API) in Advanced Settings.
-- **TUN mode:** Full system-wide tunneling (requires Administrator privileges).
-- **Modern UI:** Simple and Advanced modes, with a fully custom title bar.
-- **GeoIP:** Country detection using the GeoLite2-Country database.
-- **Subscription management:** Feed parsing, deduplication, per-feed enable/disable, and quota tracking.
 
 ## Build
 
 Run `build.bat` on Windows 10/11 x64.
 
-**Requirements:**
-- Go 1.25+
-- Node.js 20+
-- Wails3
-- Rust (for the SNI Spoofing engine)
-- MinGW (for cgo)
-- NSIS (optional, for the installer)
+Requirements: Go 1.25+, Node.js 20+, Wails3, MinGW, NSIS optional.
 
-**Output:**
-- `gui/build/bin/nekogo.exe`
-- `gui/build/bin/nekobox_core.exe`
-- `gui/build/bin/xray.exe`
-- `gui/build/bin/sni-spoof.exe`
-- `gui/build/bin/aether.exe` (optional)
-- `dist/*.zip` (portable)
-- `dist/*.exe` (installer)
+Output: `gui/build/bin/nekogo.exe` + `nekobox_core.exe` + `xray.exe`; `dist/*.zip` and `dist/*.exe`.
 
 ## Credits
 
-- [patterniha/PattNG](https://github.com/patterniha/PattNG) — Android Kotlin reference for Aether and advanced patterns.
-- [patterniha/PattN](https://github.com/patterniha/PattN) — Windows C# reference for backend patterns.
-- [CluvexStudio/Aether](https://github.com/CluvexStudio/Aether) — Rust WARP engine.
-- [qr243vbi/nekobox](https://github.com/qr243vbi/nekobox)
+- [starifly/NekoBoxForAndroid](https://github.com/starifly/NekoBoxForAndroid)
 - [Thrift](https://thrift.apache.org/)
 - [enfein/mieru](https://github.com/enfein/mieru)
 - [SagerNet/sing-box](https://github.com/SagerNet/sing-box)
-- [XTLS/Xray-core](https://github.com/XTLS/Xray-core)
+- [Xray-core](https://github.com/XTLS/Xray-core)
 - [go](https://go.dev/)
 - [Wails](https://wails.io/)
 - [Vue](https://vuejs.org/)
 - [protorpc](https://github.com/chai2010/protorpc)
 - [simple-protobuf](https://github.com/tonda-kriz/simple-protobuf)
-- [quickjs-ng](https://github.com/quickjs-ng/quickjs)
+- [quickjs-ng](https://quickjs-ng.github.io/quickjs)
 - [Open Build Service](https://openbuildservice.org/)
 - [Github](https://github.com)
 - [go-legacy-win7](https://github.com/thongtech/go-legacy-win7)

@@ -1,0 +1,13 @@
+﻿SRC=C:\Users\pc\Desktop\nekobox-main\source
+REPO=https://github.com/xenonama/NekoGo.git
+EXDIRS=.git,source,dist,node_modules,build,bin,target
+EXFILES=*.exe,*.dll,*.sys,*.syso,*.log,*.tmp,*.zip,*.pdb,*.map
+MSG=NekoGo: Update source
+DRY=0
+INC=0
+FORCE=0
+PROGRESS=1
+NETCHECK=1
+BROWSER=0
+PROXY_ON=0
+PROXY_URL=socks5://127.0.0.1:1080
