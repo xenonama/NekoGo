@@ -74,7 +74,7 @@ Run `build.bat` on Windows 10/11 x64.
 - [patterniha/PattNG](https://github.com/patterniha/PattNG) — Android Kotlin reference for Aether and advanced patterns.
 - [patterniha/PattN](https://github.com/patterniha/PattN) — Windows C# reference for backend patterns.
 - [CluvexStudio/Aether](https://github.com/CluvexStudio/Aether) — Rust WARP engine.
-- [qr243vbi/nekobox]((https://github.com/qr243vbi/nekobox)
+- [qr243vbi/nekobox](https://github.com/qr243vbi/nekobox)
 - [Thrift](https://thrift.apache.org/)
 - [enfein/mieru](https://github.com/enfein/mieru)
 - [SagerNet/sing-box](https://github.com/SagerNet/sing-box)
