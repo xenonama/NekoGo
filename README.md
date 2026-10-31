@@ -42,7 +42,7 @@ Output: `gui/build/bin/nekogo.exe` + `nekobox_core.exe` + `xray.exe`; `dist/*.zi
 
 ## Credits
 
-- [starifly/NekoBoxForAndroid](https://github.com/starifly/NekoBoxForAndroid)
+- [qr243vbi/nekobox](https://github.com/qr243vbi/nekobox)
 - [Thrift](https://thrift.apache.org/)
 - [enfein/mieru](https://github.com/enfein/mieru)
 - [SagerNet/sing-box](https://github.com/SagerNet/sing-box)
