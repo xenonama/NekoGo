@@ -68,6 +68,53 @@ func migrateCorePathSplit(s *Settings) {
 	s.CorePath = ""
 }
 
+// migrateEmptyCoreOverrides drops stored section overrides that hold
+// nothing ({} or []). mergeCoreOverrides skips those, so this is not what
+// keeps a connect alive — it is about not leaving a lie in the file: the
+// section editor reads a stored {} back as an override and shows it as
+// though the user had configured something. In-memory only; persisted on
+// the next save, like migrateCorePathSplit.
+func migrateEmptyCoreOverrides(s *Settings) bool {
+	changed := false
+	for sec, raw := range s.CoreOverrides {
+		var v any
+		if err := json.Unmarshal(raw, &v); err != nil {
+			continue
+		}
+		if isEmptyOverride(v) {
+			delete(s.CoreOverrides, sec)
+			changed = true
+		}
+	}
+	return changed
+}
+
+// migrateDNSServers drops saved DNS upstreams the current parser
+// rejects. A value written before the plain-text shapes were accepted
+// (or by an older, looser validator) would otherwise be persisted
+// forever and fail every Connect with the same error, with no way for
+// the user to see which field caused it. Reset means "system default",
+// which always starts. Returns true when anything changed.
+func migrateDNSServers(s *Settings) bool {
+	changed := false
+	for _, side := range []struct {
+		name  string
+		value *string
+	}{{"DnsRemote", &s.DnsRemote}, {"DnsDirect", &s.DnsDirect}} {
+		v := strings.TrimSpace(*side.value)
+		*side.value = v
+		if v == "" {
+			continue
+		}
+		if err := validateDNSServer(v); err != nil {
+			log.Printf("[config] invalid %s %q, resetting to empty", side.name, v)
+			*side.value = ""
+			changed = true
+		}
+	}
+	return changed
+}
+
 // ConfigStore loads/saves profiles and settings as JSON. It replaces the
 // old Qt/RocksDB datastore (src/nekobox/dataStore) which required C++.
 type ConfigStore struct {
@@ -125,6 +172,17 @@ func NewConfigStore(dir string) (*ConfigStore, error) {
 		}
 		migrateLegacyAetherPath(&c.settings, data)
 		migrateCorePathSplit(&c.settings)
+		// One-time: a saved DNS upstream the parser rejects would fail
+		// every Connect, so it is reset (and the reset written back, or
+		// the same error line would print on every launch). Same for an
+		// empty section override, which used to delete the rendered block.
+		dnsMigrated := migrateDNSServers(&c.settings)
+		overridesMigrated := migrateEmptyCoreOverrides(&c.settings)
+		if (dnsMigrated || overridesMigrated) && loaded {
+			if err := c.saveLocked(); err != nil {
+				log.Printf("[config] settings migration: save failed: %v", err)
+			}
+		}
 		if c.profiles == nil {
 			c.profiles = []Profile{}
 		}
@@ -495,6 +553,13 @@ func (c *ConfigStore) GetSettings() Settings {
 	// empty string so the settings select and the tray never read blank.
 	if s.CoreEngine == "" {
 		s.CoreEngine = "custom"
+	}
+	// SNI spoofing defaults to ON; configs written before the toggle
+	// existed omit the field. Report the effective value so the UI and
+	// every caller can treat it as a plain bool.
+	if s.SpoofEnabled == nil {
+		v := true
+		s.SpoofEnabled = &v
 	}
 	// CoreOverrides is a map: the struct copy above still aliases the
 	// live one, and callers (Advanced editors, exports) must never be

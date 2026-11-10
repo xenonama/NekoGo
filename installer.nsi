@@ -6,8 +6,10 @@
 
 Unicode true
 
+; Fallback for a bare `makensis installer.nsi`; build.bat always passes
+; /DAPP_VERSION from the VERSION file, so keep this in step with it.
 !ifndef APP_VERSION
-  !define APP_VERSION "1.0.0-beta.1"
+  !define APP_VERSION "1.0.0-beta.3"
 !endif
 ; VIProductVersion only accepts 4 plain numbers; build.bat derives this
 ; from the version tag ("1.0.0-beta.1" -> "1.0.0.0").
@@ -123,6 +125,8 @@ Section "Install"
   File /nonfatal "${PORTABLE_STAGE}\bin\aether.exe"
   ; Official sing-box CLI (optional; Upstream core engine)
   File /nonfatal "${PORTABLE_STAGE}\bin\sing-box.exe"
+  ; mihomo / Clash Meta (optional; the mihomo core)
+  File /nonfatal "${PORTABLE_STAGE}\bin\mihomo.exe"
   ; WinDivert is loaded by the engines, so it lives in bin\ next to them.
   File /nonfatal "${PORTABLE_STAGE}\bin\WinDivert.dll"
   File /nonfatal "${PORTABLE_STAGE}\bin\WinDivert64.sys"
@@ -172,6 +176,7 @@ Section "Uninstall"
   Delete "$INSTDIR\nekogo.exe"
   Delete "$INSTDIR\bin\nekobox_core.exe"
   Delete "$INSTDIR\bin\sing-box.exe"
+  Delete "$INSTDIR\bin\mihomo.exe"
   Delete "$INSTDIR\bin\xray.exe"
   Delete "$INSTDIR\bin\sni-spoof.exe"
   Delete "$INSTDIR\bin\aether.exe"
@@ -185,6 +190,7 @@ Section "Uninstall"
   ; Legacy (pre-bin) engine layout, in case this install upgraded one.
   Delete "$INSTDIR\nekobox_core.exe"
   Delete "$INSTDIR\sing-box.exe"
+  Delete "$INSTDIR\mihomo.exe"
   Delete "$INSTDIR\xray.exe"
   Delete "$INSTDIR\sni-spoof.exe"
   Delete "$INSTDIR\aether.exe"

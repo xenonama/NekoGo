@@ -98,7 +98,7 @@ const maxDownloadBytes = 512 << 20
 
 // UpdatableComponent is one row of the Updates panel.
 type UpdatableComponent struct {
-	ID          string `json:"id"` // "geoip" | "geosite" | "singbox" | "nekobox" | "xray" | "gui"
+	ID          string `json:"id"` // "geoip" | "geosite" | "singbox" | "nekobox" | "xray" | "mihomo" | "gui"
 	Name        string `json:"name"`
 	Current     string `json:"current"`
 	Latest      string `json:"latest"`
@@ -113,8 +113,9 @@ type UpdatableComponent struct {
 }
 
 // updatableIDs are the fixed rows. "singbox" is the official CLI
-// (upstream engine); "nekobox" is the Thrift core (custom engine).
-var updatableIDs = []string{"geoip", "geosite", "singbox", "nekobox", "xray", "gui"}
+// (upstream engine); "nekobox" is the Thrift core (custom engine);
+// "mihomo" is the Clash Meta engine.
+var updatableIDs = []string{"geoip", "geosite", "singbox", "nekobox", "xray", "mihomo", "gui"}
 
 // --- local state (no network) ---
 
@@ -213,12 +214,14 @@ func (a *App) localUpdatables() []UpdatableComponent {
 	}
 	nbCurrent, nbNote := a.coreDisplayVersion("nekobox", a.CoreVersion())
 	xrCurrent, xrNote := a.coreDisplayVersion("xray", a.XrayVersion())
+	mhCurrent, mhNote := a.coreDisplayVersion("mihomo", a.MihomoVersion())
 	out := []UpdatableComponent{
 		{ID: "geoip", Name: "GeoIP Database", Current: dataFileCurrent(geoPath)},
 		{ID: "geosite", Name: "GeoSite Rule-set", Current: dataFileCurrent(geoSitePath)},
 		{ID: "singbox", Name: "sing-box Core (official)", Current: sbCurrent, Notes: sbNote},
 		{ID: "nekobox", Name: "NekoBox Core (nekobox_core)", Current: nbCurrent, Notes: nbNote},
 		{ID: "xray", Name: "Xray Core", Current: xrCurrent, Notes: xrNote},
+		{ID: "mihomo", Name: "mihomo Core (Clash Meta)", Current: mhCurrent, Notes: mhNote},
 		{ID: "gui", Name: "NekoGo GUI", Current: appVersion},
 	}
 	if _, err := os.Stat(geoPath); err != nil {
@@ -265,12 +268,26 @@ type ghAsset struct {
 	Name               string `json:"name"`
 	BrowserDownloadURL string `json:"browser_download_url"`
 	Size               int64  `json:"size"`
+	// Digest is GitHub's published "sha256:<64 hex>" for the asset.
+	// Measured present on SagerNet/sing-box, MetaCubeX/mihomo and
+	// Loyalsoldier/v2ray-rules-dat; absent on older releases and on
+	// assets GitHub never hashed, so every reader must tolerate "".
+	Digest string `json:"digest"`
 }
 
 type ghRelease struct {
 	TagName string    `json:"tag_name"`
 	Name    string    `json:"name"`
 	Assets  []ghAsset `json:"assets"`
+}
+
+// releaseLookup is one GitHub release lookup shared by every row that
+// reads the same repo. CheckUpdates fills these before starting its
+// goroutines, so the rows only read them.
+type releaseLookup struct {
+	repo string
+	rel  *ghRelease
+	err  error
 }
 
 func updateGet(url string) (*http.Response, error) {
@@ -321,6 +338,7 @@ func githubLatest(ownerRepo string) (*ghRelease, error) {
 //	| singbox   | SagerNet/sing-box     | sing-box-<ver>-windows-<arch>.zip    | resolveUpstreamCore path, else exe dir |
 //	| nekobox   | xenonama/NekoGo       | nekobox_core.exe (or .zip holding it) | resolved core path, else exe dir |
 //	| xray      | xenonama/NekoGo       | xray.exe (or .zip holding it)         | resolved xray path, else exe dir |
+//	| mihomo    | MetaCubeX/mihomo      | mihomo-windows-<arch>[-v1]-v<ver>.zip | resolved mihomo path, else exe dir\bin\mihomo.exe |
 //	| gui       | xenonama/NekoGo       | NekoGo-Setup-*.exe / NekoGo-Portable-*.zip | %APPDATA%/NekoGo/updates/ (manual open via Open installer button; never auto-opened) |
 //	| geoip     | Loyalsoldier/geoip    | Country.mmdb (@release)              | gui/assets/GeoLite2-Country.mmdb |
 //	| geosite   | Loyalsoldier/v2ray-rules-dat | geosite.dat                     | gui/assets/geosite.dat |
@@ -338,6 +356,40 @@ const officialSingBoxOwnerRepo = "SagerNet/sing-box"
 // A dedicated core repo is planned; until it exists the fork's app
 // releases carry the binaries, so this points at the same repo.
 const nekoCoreOwnerRepo = forkOwnerRepo
+
+// mihomoOwnerRepo publishes the Clash Meta engine. Its STABLE release is
+// the source: the newest entry in /releases is the rolling
+// "Prerelease-Alpha" tag (measured 2026-11-07), which is not a version
+// and would make updateNeeded offer the same alpha forever.
+const mihomoOwnerRepo = "MetaCubeX/mihomo"
+
+// mihomoAsset picks the Windows archive for this arch from a stable
+// mihomo release, anchored to the exact name build.bat fetches. The
+// v1.19.33 release ships 31 Windows archives whose names all contain
+// "windows-amd64": -compatible (legacy CPU build), -go120..-go125 (old
+// toolchains), -v2/-v3 (newer instruction sets that will not start on
+// every machine NekoGo ships to) and a plain amd64 build. A substring
+// match takes whichever sorts first, so the name is constructed
+// instead. The GOAMD64=v1 asset is the baseline x86-64 build.
+//
+// Other platforms ship .gz, which the in-place installer does not
+// unpack — those stay on the manual note like the official sing-box.
+func mihomoAsset(assets []ghAsset, tag string) *ghAsset {
+	if runtime.GOOS != "windows" {
+		return nil
+	}
+	level := ""
+	if runtime.GOARCH == "amd64" {
+		level = "-v1"
+	}
+	want := strings.ToLower("mihomo-windows-" + runtime.GOARCH + level + "-v" + normTag(tag) + ".zip")
+	for i := range assets {
+		if strings.ToLower(assets[i].Name) == want {
+			return &assets[i]
+		}
+	}
+	return nil
+}
 
 // pickForkAsset selects a fork-published core binary asset: either the
 // raw "<exeBase>.exe" (or bare "<exeBase>" on non-Windows), or a
@@ -396,13 +448,18 @@ func githubFirstRelease(ownerRepo string) (*ghRelease, error) {
 	return &rels[0], nil
 }
 
-func pickNamed(assets []ghAsset, substrs ...string) *ghAsset {
+// pickAssetExact selects the asset whose name matches exactly (case
+// folded). The geosite release ships geosite.dat AND
+// geosite.dat.sha256sum: a substring match takes whichever GitHub lists
+// first, and asset order is upload order, not a contract. Picking the
+// .sha256sum would install a 64-byte text file as the rule-set — and
+// its own published digest would verify, so nothing downstream would
+// notice.
+func pickAssetExact(assets []ghAsset, name string) *ghAsset {
+	want := strings.ToLower(name)
 	for i := range assets {
-		n := strings.ToLower(assets[i].Name)
-		for _, s := range substrs {
-			if strings.Contains(n, strings.ToLower(s)) {
-				return &assets[i]
-			}
+		if strings.ToLower(assets[i].Name) == want {
+			return &assets[i]
 		}
 	}
 	return nil
@@ -480,6 +537,96 @@ func updateNeeded(current, latest string) bool {
 	// Same numeric version: a prerelease sorts before the plain release
 	// (1.0.0-beta.1 < 1.0.0), two prereleases compare identifier-wise.
 	return comparePrerelease(cpre, lpre) < 0
+}
+
+// assetSHA256 returns the lowercase hex sha256 GitHub published for an
+// asset, "" when it published none (or used another algorithm).
+func assetSHA256(asset *ghAsset) string {
+	if asset == nil {
+		return ""
+	}
+	d := strings.TrimSpace(asset.Digest)
+	if !strings.HasPrefix(strings.ToLower(d), "sha256:") {
+		return ""
+	}
+	hexPart := strings.ToLower(strings.TrimSpace(d[len("sha256:"):]))
+	if len(hexPart) != sha256.Size*2 {
+		return ""
+	}
+	for _, r := range hexPart {
+		if !strings.ContainsRune("0123456789abcdef", r) {
+			return ""
+		}
+	}
+	return hexPart
+}
+
+// verifyDigest checks downloaded bytes against a published sha256
+// BEFORE anything is extracted or installed. An empty digest means the
+// source publishes none (jsDelivr's GeoIP copy, the fork's own assets):
+// the download is accepted over HTTPS alone and the log says so, rather
+// than pretending it was verified.
+func (a *App) verifyDigest(id, name, digest string, data []byte) error {
+	want := assetSHA256(&ghAsset{Digest: digest})
+	if want == "" {
+		a.updateLog(id, "warn", "[update:"+id+"] "+name+" publishes no sha256 digest — trusted over HTTPS only")
+		return nil
+	}
+	if got := sha256Hex(data); got != want {
+		return fmt.Errorf("%s: sha256 mismatch (downloaded %s, source published %s) — refusing to install", name, got, want)
+	}
+	a.updateLog(id, "info", "[update:"+id+"] "+name+" sha256 verified against the published digest")
+	return nil
+}
+
+// contentHashCurrent recognizes the "sha:<12 hex>" stamp
+// coreDisplayVersion/dataFileCurrent give a binary whose own version
+// output is missing.
+func contentHashCurrent(current string) string {
+	s := strings.TrimSpace(current)
+	if !strings.HasPrefix(s, "sha:") {
+		return ""
+	}
+	h := strings.ToLower(s[len("sha:"):])
+	if len(h) != 12 {
+		return ""
+	}
+	for _, r := range h {
+		if !strings.ContainsRune("0123456789abcdef", r) {
+			return ""
+		}
+	}
+	return h
+}
+
+// isArchiveAsset reports whether the asset is a container rather than
+// the binary itself. GitHub's digest covers the asset as published, so
+// for an archive it is the hash of the zip — never of the exe extracted
+// from it.
+func isArchiveAsset(asset *ghAsset) bool {
+	if asset == nil {
+		return false
+	}
+	n := strings.ToLower(asset.Name)
+	return strings.HasSuffix(n, ".zip") || strings.HasSuffix(n, ".gz") || strings.HasSuffix(n, ".7z")
+}
+
+// coreUpdateNeeded compares a core row against a release asset. A row
+// stamped with a content hash cannot be ordered against a version tag,
+// and updateNeeded's unorderable fallback then answers "newer" forever:
+// the row offered an update after every check even when the installed
+// bytes were exactly the published asset. When the asset IS the binary,
+// GitHub's digest makes that comparison exact without downloading
+// anything. Archives are excluded — see isArchiveAsset — and so is a
+// source that publishes no digest; there the old fallback stands and
+// installFile's identical-content no-op keeps the re-download harmless.
+func coreUpdateNeeded(current, tag string, asset *ghAsset) bool {
+	if h := contentHashCurrent(current); h != "" && !isArchiveAsset(asset) {
+		if d := assetSHA256(asset); d != "" {
+			return h != d[:len(h)]
+		}
+	}
+	return updateNeeded(current, tag)
 }
 
 // versionLineRe matches the first dotted version token, prerelease
@@ -627,7 +774,7 @@ func (a *App) checkGeosite(c *UpdatableComponent) {
 		c.LastError = err.Error()
 		return
 	}
-	asset := pickNamed(rel.Assets, "geosite.dat")
+	asset := pickAssetExact(rel.Assets, "geosite.dat")
 	if asset == nil {
 		c.LastError = "geosite.dat not found in latest release"
 		return
@@ -641,7 +788,8 @@ func (a *App) checkGeosite(c *UpdatableComponent) {
 	}
 	marker := geositeMarker()
 	if tag, err := os.ReadFile(marker); err == nil && strings.TrimSpace(string(tag)) == rel.TagName {
-		return // installed tag matches
+		c.Notes = "Up to date"
+		return
 	}
 	c.UpdateAvail = true
 	if _, err := os.Stat(marker); err != nil {
@@ -657,19 +805,19 @@ func geositeMarker() string {
 // (prereleases included): fork-published patched cores are the only
 // installable source — upstream binaries stay rejected by
 // construction (pickForkAsset never looks at upstream repos).
-func (a *App) checkCore(c *UpdatableComponent, repo, exeBase string) {
-	rel, err := githubFirstRelease(repo)
+func (a *App) checkCore(c *UpdatableComponent, exeBase string, lk releaseLookup) {
+	rel, err := lk.rel, lk.err
 	if err != nil {
 		if isNotFoundErr(err) || strings.Contains(err.Error(), "no releases") {
 			c.UpdateAvail = false
 			c.Notes = "No core release published yet — manual update only (run build.bat)."
-			a.updateLog(c.ID, "info", fmt.Sprintf("[update:%s] source=%s latest=(none)", c.ID, repo))
+			a.updateLog(c.ID, "info", fmt.Sprintf("[update:%s] source=%s latest=(none)", c.ID, lk.repo))
 			return
 		}
 		c.LastError = err.Error()
 		return
 	}
-	a.updateLog(c.ID, "info", fmt.Sprintf("[update:%s] source=%s latest=%s", c.ID, repo, rel.TagName))
+	a.updateLog(c.ID, "info", fmt.Sprintf("[update:%s] source=%s latest=%s", c.ID, lk.repo, rel.TagName))
 	asset := pickForkAsset(rel.Assets, exeBase)
 	c.Latest = rel.TagName
 	if asset == nil {
@@ -677,7 +825,7 @@ func (a *App) checkCore(c *UpdatableComponent, repo, exeBase string) {
 		c.Notes = fmt.Sprintf("%s is not published in %s — manual update only (run build.bat).", coreExeName(exeBase), rel.TagName)
 		return
 	}
-	if updateNeeded(c.Current, rel.TagName) {
+	if coreUpdateNeeded(c.Current, rel.TagName, asset) {
 		c.UpdateAvail = true
 	}
 }
@@ -700,7 +848,7 @@ func (a *App) checkOfficialSingBox(c *UpdatableComponent) {
 		c.Notes = fmt.Sprintf("No automatic install for %s/%s — download sing-box manually.", runtime.GOOS, runtime.GOARCH)
 		return
 	}
-	if updateNeeded(c.Current, rel.TagName) {
+	if coreUpdateNeeded(c.Current, rel.TagName, asset) {
 		c.UpdateAvail = true
 	}
 }
@@ -723,22 +871,45 @@ func officialSingBoxAsset(assets []ghAsset) *ghAsset {
 	return nil
 }
 
-func (a *App) checkGUI(c *UpdatableComponent) {
+// checkMihomo resolves the mihomo row against MetaCubeX's STABLE
+// releases. /releases/latest is required here, not the newest entry of
+// /releases: that is the rolling "Prerelease-Alpha" tag, which carries
+// no version to compare and would never stop offering itself.
+func (a *App) checkMihomo(c *UpdatableComponent) {
+	rel, err := githubLatest(mihomoOwnerRepo)
+	if err != nil {
+		c.LastError = err.Error()
+		return
+	}
+	a.updateLog(c.ID, "info", fmt.Sprintf("[update:%s] source=%s latest=%s", c.ID, mihomoOwnerRepo, rel.TagName))
+	c.Latest = rel.TagName
+	asset := mihomoAsset(rel.Assets, rel.TagName)
+	if asset == nil {
+		c.UpdateAvail = false
+		c.Notes = fmt.Sprintf("No automatic install for %s/%s — download mihomo manually.", runtime.GOOS, runtime.GOARCH)
+		return
+	}
+	if coreUpdateNeeded(c.Current, rel.TagName, asset) {
+		c.UpdateAvail = true
+	}
+}
+
+func (a *App) checkGUI(c *UpdatableComponent, lk releaseLookup) {
 	// AUDIT (hotfix Task 2): queries xenonama/NekoGo/releases (list,
 	// newest first, prereleases included) — NOT /releases/latest, so
 	// pre-releases are visible.
-	rel, err := githubFirstRelease(forkOwnerRepo)
+	rel, err := lk.rel, lk.err
 	if err != nil {
 		if isNotFoundErr(err) || strings.Contains(err.Error(), "no releases published yet") {
 			c.UpdateAvail = false
 			c.Notes = "No NekoGo release published yet."
-			a.updateLog(c.ID, "info", fmt.Sprintf("[update:%s] source=%s latest=(none)", c.ID, forkOwnerRepo))
+			a.updateLog(c.ID, "info", fmt.Sprintf("[update:%s] source=%s latest=(none)", c.ID, lk.repo))
 			return
 		}
 		c.LastError = err.Error()
 		return
 	}
-	a.updateLog(c.ID, "info", fmt.Sprintf("[update:%s] source=%s latest=%s", c.ID, forkOwnerRepo, rel.TagName))
+	a.updateLog(c.ID, "info", fmt.Sprintf("[update:%s] source=%s latest=%s", c.ID, lk.repo, rel.TagName))
 	c.Latest = rel.TagName
 	asset := pickGUIAsset(rel.Assets)
 	if asset == nil {
@@ -748,6 +919,14 @@ func (a *App) checkGUI(c *UpdatableComponent) {
 	}
 	if updateNeeded(appVersion, rel.TagName) {
 		c.UpdateAvail = true
+		return
+	}
+	// A locally built GUI can be ahead of everything published (the fork's
+	// newest release is still 1.0.0-beta.1 while VERSION has moved on).
+	// "Already up to date" would be the wrong reason for the disabled
+	// button, so say which side is newer.
+	if updateNeeded(rel.TagName, appVersion) {
+		c.Notes = "This build is newer than the published release"
 	}
 }
 
@@ -759,6 +938,20 @@ func (a *App) checkGUI(c *UpdatableComponent) {
 func (a *App) CheckUpdates() ([]UpdatableComponent, error) {
 	rows := a.localUpdatables()
 	now := time.Now().Format(time.RFC3339)
+	// nekobox, xray and gui all read the fork's newest release: one
+	// lookup per repo, not one per row. GitHub allows 60 unauthenticated
+	// calls an hour and the panel's per-row Check button runs a whole
+	// pass, so three identical requests spent half that budget for
+	// nothing. Written here and only read inside the goroutines below,
+	// so the map needs no lock.
+	lookups := map[string]releaseLookup{}
+	for _, repo := range []string{nekoCoreOwnerRepo, forkOwnerRepo} {
+		if _, ok := lookups[repo]; ok {
+			continue
+		}
+		rel, err := githubFirstRelease(repo)
+		lookups[repo] = releaseLookup{repo: repo, rel: rel, err: err}
+	}
 	var wg sync.WaitGroup
 	for i := range rows {
 		wg.Add(1)
@@ -772,11 +965,13 @@ func (a *App) CheckUpdates() ([]UpdatableComponent, error) {
 			case "singbox":
 				a.checkOfficialSingBox(c)
 			case "nekobox":
-				a.checkCore(c, nekoCoreOwnerRepo, "nekobox_core")
+				a.checkCore(c, "nekobox_core", lookups[nekoCoreOwnerRepo])
 			case "xray":
-				a.checkCore(c, forkOwnerRepo, "xray")
+				a.checkCore(c, "xray", lookups[forkOwnerRepo])
+			case "mihomo":
+				a.checkMihomo(c)
 			case "gui":
-				a.checkGUI(c)
+				a.checkGUI(c, lookups[forkOwnerRepo])
 			}
 			c.LastCheck = now
 		}(&rows[i])
@@ -848,9 +1043,10 @@ func (a *App) installFile(id, path string, data []byte) error {
 		os.Remove(tmpName)
 		return err
 	}
-	// TODO: GPG/Sigstore verification of release artifacts (Part 3
-	// ships hash-compare only: identical content is rejected above,
-	// but authenticity beyond HTTPS is not established).
+	// Authenticity: GitHub-published assets are checked against their
+	// sha256 digest by verifyDigest before reaching this point. Sources
+	// that publish none (jsDelivr) are trusted over HTTPS alone, and
+	// identical content is rejected above.
 	if err := os.Rename(tmpName, path); err != nil {
 		os.Remove(tmpName)
 		return err
@@ -862,13 +1058,24 @@ func (a *App) installFile(id, path string, data []byte) error {
 // extractExeFromZip returns the bytes of the "<exeName>" entry (matched
 // by base name) inside a zip archive.
 func extractExeFromZip(zipData []byte, exeName string) ([]byte, error) {
+	want := strings.ToLower(exeName)
+	return extractZipEntry(zipData, exeName, func(base string) bool {
+		return strings.ToLower(base) == want
+	})
+}
+
+// extractZipEntry returns the first archive entry whose base name
+// satisfies match. mihomo needs a prefix match: its Windows archive
+// holds mihomo-windows-amd64-v1.exe (measured in the v1.19.33 zip), not
+// mihomo.exe, and the exact name varies with arch and microarch level.
+// The size guards live here so both callers get them.
+func extractZipEntry(zipData []byte, exeName string, match func(base string) bool) ([]byte, error) {
 	zr, err := zip.NewReader(bytes.NewReader(zipData), int64(len(zipData)))
 	if err != nil {
 		return nil, err
 	}
-	want := strings.ToLower(exeName)
 	for _, f := range zr.File {
-		if strings.ToLower(filepath.Base(f.Name)) != want {
+		if !match(filepath.Base(f.Name)) {
 			continue
 		}
 		// Checked before reading (a zip bomb would otherwise be spooled
@@ -926,8 +1133,10 @@ func (a *App) geoipDest(name string) string {
 	return fallback
 }
 
-// updateDataFile handles the geoip/geosite plain-file components.
-func (a *App) updateDataFile(id, fileURL, destName string) (*UpdatableComponent, error) {
+// updateDataFile handles the geoip/geosite plain-file components. digest
+// is the source's published sha256 ("" when it publishes none, as with
+// the jsDelivr GeoIP copy).
+func (a *App) updateDataFile(id, fileURL, destName, digest string) (*UpdatableComponent, error) {
 	c := UpdatableComponent{ID: id}
 	for _, base := range a.localUpdatables() {
 		if base.ID == id {
@@ -937,6 +1146,10 @@ func (a *App) updateDataFile(id, fileURL, destName string) (*UpdatableComponent,
 	}
 	data, err := a.downloadFile(id, fileURL)
 	if err != nil {
+		a.updateLog(id, "error", "[update:"+id+"] ERROR: "+err.Error())
+		return nil, err
+	}
+	if err := a.verifyDigest(id, destName, digest, data); err != nil {
 		a.updateLog(id, "error", "[update:"+id+"] ERROR: "+err.Error())
 		return nil, err
 	}
@@ -1080,6 +1293,12 @@ func (a *App) forkAssetBytes(id string, asset *ghAsset, exeBase string) ([]byte,
 		a.updateLog(id, "error", "[update:"+id+"] ERROR: "+err.Error())
 		return nil, err
 	}
+	// The digest covers the ARCHIVE, so it is checked before unpacking:
+	// a tampered zip must never reach the extractor or the install path.
+	if err := a.verifyDigest(id, asset.Name, asset.Digest, data); err != nil {
+		a.updateLog(id, "error", "[update:"+id+"] ERROR: "+err.Error())
+		return nil, err
+	}
 	if strings.HasSuffix(strings.ToLower(asset.Name), ".zip") {
 		data, err = extractExeFromZip(data, coreExeName(exeBase))
 		if err != nil {
@@ -1146,11 +1365,13 @@ func (a *App) updateCoreExe(id, repo, exeBase string, verifyArgs ...string) (*Up
 	if owner := coreImageOwner(dest); owner != "" && owner != id {
 		return nil, fmt.Errorf("%s update would overwrite %s, which belongs to the %s row; fix corePath in settings", id, filepath.Base(dest), owner)
 	}
+	installed := true
 	if err := a.installExeWithBackup(id, dest, data, verifyArgs...); err != nil {
 		if !errors.Is(err, errAlreadyUpToDate) {
 			a.updateLog(id, "error", "[update:"+id+"] ERROR: "+err.Error())
 			return nil, err
 		}
+		installed = false
 		a.updateLog(id, "info", "[update:"+id+"] already up to date (identical binary)")
 	}
 	// The version caches are keyed on path: same path, new bytes —
@@ -1166,6 +1387,9 @@ func (a *App) updateCoreExe(id, repo, exeBase string, verifyArgs ...string) (*Up
 	c.Latest = rel.TagName
 	c.UpdateAvail = false
 	c.Notes = ""
+	if !installed {
+		c.Notes = "Already up to date"
+	}
 	return &c, nil
 }
 
@@ -1201,6 +1425,11 @@ func (a *App) upstreamCoreInstallPath() (string, error) {
 // sing-box / nekobox_core conflation this split exists to prevent).
 func coreImageOwner(path string) string {
 	base := strings.ToLower(filepath.Base(strings.TrimSpace(path)))
+	// resolveMihomo also accepts the release's own asset name
+	// (mihomo-windows-amd64-v1.exe), so every mihomo* file is that row's.
+	if strings.HasPrefix(base, "mihomo") {
+		return "mihomo"
+	}
 	switch base {
 	case strings.ToLower(coreExeName("sing-box")):
 		return "singbox"
@@ -1236,14 +1465,25 @@ func (a *App) updateOfficialSingBox() (*UpdatableComponent, error) {
 		a.updateLog("singbox", "error", "[update:singbox] ERROR: "+err.Error())
 		return nil, err
 	}
+	if err := a.verifyDigest("singbox", asset.Name, asset.Digest, data); err != nil {
+		a.updateLog("singbox", "error", "[update:singbox] ERROR: "+err.Error())
+		return nil, err
+	}
 	data, err = extractExeFromZip(data, coreExeName("sing-box"))
 	if err != nil {
 		a.updateLog("singbox", "error", "[update:singbox] ERROR: "+err.Error())
 		return nil, err
 	}
+	installed := true
 	if err := a.installExeWithBackup("singbox", dest, data, "version"); err != nil {
-		a.updateLog("singbox", "error", "[update:singbox] ERROR: "+err.Error())
-		return nil, err
+		if !errors.Is(err, errAlreadyUpToDate) {
+			a.updateLog("singbox", "error", "[update:singbox] ERROR: "+err.Error())
+			return nil, err
+		}
+		// Re-downloading the identical binary is a successful no-op, not
+		// the ERROR row this used to surface as a failed update.
+		installed = false
+		a.updateLog("singbox", "info", "[update:singbox] already up to date (identical binary)")
 	}
 	a.invalidateCoreVersion("singbox")
 	c := UpdatableComponent{ID: "singbox", Latest: rel.TagName, UpdateAvail: false}
@@ -1256,6 +1496,98 @@ func (a *App) updateOfficialSingBox() (*UpdatableComponent, error) {
 	c.Latest = rel.TagName
 	c.UpdateAvail = false
 	c.Notes = ""
+	if !installed {
+		c.Notes = "Already up to date"
+	}
+	return &c, nil
+}
+
+// mihomoInstallPath is where mihomo.exe belongs, mirroring
+// resolveMihomo: the dedicated MihomoPath override (a directory gets
+// mihomo.exe inside it, a file is updated in place), otherwise the
+// binary already resolved from bin\ / the exe folder, and bin\ next to
+// nekogo.exe as the default destination. Settings.CorePath and
+// UpstreamCorePath belong to other engines and are never read here.
+func (a *App) mihomoInstallPath() (string, error) {
+	if a.store != nil {
+		if p := strings.TrimSpace(a.store.GetSettings().MihomoPath); p != "" {
+			if info, err := os.Stat(p); err == nil && info.IsDir() {
+				return filepath.Join(p, coreExeName("mihomo")), nil
+			}
+			return p, nil
+		}
+	}
+	if cur := a.currentCorePath("mihomo"); cur != "" {
+		return cur, nil
+	}
+	return filepath.Join(coreExeDir(), coreExeName("mihomo")), nil
+}
+
+// updateMihomo installs the Clash Meta engine from MetaCubeX's stable
+// release. The archive holds mihomo-windows-amd64-v1.exe (measured in
+// the v1.19.33 zip), so the entry is matched by prefix and written to
+// the resolved path — mihomo.exe in the shipped layout, the name the
+// resolver prefers and build.bat stages.
+func (a *App) updateMihomo() (*UpdatableComponent, error) {
+	if a.coreBusy() {
+		return nil, fmt.Errorf("disconnect before updating")
+	}
+	rel, err := githubLatest(mihomoOwnerRepo)
+	if err != nil {
+		return nil, err
+	}
+	asset := mihomoAsset(rel.Assets, rel.TagName)
+	if asset == nil {
+		return nil, fmt.Errorf("no mihomo build for %s/%s in %s", runtime.GOOS, runtime.GOARCH, rel.TagName)
+	}
+	dest, err := a.mihomoInstallPath()
+	if err != nil {
+		return nil, err
+	}
+	if owner := coreImageOwner(dest); owner != "" && owner != "mihomo" {
+		return nil, fmt.Errorf("mihomo update would overwrite %s, which belongs to the %s row; fix mihomoPath in settings", filepath.Base(dest), owner)
+	}
+	a.updateLog("mihomo", "info", fmt.Sprintf("[update:mihomo] installing %s from %s", asset.Name, rel.TagName))
+	data, err := a.downloadFile("mihomo", asset.BrowserDownloadURL)
+	if err != nil {
+		a.updateLog("mihomo", "error", "[update:mihomo] ERROR: "+err.Error())
+		return nil, err
+	}
+	if err := a.verifyDigest("mihomo", asset.Name, asset.Digest, data); err != nil {
+		a.updateLog("mihomo", "error", "[update:mihomo] ERROR: "+err.Error())
+		return nil, err
+	}
+	data, err = extractZipEntry(data, coreExeName("mihomo"), func(base string) bool {
+		n := strings.ToLower(base)
+		return strings.HasPrefix(n, "mihomo") && strings.HasSuffix(n, ".exe")
+	})
+	if err != nil {
+		a.updateLog("mihomo", "error", "[update:mihomo] ERROR: "+err.Error())
+		return nil, err
+	}
+	installed := true
+	if err := a.installExeWithBackup("mihomo", dest, data, "-v"); err != nil {
+		if !errors.Is(err, errAlreadyUpToDate) {
+			a.updateLog("mihomo", "error", "[update:mihomo] ERROR: "+err.Error())
+			return nil, err
+		}
+		installed = false
+		a.updateLog("mihomo", "info", "[update:mihomo] already up to date (identical binary)")
+	}
+	a.invalidateCoreVersion("mihomo")
+	c := UpdatableComponent{ID: "mihomo", Latest: rel.TagName, UpdateAvail: false}
+	for _, base := range a.localUpdatables() {
+		if base.ID == "mihomo" {
+			c = base
+			break
+		}
+	}
+	c.Latest = rel.TagName
+	c.UpdateAvail = false
+	c.Notes = ""
+	if !installed {
+		c.Notes = "Already up to date"
+	}
 	return &c, nil
 }
 
@@ -1277,6 +1609,12 @@ func (a *App) currentCorePath(id string) string {
 		if p, err := a.xray.resolveXray(); err == nil {
 			return p
 		}
+	case "mihomo":
+		if a.store != nil {
+			if p, err := resolveMihomo(a.store.GetSettings()); err == nil {
+				return p
+			}
+		}
 	}
 	return ""
 }
@@ -1297,6 +1635,10 @@ func (a *App) invalidateCoreVersion(id string) {
 		a.xrayVer.mu.Lock()
 		a.xrayVer.version = ""
 		a.xrayVer.mu.Unlock()
+	case "mihomo":
+		a.mihomoVer.mu.Lock()
+		a.mihomoVer.version = ""
+		a.mihomoVer.mu.Unlock()
 	}
 }
 
@@ -1331,6 +1673,10 @@ func (a *App) updateGUI() (*UpdatableComponent, error) {
 	}
 	data, err := a.downloadFile("gui", asset.BrowserDownloadURL)
 	if err != nil {
+		a.updateLog("gui", "error", "[update:gui] ERROR: "+err.Error())
+		return nil, err
+	}
+	if err := a.verifyDigest("gui", asset.Name, asset.Digest, data); err != nil {
 		a.updateLog("gui", "error", "[update:gui] ERROR: "+err.Error())
 		return nil, err
 	}
@@ -1369,17 +1715,17 @@ func (a *App) UpdateComponent(id string) (*UpdatableComponent, error) {
 	switch id {
 	case "geoip":
 		url := updateBase("jsdelivr", "https://cdn.jsdelivr.net") + "/gh/Loyalsoldier/geoip@release/Country.mmdb"
-		return a.updateDataFile(id, url, "GeoLite2-Country.mmdb")
+		return a.updateDataFile(id, url, "GeoLite2-Country.mmdb", "")
 	case "geosite":
 		rel, err := githubLatest("Loyalsoldier/v2ray-rules-dat")
 		if err != nil {
 			return nil, err
 		}
-		asset := pickNamed(rel.Assets, "geosite.dat")
+		asset := pickAssetExact(rel.Assets, "geosite.dat")
 		if asset == nil {
 			return nil, fmt.Errorf("geosite.dat not found in %s", rel.TagName)
 		}
-		c, err := a.updateDataFile(id, asset.BrowserDownloadURL, "geosite.dat")
+		c, err := a.updateDataFile(id, asset.BrowserDownloadURL, "geosite.dat", asset.Digest)
 		if err != nil {
 			return nil, err
 		}
@@ -1398,6 +1744,8 @@ func (a *App) UpdateComponent(id string) (*UpdatableComponent, error) {
 			return nil, fmt.Errorf("disconnect before updating")
 		}
 		return a.updateCoreExe(id, forkOwnerRepo, "xray", "version")
+	case "mihomo":
+		return a.updateMihomo()
 	case "gui":
 		return a.updateGUI()
 	default:

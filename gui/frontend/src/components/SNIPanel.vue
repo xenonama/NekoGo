@@ -1,10 +1,16 @@
-<!-- SNI Spoofing tab: status + engine options + Cloudflare IP list +
+<!-- SNI Spoofing tab: status + mode + engine options + IP list +
      decoy-SNI list + live stats + engine logs for the sni-spoof core.
      All state comes from the backend (SpoofGetStatus/Stats/Config):
      Stop never flips an optimistic flag — every click round-trips and the
      card re-renders from the next poll. Starting happens through Connect
      (Home / Proxies) for the selected profile; the Psiphon chain button
-     below is the only start path this tab owns. -->
+     below is the only start path this tab owns.
+     The Mode card picks where the engine gets its connect endpoint:
+     Plan B dials the curated IP list (the historical behaviour), Plan A
+     resolves each decoy SNI over DoH and dials that. The mode is a
+     persisted engine option, so every card below renders from the SAVED
+     plan — under Plan A the "IPs" card becomes the read-only list of
+     addresses Plan A derived, and both pings become resolve-then-dial. -->
 <template>
   <div class="nb-card nb-page">
     <h3>SNI Spoofing</h3>
@@ -40,10 +46,13 @@
       </span>
     </div>
     <div class="sni-status-grid">
-      <div class="sni-status-k">Pinned IP</div>
+      <!-- Plan B dials a curated IP, so the pin is the endpoint. Plan A
+           derives the endpoint from the SNI, so the same slot shows the
+           address that resolve produced (SNISNI.lastIp). -->
+      <div class="sni-status-k">{{ planIsA ? 'Resolved IP' : 'Pinned IP' }}</div>
       <div class="sni-status-v">
-        <span class="mono">{{ selectedIp || '—' }}</span>
-        <span class="sni-status-sub" :class="pinIp.cls">{{ pinIp.text }}</span>
+        <span class="mono">{{ planIsA ? resolvedIp || '—' : selectedIp || '—' }}</span>
+        <span class="sni-status-sub" :class="planIsA ? resolvedIpCls : pinIp.cls">{{ planIsA ? resolvedIpText : pinIp.text }}</span>
       </div>
       <div class="sni-status-k">Pinned SNI</div>
       <div class="sni-status-v">
@@ -66,7 +75,51 @@
     </div>
   </div>
 
-  <!-- 2. Psiphon chain -->
+  <!-- 2. Mode: where the engine gets its connect endpoint. Applying a
+         mode writes the whole engine option set (the last loaded
+         snapshot + the new plan), so the two buttons are one click and
+         take effect on the next Connect — the running engine keeps the
+         mode it started with. -->
+  <div class="nb-card nb-page">
+    <h3>Mode <span class="sni-count">Plan {{ savedPlan }} active</span></h3>
+    <div class="toolbar">
+      <button
+        class="nb-act"
+        :class="{ 'nb-act--primary': !planIsA }"
+        :disabled="busy || planApplying"
+        title="Dial the checked IPs below and present the checked decoy SNIs — the historical behaviour"
+        @click="applyPlan('B')"
+      >
+        <Icon name="globe" :size="14" />Plan B — dial the IPs
+      </button>
+      <button
+        class="nb-act"
+        :class="{ 'nb-act--primary': planIsA }"
+        :disabled="busy || planApplying"
+        title="Resolve every checked decoy SNI over DNS-over-HTTPS and dial the answer — the IP list becomes a read-out"
+        @click="applyPlan('A')"
+      >
+        <Icon name="search" :size="14" />Plan A — resolve the SNIs
+      </button>
+      <span v-if="planApplying" class="muted">Applying…</span>
+      <span v-else-if="planIsA && status.running" class="muted">The running engine keeps Plan {{ savedPlan }} until you reconnect.</span>
+    </div>
+    <p class="muted">
+      <template v-if="planIsA">
+        Plan A is active: the engine looks each checked decoy SNI up over DoH (Cloudflare 1.1.1.1, pinned so a local
+        resolver cannot steer the answer) and connects to the address it gets. The “IPs” card below lists those
+        answers and edits nothing; scanning an SNI resolves and probes it. Your Plan B IP list is kept untouched and
+        is used again the moment you switch back. Plan A needs outbound DNS-over-HTTPS — on a network that blocks it,
+        Connect reports which SNI could not be resolved instead of timing out.
+      </template>
+      <template v-else>
+        Plan B is active: the engine dials the checked IPs below (best-scanned first) and presents the checked decoy
+        SNIs as the fake ClientHello. Switch to Plan A to let the engine resolve the SNIs themselves instead.
+      </template>
+    </p>
+  </div>
+
+  <!-- 3. Psiphon chain -->
   <div class="nb-card nb-page">
     <h3>Psiphon chain</h3>
     <label class="sni-chain-row">
@@ -87,7 +140,11 @@
       Chain active — Psiphon listening on <span class="mono">127.0.0.1:{{ status.chainPort }}</span>.
     </div>
     <div v-if="chainOn && !status.running" class="toolbar" style="padding: 12px 0 0">
-      <button class="nb-act nb-act--primary" :disabled="busy || !chainReady" @click="startChain">
+      <button
+        class="nb-act nb-act--primary"
+        :disabled="busy || !chainReady || connection.busy || connection.connectBusy"
+        @click="startChain"
+      >
         <Icon name="bolt" :size="14" />Connect {{ chainProfile ? `"${chainLabel}" ` : '' }}with Psiphon
       </button>
       <span v-if="chainMsg" class="muted">{{ chainMsg }}</span>
@@ -96,10 +153,11 @@
     </div>
   </div>
 
-  <!-- 3. Engine options -->
+  <!-- 4. Engine options: no Save button — each control persists as soon as
+         its value settles (number boxes wait for the typing to stop). -->
   <div class="nb-card nb-page">
     <h3>Engine options</h3>
-    <p class="muted">Empty = engine default. Method migrates to "auto" on save.</p>
+    <p class="muted">Empty = engine default. Changes save themselves.</p>
     <div class="form-grid">
       <label>Method</label>
       <PickSelect v-model="draft.method" icon="wrench" title="Bypass method" aria-label="Bypass method" quiet neutral="" :options="methodOptions" />
@@ -116,28 +174,30 @@
       <label>Padding size (0–128)</label><input v-model="draft.paddingSize" type="number" min="0" max="128" placeholder="engine default" />
     </div>
     <div class="toolbar" style="padding: 12px 0 0">
-      <button class="nb-act nb-act--primary" :disabled="busy" @click="saveConfig">
-        <Icon name="check" :size="14" />Save
-      </button>
-      <span v-if="cfgMsg" class="muted">{{ cfgMsg }}</span>
+      <span v-if="cfgSaving" class="muted">Saving…</span>
+      <span v-else-if="cfgError" class="latency-bad">{{ cfgError }}</span>
+      <span v-else-if="cfgMsg" class="muted">{{ cfgMsg }}</span>
     </div>
   </div>
 
-  <!-- 4. Cloudflare IPs -->
+  <!-- 5. IPs: Plan B's editable endpoint pool; while Plan A is active the
+         same card is the read-only list of addresses Plan A resolved from
+         the decoy SNIs (no editing — the pool it replaces stays saved). -->
   <SniListCard
-    title="Cloudflare IPs"
+    title="IPs"
     :hint="ipHint"
     :rows="ipRows"
-    :primary-key="selectedIp"
+    :primary-key="ipPrimaryKey"
+    :readonly="planIsA"
     check-title="Check to hand this IP to the engine (star = primary)"
     :scan-title="ipScanTitle"
-    :can-scan="!!selectedSni"
+    :can-scan="planIsA || !!selectedSni"
     :scanning="scanning"
     :scanning-key="scanningKey"
     placeholder="1.2.3.4 or a batch"
     search-placeholder="Filter IPs"
     add-label="+ Add IP(s)"
-    empty-text="No IPs yet — add a Cloudflare IP above."
+    :empty-text="planIsA ? 'Nothing resolved yet — scan a decoy SNI and the address Plan A dials shows up here.' : 'No IPs yet — add one above.'"
     remove-failed-title="Remove scanned-failing IPs (the primary entry is kept)"
     :busy="busy"
     @toggle="toggleIp"
@@ -149,20 +209,30 @@
     @add-bulk="addIps"
   >
     <template #toolbar>
-      <button class="nb-act nb-act--accent" :disabled="busy || scanning || !selectedSni || checkedIpCount === 0" :title="scanCheckedIpsTitle" @click="scanCheckedIps">
+      <button
+        v-if="planIsA"
+        class="nb-act nb-act--accent"
+        :disabled="busy || scanning || checkedSniCount === 0"
+        :title="rescanTitle"
+        @click="scanCheckedSnis"
+      >
+        <Icon name="search" :size="14" />Re-resolve ({{ checkedSniCount }})
+      </button>
+      <button v-else class="nb-act nb-act--accent" :disabled="busy || scanning || !selectedSni || checkedIpCount === 0" :title="scanCheckedIpsTitle" @click="scanCheckedIps">
         <Icon name="search" :size="14" />Scan checked ({{ checkedIpCount }})
       </button>
       <button v-if="scanning" class="nb-act nb-act--warn" title="Abort the running probe" @click="cancelScan">
         <Icon name="x" :size="14" />Cancel scan
       </button>
-      <span v-if="scanning && scanKind === 'ip'" class="muted">probe {{ scanDone }}/{{ scanTotal }}</span>
-      <button class="nb-act nb-act--ghost" :disabled="busy || scanning" title="Restore the curated Cloudflare IPs + decoy SNIs (keeps scan results for kept entries)" @click="resetLists">
+      <span v-if="scanning" class="muted">probe {{ scanDone }}/{{ scanTotal }}</span>
+      <button v-if="!planIsA" class="nb-act nb-act--ghost" :disabled="busy || scanning" title="Restore the curated IPs + decoy SNIs (keeps scan results for kept entries)" @click="resetLists">
         <Icon name="refresh" :size="14" />Reset to defaults
       </button>
     </template>
   </SniListCard>
 
-  <!-- 5. Decoy SNIs -->
+  <!-- 6. Decoy SNIs: the rotation pool in Plan B, the endpoint source in
+         Plan A (every checked host is resolved and dialed). -->
   <SniListCard
     title="Decoy SNIs"
     :hint="sniHint"
@@ -170,7 +240,7 @@
     :primary-key="selectedSni"
     check-title="Check to hand this SNI to the engine (star = primary)"
     :scan-title="sniScanTitle"
-    :can-scan="!!selectedIp"
+    :can-scan="planIsA || !!selectedIp"
     :scanning="scanning"
     :scanning-key="scanningKey"
     placeholder="example.com or a batch"
@@ -188,17 +258,20 @@
     @add-bulk="addSnis"
   >
     <template #toolbar>
-      <button class="nb-act nb-act--accent" :disabled="busy || scanning || !selectedIp || checkedSniCount === 0" :title="scanCheckedSnisTitle" @click="scanCheckedSnis">
-        <Icon name="search" :size="14" />Scan checked ({{ checkedSniCount }})
+      <button class="nb-act nb-act--accent" :disabled="busy || scanning || (!planIsA && !selectedIp) || checkedSniCount === 0" :title="scanCheckedSnisTitle" @click="scanCheckedSnis">
+        <Icon name="search" :size="14" />{{ planIsA ? 'Resolve + probe' : 'Scan checked' }} ({{ checkedSniCount }})
       </button>
       <button v-if="scanning" class="nb-act nb-act--warn" title="Abort the running probe" @click="cancelScan">
         <Icon name="x" :size="14" />Cancel scan
       </button>
-      <span v-if="scanning && scanKind === 'sni'" class="muted">probe {{ scanDone }}/{{ scanTotal }}</span>
+      <span v-if="scanning" class="muted">probe {{ scanDone }}/{{ scanTotal }}</span>
+      <button v-if="planIsA" class="nb-act nb-act--ghost" :disabled="busy || scanning" title="Restore the curated IPs + decoy SNIs (keeps scan results for kept entries)" @click="resetLists">
+        <Icon name="refresh" :size="14" />Reset to defaults
+      </button>
     </template>
   </SniListCard>
 
-  <!-- 6. Stats -->
+  <!-- 7. Stats -->
   <div class="nb-card nb-page">
     <h3>Stats</h3>
     <div v-if="!stats" class="muted">No stats yet — start the engine to collect them.</div>
@@ -215,17 +288,18 @@
       </div>
       <div v-if="(stats.methods ?? []).length > 0" class="sni-methods">
         <div class="sni-methods-title">Bypass methods</div>
-        <div v-for="m in (stats.methods ?? []).slice(0, 5)" :key="m.key" class="sni-method">
+        <div v-for="m in (stats.methods ?? []).slice(0, 5)" :key="m.key" class="sni-method" :title="rankTitle(m)">
           <span class="sni-method-name mono">{{ m.key }}</span>
           <span class="nb-quota"><span class="nb-quota-fill" :style="{ width: barWidth(m.rate) }" /></span>
           <span class="sni-method-rate">{{ (m.rate * 100).toFixed(1) }}%</span>
+          <span class="sni-method-lat">{{ latText(m) }}</span>
           <span class="sni-method-counts">{{ m.ok }} ok · {{ m.fail }} fail</span>
         </div>
       </div>
     </template>
   </div>
 
-  <!-- 7. Logs -->
+  <!-- 8. Logs -->
   <div class="nb-card nb-page">
     <h3>Logs</h3>
     <div class="toolbar">
@@ -255,7 +329,7 @@
 </template>
 
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, reactive, ref } from 'vue'
+import { computed, onMounted, onUnmounted, reactive, ref, watch } from 'vue'
 import { backend } from '../api'
 import { useConnectionStore } from '../stores/connection'
 import { useProfilesStore } from '../stores/profiles'
@@ -263,7 +337,7 @@ import { useSettingsStore } from '../stores/settings'
 import SniListCard from './SniListCard.vue'
 import Icon from './Icon.vue'
 import PickSelect from './PickSelect.vue'
-import type { LogEntry, Profile, SNIIP, SNISNI, SniListRow, SpoofStats, SpoofStatus } from '../types'
+import type { LogEntry, Profile, SNIConfig, SNIIP, SNISNI, SniListRow, SpoofRanked, SpoofStats, SpoofStatus } from '../types'
 
 const profiles = useProfilesStore()
 const settings = useSettingsStore()
@@ -283,8 +357,12 @@ const logLevelOptions = [
   { value: 'error', label: 'ERROR' },
 ]
 
-const methods = ['auto', 'wrong_seq', 'wrong_seq_ttl', 'split_seq', 'fragmented', 'padding', 'delayed_retry', 'double_sni', 'hostfakesplit', 'fakedsplit']
-const fps = ['legacy', 'chrome_120', 'chrome_124', 'firefox_122', 'firefox_124']
+// Must mirror the core's accepted sets (sni_core::fake_tcp::SUPPORTED_METHODS
+// and TlsProfile): a value here that the engine rejects makes Start fail, and a
+// value the engine accepts but is missing here cannot be selected at all.
+// hello_split is the strategy that segments the client's own ClientHello.
+const methods = ['auto', 'wrong_seq', 'wrong_seq_ttl', 'split_seq', 'fragmented', 'padding', 'hello_split', 'hostfakesplit', 'fakedsplit']
+const fps = ['legacy', 'chrome', 'firefox']
 const quics = ['block', 'spoof', 'passthrough']
 const ipmodes = ['ipv4', 'ipv6', 'both']
 
@@ -301,6 +379,21 @@ const draft = reactive({
   handshakeTimeout: '', maxConnections: '', fakeDelay: '', seqOverlap: '', paddingSize: '',
 })
 const cfgMsg = ref('')
+
+// --- SNI spoofing mode (Plan A / Plan B) ------------------------------
+// The plan decides where the engine gets its connect endpoint, so it is a
+// persisted engine option, not view state: every card below renders from
+// what is stored (the Mode buttons save on click). The settings store's
+// sniConfig is that stored value — the same struct SpoofGetConfig reads —
+// so there is only one source for which mode the tab shows.
+// cfgSnapshot is the saved engine option set, kept so a mode click can
+// re-send the other knobs untouched (a half-typed draft never rides along).
+const savedPlan = computed<'A' | 'B'>(() =>
+  String(settings.settings.sniConfig?.plan ?? '').toUpperCase() === 'A' ? 'A' : 'B',
+)
+const planIsA = computed(() => savedPlan.value === 'A')
+const planApplying = ref(false)
+const cfgSnapshot = ref<SNIConfig>({})
 
 const ipList = computed(() => settings.settings.sniIps ?? [])
 const sniList = computed(() => settings.settings.sniSnis ?? [])
@@ -341,7 +434,8 @@ const selectedSni = computed(() => {
 
 // Store entries -> list-card rows (scan line + health stamps for the
 // card's sort/filter; `index` stays the store position for removal).
-const ipRows = computed<SniListRow[]>(() =>
+// Plan B's editable pool.
+const poolIpRows = computed<SniListRow[]>(() =>
   ipList.value.map((e, index) => ({
     key: e.ip, index, label: e.ip,
     sub: scanText(e.lastOk, e.lastMs, e.lastAt, e.lastTls),
@@ -351,15 +445,44 @@ const ipRows = computed<SniListRow[]>(() =>
     primary: isChecked(e) && String(e.ip ?? '').trim() === selectedIp.value,
   })),
 )
+// Plan A's "IPs" card is a read-out, not a pool: one row per checked decoy
+// SNI, labelled with the address the last Plan A resolve stamped on it
+// (SNISNI.lastIp). Nothing is editable and `index` is unused (the card has
+// no remove button); the row key is the host, which is what a scan of that
+// row re-resolves. The Plan B pool stays saved underneath.
+const derivedIpRows = computed<SniListRow[]>(() =>
+  sniList.value
+    .filter(isChecked)
+    .map((e) => {
+      const host = normSni(e.host)
+      const ip = String(e.lastIp ?? '').trim()
+      return {
+        // Keyed by the raw host, exactly like the SNI card, so one probe
+        // lights both rows up.
+        key: String(e.host ?? ''), index: -1, label: ip || 'not resolved yet',
+        sub: `${scanText(e.lastOk, e.lastMs, e.lastAt, e.lastTls)} · from ${host}`,
+        cls: scanClass(e.lastOk, e.lastAt),
+        ok: !!e.lastOk, ms: e.lastMs ?? 0, at: e.lastAt ?? '',
+        checked: true,
+        primary: host === selectedSni.value,
+      }
+    }),
+)
+const ipRows = computed(() => (planIsA.value ? derivedIpRows.value : poolIpRows.value))
+// In Plan A the same stamp line also names the address the host resolved
+// to, so one card shows both halves of the probe.
 const sniRows = computed<SniListRow[]>(() =>
-  sniList.value.map((e, index) => ({
-    key: e.host, index, label: e.host,
-    sub: scanText(e.lastOk, e.lastMs, e.lastAt, e.lastTls),
-    cls: scanClass(e.lastOk, e.lastAt),
-    ok: !!e.lastOk, ms: e.lastMs ?? 0, at: e.lastAt ?? '',
-    checked: isChecked(e),
-    primary: isChecked(e) && normSni(e.host) === selectedSni.value,
-  })),
+  sniList.value.map((e, index) => {
+    const ip = String(e.lastIp ?? '').trim()
+    return {
+      key: e.host, index, label: e.host,
+      sub: scanText(e.lastOk, e.lastMs, e.lastAt, e.lastTls) + (planIsA.value && ip ? ` · → ${ip}` : ''),
+      cls: scanClass(e.lastOk, e.lastAt),
+      ok: !!e.lastOk, ms: e.lastMs ?? 0, at: e.lastAt ?? '',
+      checked: isChecked(e),
+      primary: isChecked(e) && normSni(e.host) === selectedSni.value,
+    }
+  }),
 )
 
 const spoofable = computed(() => profiles.profiles.filter((p) => p.core === 2))
@@ -453,6 +576,18 @@ const pinnedSniEntry = computed(() => sniList.value.find((e) => e.host === selec
 const pinIp = computed(() => pinHealth(pinnedIpEntry.value))
 const pinSni = computed(() => pinHealth(pinnedSniEntry.value))
 
+// Plan A's endpoint read-out: the address the pinned SNI resolved to. The
+// pin slot shows this instead of the (unused) Pinned IP, because under
+// Plan A nothing dials the curated pool.
+const resolvedIp = computed(() => String(pinnedSniEntry.value?.lastIp ?? '').trim())
+const resolvedIpText = computed(() => {
+  if (!selectedSni.value) return 'nothing checked to resolve'
+  return resolvedIp.value ? `resolved from ${selectedSni.value}` : 'not resolved yet — scan the SNI'
+})
+const resolvedIpCls = computed(() => (resolvedIp.value ? 'lat-ok' : 'lat-warn'))
+// The card's "Primary:" line names what the engine actually dials.
+const ipPrimaryKey = computed(() => (planIsA.value ? resolvedIp.value : selectedIp.value))
+
 const rateText = computed(() => {
   if (!stats.value) return '—'
   return `${(stats.value.success_rate * 100).toFixed(1)}%`
@@ -471,6 +606,18 @@ const filteredLogs = computed(() =>
 function barWidth(rate: number): string {
   const pct = Math.min(100, Math.max(0, (Number(rate) || 0) * 100))
   return `${pct.toFixed(1)}%`
+}
+
+// Rows reach us already sorted by the engine's own score (stats.rs
+// ranked()), so showing the number that ordered them is the only way to
+// explain why a 100% method sits below a slower one. latency_ms is null
+// until that method has completed a handshake at all.
+function latText(m: SpoofRanked): string {
+  return m.latency_ms === null || m.latency_ms === undefined ? '—' : `${Math.round(m.latency_ms)}ms`
+}
+
+function rankTitle(m: SpoofRanked): string {
+  return `auto ranks on score ${m.score.toFixed(3)} — success rate minus latency drag`
 }
 
 function fmtBytes(n: number): string {
@@ -582,7 +729,11 @@ async function saveChain() {
 // so it only runs through Connect — the active profile is the target.
 async function startChain() {
   const target = chainProfile.value
-  if (!target) return
+  // Gate BEFORE spoofUseProfile below: that call permanently rewrites the
+  // profile's core, so a connect that is going to be refused must not leave
+  // the rewrite behind. connection.error is not a gate — the status poller
+  // writes it too, so a poll hiccup would block a legitimate start.
+  if (!target || busy.value || connection.busy || connection.connectBusy) return
   busy.value = true
   err.value = ''
   msg.value = ''
@@ -596,32 +747,154 @@ async function startChain() {
       chainMsg.value = `Switched "${saved.name || target.name}" to the SNI spoof core.`
       await profiles.load()
     }
-    await connection.connect(target.id)
-    if (connection.error) throw new Error(connection.error)
+    if (!(await connection.connect(target.id))) {
+      throw new Error(connection.error || 'another connect is in progress')
+    }
     chainMsg.value = 'Connected through the SNI spoof → Psiphon chain.'
     await refresh()
   } catch (e) { err.value = String(e) } finally { busy.value = false }
 }
 
-async function saveConfig() {
-  busy.value = true
-  cfgMsg.value = ''
-  err.value = ''
+// --- Engine options: autosave ------------------------------------------
+// Every control in the card persists as soon as its value settles, like
+// the rest of the tab (mode, chain and both lists already save on the
+// spot). A Save click used to be the only path — and when the backend
+// refused a value the tab itself offered, the refusal discarded the whole
+// card and said so only in the banner at the top of the page, which is
+// how "I pressed Save and nothing was saved" happened.
+type Knob =
+  | 'method' | 'fingerprint' | 'quicMode' | 'ipMode'
+  | 'handshakeTimeout' | 'maxConnections' | 'fakeDelay' | 'seqOverlap' | 'paddingSize'
+
+const selectKnobs = ['method', 'fingerprint', 'quicMode', 'ipMode'] as const
+const numberKnobs = ['handshakeTimeout', 'maxConnections', 'fakeDelay', 'seqOverlap', 'paddingSize'] as const
+
+// Mirrors the ranges App.SpoofSetConfig enforces (gui/app.go). Autosaving
+// makes them a UI concern: "1" is a half-typed "10", and sending it would
+// be refused (or land as an engine default) while the user is still in the
+// box. Out of range means wait, not fail.
+const knobRange: Partial<Record<Knob, [number, number]>> = {
+  handshakeTimeout: [0.5, 10],
+  maxConnections: [10, 2000],
+  fakeDelay: [0, 5],
+  seqOverlap: [0, 16],
+  paddingSize: [0, 128],
+}
+
+const cfgSaving = ref(false)
+const cfgError = ref('')
+const knobTimers: Partial<Record<Knob, number>> = {}
+
+/** The value as it goes on the wire. Empty and 0 both mean "engine
+ *  default", and the backend omits zeros, so clearing a box resets it. */
+function knobWire(k: Knob): string | number | undefined {
+  return (numberKnobs as readonly string[]).includes(k)
+    ? numOrUndef(draft[k]) || undefined
+    : strOrUndef(draft[k])
+}
+
+function knobProblem(k: Knob): string {
+  const range = knobRange[k]
+  if (!range) return ''
+  const raw = String(draft[k] ?? '').trim()
+  if (raw === '') return ''
+  const n = Number(raw)
+  if (!Number.isFinite(n)) return `${k} is not a number`
+  if (n !== 0 && (n < range[0] || n > range[1])) return `${k} must be ${range[0]}–${range[1]} (empty = engine default)`
+  return ''
+}
+
+/** Empty, 0 and absent all spell "engine default", so a value that only
+ *  differs in that spelling is not a change worth saving. This is also
+ *  what keeps loadConfig() writing the stored values back into the draft
+ *  from re-triggering a save. */
+function knobAlreadySaved(k: Knob, wire: string | number | undefined): boolean {
+  const spell = (v: unknown) => (v === undefined || v === null || v === '' || v === 0 ? '' : String(v))
+  const stored = (cfgSnapshot.value as unknown as Record<string, unknown>)[k]
+  return spell(stored) === spell(wire)
+}
+
+async function persistKnob(k: Knob) {
+  window.clearTimeout(knobTimers[k])
+  delete knobTimers[k]
+  const problem = knobProblem(k)
+  if (problem) {
+    cfgError.value = `${problem} — not saved`
+    return
+  }
+  const wire = knobWire(k)
+  if (knobAlreadySaved(k, wire)) {
+    cfgError.value = ''
+    return
+  }
+  cfgSaving.value = true
+  cfgError.value = ''
   try {
-    await backend.spoofSetConfig({
-      method: strOrUndef(draft.method),
-      fingerprint: strOrUndef(draft.fingerprint),
-      quicMode: strOrUndef(draft.quicMode),
-      ipMode: strOrUndef(draft.ipMode),
-      handshakeTimeout: numOrUndef(draft.handshakeTimeout),
-      maxConnections: numOrUndef(draft.maxConnections),
-      fakeDelay: numOrUndef(draft.fakeDelay),
-      seqOverlap: numOrUndef(draft.seqOverlap),
-      paddingSize: numOrUndef(draft.paddingSize),
-    })
-    await settings.load()
+    // Merge onto what is stored, not onto the draft: an unrelated
+    // half-typed box must never ride along with this change.
+    const next = { ...cfgSnapshot.value, plan: savedPlan.value, [k]: wire } as unknown as SNIConfig
+    await backend.spoofSetConfig(next)
+    cfgSnapshot.value = next
+    // Keep the shared store's copy in step: the lists' save writes the
+    // whole settings struct, so a stale sniConfig there would undo this.
+    settings.settings.sniConfig = next
     cfgMsg.value = 'Saved.'
-  } catch (e) { err.value = String(e) } finally { busy.value = false }
+  } catch (e) {
+    cfgError.value = `${String(e)} — reverted to what is stored`
+    try { await loadConfig() } catch { /* keeps the card as-is */ }
+  } finally {
+    cfgSaving.value = false
+  }
+}
+
+for (const k of selectKnobs) watch(() => draft[k], () => { void persistKnob(k) })
+for (const k of numberKnobs) {
+  watch(() => draft[k], () => {
+    // Say what the box holds right now: a valid pending value must not
+    // keep showing a complaint about the characters that came before it.
+    const problem = knobProblem(k)
+    cfgError.value = problem ? `${problem} — not saved` : ''
+    window.clearTimeout(knobTimers[k])
+    knobTimers[k] = window.setTimeout(() => { void persistKnob(k) }, 500)
+  })
+}
+
+// loadConfig pulls the persisted engine options: cfgSnapshot for the mode
+// buttons and the draft for the knobs above. (The active mode itself is
+// store-derived, and settings.load() refreshes it.)
+async function loadConfig() {
+  const cfg = await backend.spoofGetConfig()
+  cfgSnapshot.value = cfg
+  draft.method = String(cfg.method ?? 'auto')
+  draft.fingerprint = String(cfg.fingerprint ?? '')
+  draft.quicMode = String(cfg.quicMode ?? '')
+  draft.ipMode = String(cfg.ipMode ?? '')
+  draft.handshakeTimeout = cfg.handshakeTimeout?.toString() ?? ''
+  draft.maxConnections = cfg.maxConnections?.toString() ?? ''
+  draft.fakeDelay = cfg.fakeDelay?.toString() ?? ''
+  draft.seqOverlap = cfg.seqOverlap?.toString() ?? ''
+  draft.paddingSize = cfg.paddingSize?.toString() ?? ''
+}
+
+// The Mode card: one click, saved immediately. Everything but the plan is
+// re-sent exactly as loaded, so switching cannot commit half-typed knobs.
+// The running engine keeps the mode it started with — the config file is
+// only rewritten on Connect.
+async function applyPlan(p: 'A' | 'B') {
+  if (planApplying.value || p === savedPlan.value) return
+  planApplying.value = true
+  err.value = ''
+  msg.value = ''
+  try {
+    await backend.spoofSetConfig({ ...cfgSnapshot.value, plan: p })
+    // The mode is read back from settings (single source), the knobs from
+    // the engine-options call.
+    await Promise.all([settings.load(), loadConfig()])
+    msg.value = p === 'A'
+      ? 'Plan A active — the engine resolves the checked decoy SNIs and dials the answers.'
+      : 'Plan B active — the engine dials the checked IPs.'
+    if (status.value.running) msg.value += ' The running engine keeps its current mode until you reconnect.'
+  } catch (e) { err.value = String(e) } finally { planApplying.value = false }
 }
 
 async function persistLists() {
@@ -761,7 +1034,9 @@ async function removeFailedSnis() {
 }
 
 const scanning = ref(false)
-// Row key ("ip:1.2.3.4" / "sni:example.com") of the probe in flight.
+// Row key of the probe in flight — a bare IP (Plan B's pool) or a bare
+// host (SNI rows, and Plan A's derived IP rows, which are keyed by the
+// SNI they came from). Same values the cards put in `key`.
 const scanningKey = ref('')
 
 // Live progress of the in-flight probe ("probe 3/12"), polled from the
@@ -785,12 +1060,15 @@ function startScanPoll(kind: 'ip' | 'sni') {
       scanDone.value = s.done
       scanTotal.value = s.total
       const [ip, sni] = String(s.last ?? '').split(' / ')
+      // Row keys are bare (an IP or a host), so the in-flight row is
+      // found by value — the prefix the old code compared with never
+      // matched a key and the row never lit up.
       if (kind === 'ip' && ip) {
         const row = ipList.value.find((e) => String(e.ip ?? '').trim() === ip)
-        if (row) scanningKey.value = `ip:${row.ip}`
+        if (row) scanningKey.value = String(row.ip ?? '').trim()
       } else if (kind === 'sni' && sni) {
         const row = sniList.value.find((e) => normSni(e.host) === sni)
-        if (row) scanningKey.value = `sni:${row.host}`
+        if (row) scanningKey.value = String(row.host ?? '')
       }
     } catch { /* the run may have just finished */ }
   }, 250)
@@ -802,6 +1080,9 @@ function stopScanPoll() {
 }
 
 const ipHint = computed(() => {
+  if (planIsA.value) {
+    return 'Plan A derives these addresses — each checked decoy SNI below is resolved over DoH and dialed, so this card is a read-out of those answers, not a pool. Nothing to edit here: your Plan B IPs stay saved and are used again when you switch back. Scan a row (or the SNI itself) to re-resolve and re-probe.'
+  }
   const base = 'Checked IPs are handed to the engine (best-scanned first); click rows to check/uncheck, star one to make it the primary endpoint. Unchecked entries stay in the list but the engine never uses them.'
   if (!ipList.value.some(isChecked)) {
     return `${base} None checked — the engine falls back to the profile's own endpoint only.`
@@ -809,6 +1090,9 @@ const ipHint = computed(() => {
   return base
 })
 const sniHint = computed(() => {
+  if (planIsA.value) {
+    return 'Plan A: every checked SNI here is resolved over DoH and dialed, so the checked rows ARE the endpoint list (the starred one is the primary, and its port is the one used). Unchecked entries stay in the list but are never resolved.'
+  }
   const base = 'Checked SNIs rotate as per-connection decoys; click rows to check/uncheck, star one to make it the primary. Unchecked entries stay in the list but the engine never uses them.'
   if (!sniList.value.some(isChecked)) {
     return `${base} None checked — the engine uses the profile's own SNI only.`
@@ -816,45 +1100,61 @@ const sniHint = computed(() => {
   return base
 })
 
-// Per-row probes: an IP row scans against the pinned SNI, an SNI row
-// against the pinned IP — one real TLS handshake, one row. "Scan
-// checked (N)" probes the checked subset the same way (still no
-// IP x SNI matrix: the old "Scan all" did that, and it is gone).
-const ipScanTitle = computed(() =>
-  selectedSni.value
+// Per-row probes. Plan B: an IP row dials against the pinned SNI and an
+// SNI row against the pinned IP — one real TLS handshake, one row. Plan A:
+// both become resolve-over-DoH + probe of the address that answer produced
+// (the IP row is that SNI's derived address), and no pinned counterpart is
+// needed because the endpoint is derived, not chosen.
+const ipScanTitle = computed(() => {
+  if (planIsA.value) return 'Re-resolve this row’s SNI over DoH and probe the address it returns'
+  return selectedSni.value
     ? `Probe this IP against the pinned SNI (${selectedSni.value}) with a real TLS handshake`
-    : 'Check a decoy SNI first — an IP probe needs a ServerName to dial',
-)
-const sniScanTitle = computed(() =>
-  selectedIp.value
+    : 'Check a decoy SNI first — an IP probe needs a ServerName to dial'
+})
+const sniScanTitle = computed(() => {
+  if (planIsA.value) return 'Resolve this SNI over DoH and probe the address it returns with a real TLS handshake'
+  return selectedIp.value
     ? `Probe this SNI against the pinned IP (${selectedIp.value}) with a real TLS handshake`
-    : 'Check a Cloudflare IP first — an SNI probe needs an endpoint to dial',
-)
+    : 'Check an IP first — an SNI probe needs an endpoint to dial'
+})
 const scanCheckedIpsTitle = computed(() =>
   selectedSni.value
     ? `Probe every checked IP against the pinned SNI (${selectedSni.value}) — one TLS handshake per IP`
     : 'Check a decoy SNI first — IP probes need a ServerName to dial',
 )
-const scanCheckedSnisTitle = computed(() =>
-  selectedIp.value
+const scanCheckedSnisTitle = computed(() => {
+  if (planIsA.value) return 'Resolve every checked SNI over DoH and probe the address each returns — one resolve + handshake per SNI'
+  return selectedIp.value
     ? `Probe the pinned IP (${selectedIp.value}) against every checked SNI — one TLS handshake per SNI`
-    : 'Check a Cloudflare IP first — SNI probes need an endpoint to dial',
+    : 'Check an IP first — SNI probes need an endpoint to dial'
+})
+const rescanTitle = computed(() =>
+  'Re-run Plan A for every checked decoy SNI: resolve it over DoH, then probe the address it returned',
 )
 
-async function scanIp(ip: string) {
+async function scanIp(key: string) {
+  // Plan A: the derived row's key is its SNI host.
+  if (planIsA.value) {
+    await scanPair([], [key], key, 'sni')
+    return
+  }
   const sni = selectedSni.value
   if (!sni) return
-  await scanPair([ip], [sni], `ip:${ip}`, 'ip')
+  await scanPair([key], [sni], key, 'ip')
 }
 
 async function scanSni(host: string) {
+  if (planIsA.value) {
+    await scanPair([], [host], host, 'sni')
+    return
+  }
   const ip = selectedIp.value
   if (!ip) return
-  await scanPair([ip], [host], `sni:${host}`, 'sni')
+  await scanPair([ip], [host], host, 'sni')
 }
 
-// "Scan checked (N)": the checked subset only, against the pinned
-// counterpart — N probes, never the full matrix.
+// "Scan checked (N)" / Plan A's "Re-resolve": the checked subset only —
+// in Plan B against the pinned counterpart, never the full matrix.
 async function scanCheckedIps() {
   const sni = selectedSni.value
   const ips = ipList.value.filter((e) => isChecked(e)).map((e) => String(e.ip ?? '').trim()).filter(Boolean)
@@ -863,15 +1163,20 @@ async function scanCheckedIps() {
 }
 
 async function scanCheckedSnis() {
-  const ip = selectedIp.value
   const snis = sniList.value.filter((e) => isChecked(e)).map((e) => normSni(e.host)).filter(Boolean)
-  if (!ip || snis.length === 0) return
+  if (snis.length === 0) return
+  if (planIsA.value) {
+    await scanPair([], snis, '', 'sni')
+    return
+  }
+  const ip = selectedIp.value
+  if (!ip) return
   await scanPair([ip], snis, '', 'sni')
 }
 
 // One probe at a time (the backend rejects concurrent runs): flag the
 // row(s), poll live progress, round-trip, then reload the scanner
-// stamps.
+// stamps. `key` is a row key as the cards build them (a bare IP or host).
 async function scanPair(ips: string[], snis: string[], key: string, kind: 'ip' | 'sni') {
   scanning.value = true
   scanningKey.value = key
@@ -883,9 +1188,13 @@ async function scanPair(ips: string[], snis: string[], key: string, kind: 'ip' |
     if (r.length === 1) {
       const hit = r[0]
       const target = `${hit.sni} @ ${hit.ip}`
-      msg.value = hit.ok
-        ? `Scan ${target}: OK${hit.latencyMs ? ` · ${hit.latencyMs} ms` : ''}.`
-        : `Scan ${target}: failed${hit.error ? ` — ${hit.error}` : ''}.`
+      if (hit.ok) {
+        // Plan A can pass the handshake and still flag the answer as
+        // non-Cloudflare — shown, not swallowed.
+        msg.value = `Scan ${target}: OK${hit.latencyMs ? ` · ${hit.latencyMs} ms` : ''}${hit.warning ? ` — ${hit.warning}` : ''}.`
+      } else {
+        msg.value = `Scan ${target}: failed${hit.error ? ` — ${hit.error}` : ''}.`
+      }
     } else {
       const ok = r.filter((x) => x.ok).length
       msg.value = `Scanned ${r.length} pair(s): ${ok} OK, ${r.length - ok} failed.`
@@ -929,16 +1238,7 @@ let disposed = false
 
 onMounted(async () => {
   try {
-    const cfg = await backend.spoofGetConfig()
-    draft.method = String(cfg.method ?? 'auto')
-    draft.fingerprint = String(cfg.fingerprint ?? '')
-    draft.quicMode = String(cfg.quicMode ?? '')
-    draft.ipMode = String(cfg.ipMode ?? '')
-    draft.handshakeTimeout = cfg.handshakeTimeout?.toString() ?? ''
-    draft.maxConnections = cfg.maxConnections?.toString() ?? ''
-    draft.fakeDelay = cfg.fakeDelay?.toString() ?? ''
-    draft.seqOverlap = cfg.seqOverlap?.toString() ?? ''
-    draft.paddingSize = cfg.paddingSize?.toString() ?? ''
+    await loadConfig()
   } catch (e) { err.value = String(e) }
   // Fresh profiles: the store may predate an import done from another
   // shell, which is exactly how a convertible profile shows up here.
@@ -953,5 +1253,10 @@ onUnmounted(() => {
   disposed = true
   window.clearInterval(timer)
   window.clearInterval(scanPoll)
+  // A half-typed box must not lose its value to a tab switch: flush what
+  // is still pending instead of dropping the timers with the component.
+  for (const k of numberKnobs) {
+    if (knobTimers[k]) void persistKnob(k)
+  }
 })
 </script>

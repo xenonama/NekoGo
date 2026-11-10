@@ -30,10 +30,12 @@ export const useConnectionStore = defineStore('connection', () => {
   // logsSubs > 0, so ~68 KB/min of bridge traffic disappears when the
   // Logs tab is closed.
   let logsSubs = 0
-  // inFlight self-throttles both polls: a tick overlapping a slow
-  // previous refresh returns immediately instead of piling concurrent
-  // Thrift calls onto the non-concurrent client (frontend BUG-001).
-  let inFlight = false
+  // inFlight is the running poll leg rather than a boolean: an overlapping
+  // timer tick still drops itself instead of piling concurrent Thrift calls
+  // onto the non-concurrent client (frontend BUG-001), but a forced sample
+  // queues behind it and then runs, so the refresh after connect/disconnect
+  // is no longer silently skipped for up to a second.
+  let inFlight: Promise<void> | null = null
   // The log buffer is 300 entries (~68 KB of bridge payload per
   // fetch, measured). Refetching it every second spent ~4 MB/min on
   // the bridge for a list the user reads at 1s; the log view refreshes
@@ -45,47 +47,56 @@ export const useConnectionStore = defineStore('connection', () => {
     if (backend.available()) error.value = String(e)
   }
 
-  /** Fetch status() + getStats() (the 1s status poller leg). */
-  async function refreshStatus() {
-    if (inFlight) return
-    inFlight = true
+  async function sampleStatus() {
     try {
-      try {
-        status.value = await backend.status()
-        connectBusy.value = status.value.connectBusy === true
-        fault.value = status.value.lastError ?? ''
-      } catch (e) {
-        noteError(e)
-      }
-      try {
-        stats.value = await backend.getStats()
-      } catch (e) {
-        noteError(e)
-      }
-    } finally {
-      inFlight = false
+      status.value = await backend.status()
+      connectBusy.value = status.value.connectBusy === true
+      fault.value = status.value.lastError ?? ''
+    } catch (e) {
+      noteError(e)
     }
+    try {
+      stats.value = await backend.getStats()
+    } catch (e) {
+      noteError(e)
+    }
+  }
+
+  async function sampleLogs(force: boolean) {
+    const now = Date.now()
+    if (!force && now - lastLogFetch < logPollMs) return
+    lastLogFetch = now
+    try {
+      logs.value = await backend.recentLogs(300)
+    } catch (e) {
+      noteError(e)
+    }
+  }
+
+  /** Run one poll leg, serialized against any leg already running. The
+   *  samples swallow their own errors, so the chain never rejects. */
+  async function poll(sample: () => Promise<void>, force: boolean) {
+    const prev = inFlight
+    if (prev && !force) return
+    const run = prev ? prev.then(sample) : sample()
+    inFlight = run
+    try {
+      await run
+    } finally {
+      if (inFlight === run) inFlight = null
+    }
+  }
+
+  /** Fetch status() + getStats() (the 1s status poller leg). */
+  async function refreshStatus(force = false) {
+    await poll(sampleStatus, force)
   }
 
   /** Fetch recentLogs(300) (the 2s logs poller leg). Gated by logPollMs
    *  so it only actually crosses the bridge every 2s even though the
-   *  timer fires every 1s. */
-  async function refreshLogs() {
-    if (inFlight) return
-    inFlight = true
-    try {
-      const now = Date.now()
-      if (now - lastLogFetch >= logPollMs) {
-        lastLogFetch = now
-        try {
-          logs.value = await backend.recentLogs(300)
-        } catch (e) {
-          noteError(e)
-        }
-      }
-    } finally {
-      inFlight = false
-    }
+   *  timer fires every 1s; force skips that cadence gate. */
+  async function refreshLogs(force = false) {
+    await poll(() => sampleLogs(force), force)
   }
 
   /** Fetch everything: status + stats + logs. Used one-shot on mount
@@ -95,22 +106,32 @@ export const useConnectionStore = defineStore('connection', () => {
     await refreshLogs()
   }
 
-  async function connect(id: string) {
+  /** Starts a profile. Resolves true only when the backend accepted the
+   *  connect — callers that act on the new tunnel (speed/IP probes, row
+   *  feedback) must check it instead of reading `error`, which the poller
+   *  also writes. The guard is synchronous: two components clicking in the
+   *  same tick must not both reach backend.connect. */
+  async function connect(id: string): Promise<boolean> {
+    if (busy.value) return false
     busy.value = true
     error.value = ''
     try {
       await backend.connect(id)
-      await refreshStatus()
-      await refreshLogs()
+      await refreshStatus(true)
+      await refreshLogs(true)
+      return true
     } catch (e) {
       const msg = String(e)
       error.value = msg
-      // TUN needs an elevated process for the Wintun adapter. The
-      // backend refuses the connect with this actionable error and
-      // persists the requested profile, so the existing
-      // RelaunchAsAdmin handoff resumes it via --connect.
-      if (msg.includes('TUN mode requires administrator rights') && backend.available()) {
-        const relaunch = confirm('TUN mode requires administrator rights.\n\nRelaunch NekoGo as administrator? The app will restart and resume the connection.')
+      // TUN needs an elevated process for the Wintun adapter, and the SNI
+      // spoof engine needs one for WinDivert. The backend refuses the
+      // connect with an actionable error that names which, and persists the
+      // requested profile, so the existing RelaunchAsAdmin handoff resumes
+      // it via --connect. Both messages carry this phrase — matching only
+      // the TUN one left a spoof connect failing on a driver error with no
+      // way to fix it from the UI.
+      if (msg.includes('requires administrator rights') && backend.available()) {
+        const relaunch = confirm(`${msg}\n\nThe app will restart and resume the connection.`)
         if (relaunch) {
           try {
             await backend.relaunchAsAdmin()
@@ -119,19 +140,25 @@ export const useConnectionStore = defineStore('connection', () => {
           }
         }
       }
+      return false
     } finally {
       busy.value = false
     }
   }
 
-  async function disconnect() {
+  /** Stops the running core. Same contract as connect: true only when the
+   *  backend accepted it. */
+  async function disconnect(): Promise<boolean> {
+    if (busy.value) return false
     busy.value = true
     try {
       await backend.disconnect()
-      await refreshStatus()
-      await refreshLogs()
+      await refreshStatus(true)
+      await refreshLogs(true)
+      return true
     } catch (e) {
       error.value = String(e)
+      return false
     } finally {
       busy.value = false
     }

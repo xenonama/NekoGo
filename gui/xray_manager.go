@@ -58,14 +58,10 @@ type XrayManager struct {
 	// the probe commits only on an unchanged epoch. Guarded by mu.
 	startEpoch uint64
 	ephEpoch   uint64
-	// Phase C client-side probe state (xray has no test RPCs): testMu
-	// guards a cancel for the in-flight probe plus cached last
-	// results backing LastNetwork (the reporter equivalent).
-	testMu     sync.Mutex
-	testCancel context.CancelFunc
-	lastIP     *IPTestResult
-	lastSpeed  *SpeedTestResult
-	lastURL    *URLTestResult
+	// probes is the Phase C client-side state (xray has no test RPCs):
+	// a cancel for the in-flight probe plus cached last results backing
+	// LastNetwork (the reporter equivalent). See nettools.go.
+	probes probeState
 }
 
 // NewXrayManager creates a manager. xrayPath may be empty (auto-detect).
@@ -177,6 +173,12 @@ func (m *XrayManager) Start(profile *Profile, settings Settings) error {
 	if apiAddr == "" {
 		apiAddr = fmt.Sprintf("127.0.0.1:%d", xrayAPIDefaultPort)
 	}
+	// BuildXrayConfig renders api-in from splitAPIAddr, so probe, dial and
+	// publish that same normalized address. A tolerated-but-rewritten
+	// setting (out-of-range port, bare IPv6, host carrying a path) used to
+	// start a healthy xray and then kill it 5s later as "API not reachable".
+	apiHost, apiPort := splitAPIAddr(apiAddr)
+	apiAddr = net.JoinHostPort(apiHost, strconv.Itoa(apiPort))
 	mixedPort := effectiveMixedPort(settings.MixedPort)
 	// HOTFIX (zombie xray): a crashed session leaves xray.exe holding
 	// these ports, so the next Connect would fail 5s later with a bare
@@ -186,8 +188,7 @@ func (m *XrayManager) Start(profile *Profile, settings Settings) error {
 	if mixedPort+1 <= 65535 {
 		preflight = append(preflight, fmt.Sprintf("127.0.0.1:%d", mixedPort+1))
 	}
-	if apiHost, apiPort := splitAPIAddr(apiAddr); apiHost == "127.0.0.1" ||
-		apiHost == "0.0.0.0" || apiHost == "::" || apiHost == "localhost" {
+	if apiHost == "127.0.0.1" || apiHost == "0.0.0.0" || apiHost == "::" || apiHost == "localhost" {
 		preflight = append(preflight, fmt.Sprintf("127.0.0.1:%d", apiPort))
 	}
 	for _, ap := range preflight {
@@ -439,12 +440,12 @@ func (m *XrayManager) URLTest(url string, timeoutMs int32) (*TestResult, error) 
 	if url == "" {
 		url = defaultTestURL
 	}
-	ctx, cancel := m.xrayTestCtx()
+	ctx, cancel := m.probes.scope()
 	defer cancel()
 	// BUG-020: clamp into range (int64 conversion below is wrap-safe,
 	// but negatives would expire instantly and huge values linger).
 	d, err := proxiedHeadOrGetCtx(ctx,
-		fmt.Sprintf("127.0.0.1:%d", effectiveMixedPort(mixedPort)),
+		mixedProxyAddr(mixedPort),
 		url, time.Duration(int64(clampProbeTimeoutMs(timeoutMs)))*time.Millisecond)
 	if err != nil {
 		return nil, err
@@ -675,7 +676,7 @@ func (m *XrayManager) Test(profile *Profile, settings Settings, timeoutMs int) (
 	if _, err := BuildXrayConfig(profile, settings, apiAddr); err != nil {
 		return &TestResult{LatencyMs: -1, Error: err.Error()}, nil
 	}
-	conn, err := net.DialTimeout("tcp", fmt.Sprintf("%s:%d", profile.Address, profile.Port), timeout)
+	conn, err := net.DialTimeout("tcp", net.JoinHostPort(profile.Address, strconv.Itoa(profile.Port)), timeout)
 	if err != nil {
 		return &TestResult{LatencyMs: -1, Error: err.Error()}, nil
 	}
@@ -777,7 +778,7 @@ func BuildXrayConfig(profile *Profile, settings Settings, apiAddr string) (strin
 	// SNI-spoof front (sni_front.go): same contract as the sing-box
 	// builder — CoreSpoof or loopback-while-engine-runs rewrites the
 	// "proxy" outbound at the local spoof listener.
-	if spoofPort, ok := spoofPortForProfile(profile); ok {
+	if spoofPort, ok := spoofPortForProfile(profile, settings); ok {
 		applySNIFrontXray(cfg, spoofPort)
 	}
 	// Phase E: merge stored section overrides (route->routing,
@@ -885,6 +886,12 @@ func mapProfileToXrayOutbound(p *Profile) (map[string]any, error) {
 		var raw map[string]any
 		if err := json.Unmarshal([]byte(p.RawOutbound), &raw); err != nil {
 			return nil, fmt.Errorf("rawOutbound: %w", err)
+		}
+		// JSON null decodes WITHOUT an error and leaves raw nil, so the
+		// re-tag below would panic on a profile whose raw outbound was
+		// cleared to null in a hand-edited config.json.
+		if raw == nil {
+			return nil, fmt.Errorf("rawOutbound: want a JSON object, got null")
 		}
 		// Always re-tag: the SNI front rewrite, external chaining and
 		// spoof repair all look the outbound up as "proxy", so a pasted

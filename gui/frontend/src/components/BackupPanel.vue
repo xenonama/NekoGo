@@ -42,7 +42,7 @@
       <div class="stg-head">
         <span class="stg-head-chip"><Icon name="code" :size="22" /></span>
         <span class="stg-head-text">
-          <span class="stg-head-title">Raw config</span>
+          <span class="stg-head-title">View raw config</span>
           <span class="stg-head-sub">Exact config the active core receives, overrides merged in.</span>
         </span>
         <button class="nb-act" :disabled="busy" @click="showRaw">

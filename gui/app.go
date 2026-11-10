@@ -18,7 +18,9 @@ import (
 
 // appVersion is overridden at link time:
 // go build -ldflags="-X main.appVersion=1.2.3"
-var appVersion = "5.11.28.3-fork.1-dev"
+// Keep the default in step with the VERSION file so a plain `go build`
+// (wails3 task, `go run`) still reports a real version to the updater.
+var appVersion = "1.0.0-beta.3-dev"
 
 // App is the Wails bound service. Every public method is callable from the
 // Vue frontend.
@@ -51,12 +53,14 @@ type App struct {
 	// Settings.CoreEngine == "upstream". Wired into cores via
 	// SetUpstreamSingBoxManager.
 	upstreamMgr *UpstreamSingBoxManager
-	tray        trayController
+	// mihomoMgr owns the mihomo.exe (Clash Meta) child process for
+	// CoreMihomo profiles. Wired into cores via SetMihomoManager.
+	mihomoMgr *MihomoManager
+	tray      trayController
 	// trayBuilder rebuilds the tray with identical menu+callbacks;
 	// set by main.go, used when closeToTray flips false->true after
 	// a launch that skipped tray creation. Nil in tests unless set.
 	trayBuilder func() trayController
-	onShow      func()
 	logCh       chan LogEntry
 	logBuf      []LogEntry
 	logMu       sync.RWMutex
@@ -72,6 +76,7 @@ type App struct {
 	coreVer     versionCache
 	upstreamVer versionCache
 	xrayVer     versionCache
+	mihomoVer   versionCache
 	// orphanScanDone is closed when the startup orphan scan finished.
 	// The scan runs in the background (it spawns wmic + tasklist, ~420
 	// ms measured) so the window appears immediately; Connect waits for
@@ -121,6 +126,11 @@ type App struct {
 	refreshCancel context.CancelFunc
 	refreshDone   atomic.Int64
 	refreshTotal  atomic.Int64
+	// refreshWG tracks the fire-and-forget refreshCountriesBackground
+	// goroutines so Shutdown can drain them: a late SaveFile must not
+	// write config.json after the app has stopped (or a test's TempDir
+	// is torn down).
+	refreshWG sync.WaitGroup
 	// aetherScanMu guards aetherScanCancel: at most one endpoint scan
 	// runs at a time, and AetherScanCancel aborts it.
 	aetherScanMu     sync.Mutex
@@ -147,18 +157,13 @@ func (a *App) clearError() {
 
 // noteFault reports an unexpected engine death (CoreManager's
 // EngineExit callback): log it, surface it through LastError/Status, and
-// revert the auto-enabled system proxy so traffic is not pointed at a
-// closed port. The group teardown itself belongs to CoreManager.
+// revert the system proxy so traffic is not pointed at a closed port.
+// The group teardown itself belongs to CoreManager.
 func (a *App) noteFault(ev EngineExit) {
 	msg := ev.Summary()
 	a.emitLog("gui", "error", msg)
 	a.noteError(msg)
-	if a.getAutoProxy() {
-		if err := a.ClearSystemProxy(); err != nil {
-			a.emitLog("gui", "warn", fmt.Sprintf("auto system proxy revert after engine exit: %v", err))
-		}
-		a.setAutoProxy(false)
-	}
+	a.revertSystemProxyOnExit("engine exit")
 	a.refreshTray()
 }
 
@@ -184,6 +189,8 @@ func NewApp(store *ConfigStore, logCh chan LogEntry) *App {
 	a.cores.SetPsiphonManager(a.psiphonMgr)
 	a.upstreamMgr = NewUpstreamSingBoxManager(logCh)
 	a.cores.SetUpstreamSingBoxManager(a.upstreamMgr)
+	a.mihomoMgr = NewMihomoManager(logCh)
+	a.cores.SetMihomoManager(a.mihomoMgr)
 	a.cores.SetFaultHandler(a.noteFault)
 	a.geo = NewGeoIP(store.GetSettings().GeoIPDBPath)
 	go a.pumpLogs()
@@ -376,6 +383,14 @@ var xrayProtocols = map[string]bool{
 	"aether": true,
 }
 
+// mihomoProtocols mirror the mapProfileToMihomoProxy switch. "direct" is
+// absent on purpose: mihomo routes through a proxy group, and a DIRECT
+// member would need a rule set NekoGo does not render.
+var mihomoProtocols = map[string]bool{
+	"vless": true, "vmess": true, "trojan": true, "shadowsocks": true,
+	"socks": true, "http": true, "aether": true,
+}
+
 // validateProfileForSave rejects profiles the builders cannot route,
 // so bad input fails fast at save instead of slowly at Connect/Test
 // (integration BUG-007 port, BUG-011 protocol). Profiles carrying a raw
@@ -398,8 +413,11 @@ func validateProfileForSave(p Profile) error {
 		if !p.Core.IsSpoof() {
 			supported := singBoxProtocols
 			coreName := "sing-box"
-			if p.Core.IsXray() {
+			switch {
+			case p.Core.IsXray():
 				supported, coreName = xrayProtocols, "xray"
+			case p.Core.IsMihomo():
+				supported, coreName = mihomoProtocols, "mihomo"
 			}
 			if !supported[p.Protocol] {
 				return fmt.Errorf("protocol %q needs rawOutbound JSON for %s", p.Protocol, coreName)
@@ -531,6 +549,12 @@ func (a *App) SaveSettings(s Settings) error {
 		return err
 	}
 	s.InboundAddress = addr
+	// DNS upstreams normalize by trimming only: a pasted value carries
+	// surrounding whitespace, and everything beyond that is the
+	// renderer's parser's decision (it must accept the same shapes, or
+	// a save would be a config that cannot start).
+	s.DnsRemote = strings.TrimSpace(s.DnsRemote)
+	s.DnsDirect = strings.TrimSpace(s.DnsDirect)
 	if err := validateDNSServer(s.DnsRemote); err != nil {
 		return err
 	}
@@ -611,6 +635,7 @@ func (a *App) Connect(id string) error {
 		return fmt.Errorf("profile %q not found", id)
 	}
 	a.emitLog("gui", "info", fmt.Sprintf("Connect: starting %q via %s", p.Name, p.Core.String()))
+	settings := a.store.GetSettings()
 	// Legacy loopback dead-end rescue (Windows: the engine ships as
 	// sni-spoof.exe). A loopback config imported before the SNI
 	// auto-detect (e.g. trojan://...@127.0.0.1:40443 ws) has no local
@@ -620,7 +645,9 @@ func (a *App) Connect(id string) error {
 	// whose local port IS alive is a legitimate local chain — never
 	// hijack it. This also covers tray + auto-connect, so connecting
 	// the legacy profile from anywhere behaves like the tab Start.
-	if runtime.GOOS == "windows" && shouldRescueLoopbackProfile(&p) {
+	// Settings → SNI spoofing OFF disables both rescues: a loopback
+	// address is then the user's own tunnel, not a dead end.
+	if runtime.GOOS == "windows" && shouldRescueLoopbackProfile(&p, settings) {
 		if saved, err := a.SpoofUseProfile(p.ID); err != nil {
 			a.emitLog("gui", "error", fmt.Sprintf("Connect: loopback rescue failed: %v", err))
 		} else {
@@ -634,21 +661,20 @@ func (a *App) Connect(id string) error {
 	// (SpoofUseProfile), so Connect converges it to the spoof core
 	// a fresh import would get. IP literals never rescue (same rule
 	// as import: proving CF-fronting needs a live lookup).
-	if runtime.GOOS == "windows" && shouldRescueDirectSpoofProfile(&p) {
+	if runtime.GOOS == "windows" && shouldRescueDirectSpoofProfile(&p, settings) {
 		if saved, err := a.SpoofUseProfile(p.ID); err != nil {
 			a.emitLog("gui", "error", fmt.Sprintf("Connect: direct-spoof rescue failed: %v", err))
 		} else {
 			p = saved
 		}
 	}
-	settings := a.store.GetSettings()
 	// Upstream pre-flight: the official sing-box binary is compiled
 	// without the NekoGo-only transports, so a profile that needs one
 	// cannot run there. Refuse now with an actionable message instead of
-	// letting the core fail 15s later on a decode error. Xray profiles
-	// never use a sing-box binary; every other core (plain, SNI spoof,
-	// aether) runs the selected engine's sing-box as its transport.
-	if settings.CoreEngine == "upstream" && !p.Core.IsXray() {
+	// letting the core fail 15s later on a decode error. Xray and mihomo
+	// profiles never use a sing-box binary; every other core (plain, SNI
+	// spoof, aether) runs the selected engine's sing-box as its transport.
+	if settings.CoreEngine == "upstream" && !p.Core.IsXray() && !p.Core.IsMihomo() {
 		if reason := upstreamUnsupportedReason(&p); reason != "" {
 			a.emitLog("gui", "error", fmt.Sprintf("Connect: upstream core refused profile %q: %s", p.Name, reason))
 			a.noteError(upstreamUnsupportedProfileMessage)
@@ -656,20 +682,25 @@ func (a *App) Connect(id string) error {
 		}
 		a.emitLog("gui", "info", fmt.Sprintf("Connect: sing-box engine = official sing-box.exe (upstream, core %s)", p.Core.String()))
 	}
-	// TUN pre-flight (Windows): the TUN inbound creates a Wintun
-	// adapter, which needs an elevated process, while nekogo.exe ships
-	// asInvoker. Refuse BEFORE spawning the core with an actionable
-	// message instead of a cryptic driver error. The frontend offers
-	// the existing RelaunchAsAdmin handoff, so persist the requested
-	// profile first: the elevated child resumes it through --connect.
-	// Xray ignores tunEnabled, so proxy-only users are never gated.
-	if tunNeedsElevation(&p, settings) {
-		if err := a.store.SetActiveProfileID(id); err != nil {
-			a.emitLog("gui", "error", fmt.Sprintf("Connect: persist TUN elevation target: %v", err))
+	// Elevation pre-flight (Windows): the TUN inbound creates a Wintun
+	// adapter and the SNI spoof engine loads WinDivert — both need an
+	// elevated process, while nekogo.exe ships asInvoker. Refuse BEFORE
+	// spawning anything, with an actionable message instead of a cryptic
+	// driver error. The frontend offers the existing RelaunchAsAdmin
+	// handoff, so persist the requested profile first: the elevated child
+	// resumes it through --connect. Xray ignores both, so proxy-only users
+	// are never gated.
+	if tunNeedsElevation(&p, settings) || spoofNeedsElevation(&p, settings) {
+		msg := spoofRequiresAdminMessage
+		if tunNeedsElevation(&p, settings) {
+			msg = tunRequiresAdminMessage
 		}
-		a.emitLog("gui", "error", tunRequiresAdminMessage)
-		a.noteError(tunRequiresAdminMessage)
-		return errors.New(tunRequiresAdminMessage)
+		if err := a.store.SetActiveProfileID(id); err != nil {
+			a.emitLog("gui", "error", fmt.Sprintf("Connect: persist elevation target: %v", err))
+		}
+		a.emitLog("gui", "error", msg)
+		a.noteError(msg)
+		return errors.New(msg)
 	}
 	start := a.cores.Start
 	if a.coreStarter != nil {
@@ -677,6 +708,13 @@ func (a *App) Connect(id string) error {
 	}
 	if err := start(&p, settings); err != nil {
 		a.emitLog("gui", "error", fmt.Sprintf("Connect: core start failed: %v", err))
+		// Start tore the previous group down before probing this one, and
+		// a deliberate stop reports no EngineExit, so noteFault never runs.
+		// With nothing running the OS proxy would point at a closed port
+		// until Disconnect or a later successful connect.
+		if _, _, running := a.cores.Status(); !running {
+			a.revertSystemProxyOnExit("failed connect")
+		}
 		return tunStartHint(err, &p, settings)
 	}
 	ports := a.ActiveProxyPorts()
@@ -765,12 +803,40 @@ const tunRequiresAdminMessage = "TUN mode requires administrator rights. Relaunc
 // proceeds and a real permission failure is annotated by
 // tunStartHint instead.
 func tunNeedsElevation(p *Profile, settings Settings) bool {
-	if runtime.GOOS != "windows" || p == nil || p.Core.IsXray() || !tunRequiredFor(p, settings) {
+	// Xray and mihomo never render a TUN inbound, so neither ever needs
+	// the Wintun adapter — asking for admin there would gate proxy-only
+	// users on a driver they will not use.
+	if runtime.GOOS != "windows" || p == nil || p.Core.IsXray() || p.Core.IsMihomo() || !tunRequiredFor(p, settings) {
 		return false
 	}
 	// A stored full raw config replaces the rendered config (and the
 	// TUN append) entirely, so it never needs the Wintun adapter.
 	if _, full, err := rawCoreOverride(settings.CoreOverrides); err == nil && full {
+		return false
+	}
+	elevated, err := guiElevated()
+	return err == nil && !elevated
+}
+
+// spoofRequiresAdminMessage is the Connect error shown when the SNI spoof
+// engine would start but this process cannot load its driver. The frontend
+// matches the phrase "requires administrator rights" — shared with
+// tunRequiresAdminMessage — to offer the RelaunchAsAdmin handoff, so both
+// messages must keep that wording.
+const spoofRequiresAdminMessage = "SNI spoofing requires administrator rights (the WinDivert driver). Relaunch NekoGo as administrator?"
+
+// spoofNeedsElevation reports whether connecting p starts the SNI spoof
+// engine while this GUI process is not elevated. The engine injects fake
+// ClientHellos through WinDivert, which loads a kernel driver, so an
+// unelevated process gets "Access is denied (code 5)" and every dial dies
+// behind a UI that still reports a connection — the shape users describe
+// as "connected, but Google and YouTube will not load". The TUN gate never
+// covered it: a plain spoof connect renders no TUN inbound, so
+// tunRequiredFor is false and the refusal arrived from the driver instead,
+// with no admin remedy attached. Probe failures are not treated as
+// unelevated, matching tunNeedsElevation.
+func spoofNeedsElevation(p *Profile, settings Settings) bool {
+	if runtime.GOOS != "windows" || !spoofConnectEnabled(p, settings) {
 		return false
 	}
 	elevated, err := guiElevated()
@@ -783,7 +849,7 @@ func tunNeedsElevation(p *Profile, settings Settings) bool {
 // "CreateAdapter failed" strings; on an unelevated GUI that means the
 // Wintun adapter, not a config bug. Config rendering is untouched.
 func tunStartHint(err error, p *Profile, settings Settings) error {
-	if err == nil || runtime.GOOS != "windows" || p == nil || p.Core.IsXray() || !tunRequiredFor(p, settings) {
+	if err == nil || runtime.GOOS != "windows" || p == nil || p.Core.IsXray() || p.Core.IsMihomo() || !tunRequiredFor(p, settings) {
 		return err
 	}
 	if elevated, probeErr := guiElevated(); probeErr == nil && elevated {
@@ -938,12 +1004,51 @@ func (a *App) SpoofGetConfig() (SNIConfig, error) {
 // validSpoofEnums mirrors the Rust validator (CORE_REPORT.md section
 // 3): unknown values fail here with the accepted set named, instead
 // of dying inside the engine at Start.
+//
+// These sets are the ENGINE's names, not a memory of them —
+// core/src/fake_tcp.rs SUPPORTED_METHODS and core/src/config.rs
+// SUPPORTED_FINGERPRINTS are the source of truth. Keeping them from
+// drifting matters because the tab offers exactly these values: while
+// this list still named v2's double_sni/delayed_retry, had no
+// hello_split, and knew only the versioned fingerprint spellings,
+// saving Method=hello_split or Fingerprint=chrome was refused here —
+// which discarded every knob in the card, not just the refused one.
 var (
-	validSpoofMethods = []string{"auto", "wrong_seq", "wrong_seq_ttl", "split_seq", "fragmented", "padding", "delayed_retry", "double_sni", "hostfakesplit", "fakedsplit"}
-	validSpoofFPS     = []string{"legacy", "chrome_120", "chrome_124", "firefox_122", "firefox_124", "custom"}
+	validSpoofMethods = []string{"auto", "wrong_seq", "wrong_seq_ttl", "split_seq", "fragmented", "padding", "hello_split", "hostfakesplit", "fakedsplit"}
+	validSpoofFPS     = []string{"legacy", "chrome", "firefox"}
 	validSpoofQUIC    = []string{"block", "spoof", "passthrough"}
 	validSpoofIPMode  = []string{"ipv4", "ipv6", "both"}
+	// Plans are matched case-insensitively (spoofEnumOk lowercases), but
+	// the tab stores them upper-case so the mode reads as "Plan A"/"Plan B".
+	validSpoofPlans = []string{"a", "b"}
 )
+
+// retiredSpoofMethods mirrors config::migrate: names v3 deleted are
+// rewritten to the engine default instead of rejected, because they
+// arrive from a settings file written before the deletion.
+var retiredSpoofMethods = map[string]string{
+	"delayed_retry": "auto",
+	"double_sni":    "auto",
+}
+
+// retiredSpoofFPS folds the pre-v3 versioned spellings onto the names the
+// engine still distinguishes — tls.rs maps chrome_120/chrome_124 and
+// firefox_122/firefox_124 to the same bytes, and storing the canonical
+// name keeps the tab's dropdown showing what is actually saved.
+//
+// "custom" is the same class of lie: it is not in config.rs
+// SUPPORTED_FINGERPRINTS, and tls.rs maps it onto Legacy, so a settings
+// file naming it used to save "custom", render TLS_FINGERPRINT "custom",
+// have the engine canonicalize it to legacy, and leave the tab showing a
+// fingerprint that never existed. Rejecting it outright is not the fix
+// either — a rejected card discards every knob in it — so it migrates.
+var retiredSpoofFPS = map[string]string{
+	"chrome_120":  "chrome",
+	"chrome_124":  "chrome",
+	"firefox_122": "firefox",
+	"firefox_124": "firefox",
+	"custom":      "legacy",
+}
 
 func spoofEnumOk(v string, valid []string) bool {
 	v = strings.ToLower(strings.TrimSpace(v))
@@ -964,6 +1069,26 @@ func (a *App) SpoofSetConfig(cfg SNIConfig) error {
 	cfg.Fingerprint = strings.ToLower(strings.TrimSpace(cfg.Fingerprint))
 	cfg.QUICMode = strings.ToLower(strings.TrimSpace(cfg.QUICMode))
 	cfg.IPMode = strings.ToLower(strings.TrimSpace(cfg.IPMode))
+	// Retired spellings migrate instead of failing the save: they reach
+	// here from a settings file written before v3, and refusing them would
+	// discard the whole card the same way a rejected dropdown value did.
+	if to, ok := retiredSpoofMethods[cfg.Method]; ok {
+		cfg.Method = to
+	}
+	if to, ok := retiredSpoofFPS[cfg.Fingerprint]; ok {
+		cfg.Fingerprint = to
+	}
+	// Plan is the SNI tab's mode switch: "A" = resolve the fake SNIs over
+	// DoH, "B" = dial the curated IP pool (the historical behaviour). The
+	// empty value that every settings file predating the switch carries
+	// normalizes to "B", so the tab always shows an active mode.
+	cfg.Plan = strings.ToUpper(strings.TrimSpace(cfg.Plan))
+	if cfg.Plan == "" {
+		cfg.Plan = "B"
+	}
+	if !spoofEnumOk(cfg.Plan, validSpoofPlans) {
+		return fmt.Errorf(`plan must be "A" (resolve the SNI over DoH) or "B" (use the IP list)`)
+	}
 	if cfg.Method == "" {
 		cfg.Method = "auto"
 	}
@@ -1022,6 +1147,9 @@ func (a *App) SpoofStart(profileID string) error {
 	}
 	if !p.Core.IsSpoof() {
 		return fmt.Errorf("profile %q is not a CoreSpoof profile (got %s)", p.Name, p.Core.String())
+	}
+	if !spoofEnabled(a.store.GetSettings()) {
+		return fmt.Errorf("SNI spoofing is disabled in Settings → Connection")
 	}
 	if err := a.spoofMgr.Start(&p, a.store.GetSettings()); err != nil {
 		return err
@@ -1280,12 +1408,16 @@ func (a *App) IsPrivileged() (bool, error) {
 	return a.cores.IsPrivileged()
 }
 
-// GetSystemProxyState reports the ACTUAL OS proxy switch by reading it
-// from the OS (integration BUG-010). The Console System tab queries
-// this on mount so the toggle reflects reality — a crash leftover, an
-// external change, or a restart — instead of its own stale local state.
+// GetSystemProxyState reports whether the OS proxy is ON *and ours*
+// (integration BUG-010). It used to return the raw ProxyEnable switch,
+// which a corporate or third-party proxy also sets: the toggle then
+// showed ON, the user clicked it off, ClearSystemProxy rightly refused
+// to revert a proxy it never installed — and the card painted "Off"
+// while that foreign proxy kept steering the browser. osProxyOwned is
+// the same predicate Connect's auto path uses, so the two can no longer
+// disagree about who owns the switch.
 func (a *App) GetSystemProxyState() (bool, error) {
-	return osProxyEnabled()
+	return a.osProxyOwned()
 }
 
 // EnableSystemProxyGUI applies the OS proxy for the currently running
@@ -1293,7 +1425,15 @@ func (a *App) GetSystemProxyState() (bool, error) {
 // remembers SystemProxy=true so the next Connect keeps the OS proxy
 // on instead of second-guessing the user.
 func (a *App) EnableSystemProxyGUI() error {
-	if err := a.SetSystemProxy(a.ActiveProxyPorts()); err != nil {
+	p := a.ActiveProxyPorts()
+	if p.HTTP <= 0 && p.SOCKS <= 0 {
+		// No core, no port: pointing the OS proxy at "127.0.0.1:0" is
+		// worse than doing nothing, and doing nothing while returning
+		// nil was how the tile ended up claiming On with an untouched
+		// registry. Say so instead.
+		return fmt.Errorf("no core is running: connect first, then the OS proxy can point at its port")
+	}
+	if err := a.SetSystemProxy(p); err != nil {
 		return err
 	}
 	return a.rememberSystemProxy(true)
@@ -1448,7 +1588,7 @@ func (a *App) ImportLinks(text string) (*LinkImportResult, error) {
 	}
 	a.emitLog("gui", "info", fmt.Sprintf("Import: %d new profiles, %d invalid", len(out), invalid))
 	if len(out) > 0 && a.store.GetSettings().GeoIPAutoDetect {
-		go a.refreshCountriesBackground("import")
+		a.launchCountryRefresh("import")
 	}
 	return &LinkImportResult{Profiles: out, Invalid: invalid}, nil
 }
@@ -1552,7 +1692,7 @@ func (a *App) UpdateSubscriptions() (*LinkImportResult, error) {
 	}
 	a.emitLog("gui", "info", fmt.Sprintf("Subscriptions updated: %d new profiles", len(out)))
 	if len(out) > 0 && a.store.GetSettings().GeoIPAutoDetect {
-		go a.refreshCountriesBackground("subscriptions")
+		a.launchCountryRefresh("subscriptions")
 	}
 	return &LinkImportResult{Profiles: out, Invalid: invalid}, nil
 }
@@ -1659,7 +1799,7 @@ func (a *App) EditSubscription(oldURL, newURL, name string) (*LinkImportResult, 
 	}
 	a.emitLog("gui", "info", fmt.Sprintf("Subscription saved: %s", label))
 	if len(res.Profiles) > 0 && a.store.GetSettings().GeoIPAutoDetect {
-		go a.refreshCountriesBackground("subscriptions")
+		a.launchCountryRefresh("subscriptions")
 	}
 	return res, nil
 }
@@ -1803,6 +1943,37 @@ func (a *App) refreshCountriesBackground(trigger string) {
 	}
 	a.emitLog("gui", "info", fmt.Sprintf("GeoIP refresh (%s): %d updated, %d skipped, %d failed",
 		trigger, res.Updated, res.Skipped, res.Failed))
+}
+
+// launchCountryRefresh starts a tracked background refresh. Add happens
+// before the go statement so waitCountryRefresh (Shutdown / tests) can
+// never miss a goroutine that is about to write config.json. A refresh
+// that has not begun by the time shutdown starts is skipped, so the
+// drain never waits on a fresh run.
+func (a *App) launchCountryRefresh(trigger string) {
+	a.refreshWG.Add(1)
+	go func() {
+		defer a.refreshWG.Done()
+		if a.isQuitting() {
+			return
+		}
+		a.refreshCountriesBackground(trigger)
+	}()
+}
+
+// isQuitting reports whether Shutdown has begun.
+func (a *App) isQuitting() bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.quitting
+}
+
+// waitCountryRefresh cancels any in-flight refresh and blocks until every
+// background refresh goroutine has returned, so no SaveFile outlives the
+// caller. Used by Shutdown and by tests before tearing down their store.
+func (a *App) waitCountryRefresh() {
+	a.CancelRefreshCountries()
+	a.refreshWG.Wait()
 }
 
 // countryLookup resolves and stamps one profile's country fields. It is
@@ -2192,6 +2363,41 @@ func (a *App) XrayVersion() string {
 	return v
 }
 
+// MihomoVersion runs "<resolved mihomo path> -v" and returns the first
+// non-empty stdout line, cached per resolved path like the other cores
+// (a transient "" is never cached, so the next call retries). Measured
+// on v1.19.33: -v prints "Mihomo Meta v1.19.33 windows amd64 with
+// go1.26.10 …" on STDOUT and exits 0, leaving stderr empty. The cache
+// keys on the resolved binary, not settings.MihomoPath, because that
+// override may name a directory.
+func (a *App) MihomoVersion() string {
+	if a.store == nil {
+		return ""
+	}
+	bin, err := resolveMihomo(a.store.GetSettings())
+	if err != nil {
+		return ""
+	}
+	a.mihomoVer.mu.Lock()
+	if a.mihomoVer.path != bin {
+		a.mihomoVer.version = ""
+		a.mihomoVer.path = bin
+	}
+	cached := a.mihomoVer.version
+	a.mihomoVer.mu.Unlock()
+	if cached != "" {
+		return cached
+	}
+	v := runVersionQuery(bin, "-v")
+	a.mihomoVer.mu.Lock()
+	if v != "" {
+		a.mihomoVer.version = v
+	}
+	a.mihomoVer.path = bin
+	a.mihomoVer.mu.Unlock()
+	return v
+}
+
 // RuntimeInfo reports the GUI process runtime for the About diagnostics
 // card (OS + Go toolchain; the cores report their own versions above).
 func (a *App) RuntimeInfo() map[string]string {
@@ -2288,12 +2494,33 @@ func (a *App) SetCloseToTray(enabled bool) error {
 	return nil
 }
 
-// Shutdown stops cores; called on app exit. A leftover system-DNS
-// override is restored best-effort first (BUG-009: quitting with
-// system DNS applied must not leave it installed); an auto-enabled
-// system proxy is likewise restored best-effort, but only when this
-// session enabled it (autoProxyOn) — a manually-enabled proxy is left
-// untouched. Failures are ignored so shutdown never blocks. cores.Stop
+// revertSystemProxyOnExit undoes the OS proxy when this process is going
+// away or the core died underneath it. Ownership is wider than the auto
+// path: a proxy the user turned on by hand is ours too, and once the
+// core is gone its port is closed — leaving the switch installed breaks
+// every browser until NekoGo happens to start again, because
+// cleanupStaleSysproxy only runs at startup. Disconnect keeps the
+// opposite contract: the app is alive and a reconnect is coming, so a
+// manual proxy stays where the user left it.
+func (a *App) revertSystemProxyOnExit(reason string) {
+	if !a.getAutoProxy() && !sysproxyOwned() {
+		return
+	}
+	if err := a.ClearSystemProxy(); err != nil {
+		a.emitLog("gui", "warn", fmt.Sprintf("system proxy revert on %s failed: %v", reason, err))
+		return
+	}
+	a.setAutoProxy(false)
+	a.emitLog("gui", "info", fmt.Sprintf("system proxy reverted on %s", reason))
+}
+
+// Shutdown stops cores; called on app exit. A background GeoIP refresh
+// is cancelled and drained first so no SaveFile writes config.json after
+// exit. A leftover system-DNS override is restored best-effort next
+// (BUG-009: quitting with system DNS applied must not leave it
+// installed); the system proxy is restored the same way whenever this
+// session owns it, auto-enabled or manual — quitting takes the listener
+// with it. Failures are ignored so shutdown never blocks. cores.Stop
 // aborts any in-flight Start via the epoch instead of blocking on its
 // probe.
 func (a *App) Shutdown() {
@@ -2304,10 +2531,8 @@ func (a *App) Shutdown() {
 	}
 	a.quitting = true
 	a.mu.Unlock()
-	if a.getAutoProxy() {
-		_ = a.ClearSystemProxy()
-		a.setAutoProxy(false)
-	}
+	a.waitCountryRefresh()
+	a.revertSystemProxyOnExit("shutdown")
 	_ = a.cores.SetSystemDNS(true)
 	_ = a.cores.Stop()
 }
@@ -2406,9 +2631,33 @@ func mergeCoreOverrides(cfg map[string]any, overrides map[string]json.RawMessage
 		if err := json.Unmarshal([]byte(t), &v); err != nil {
 			return fmt.Errorf("coreOverrides[%q]: %w", sec, err)
 		}
+		// An override holding nothing carries no intent, and applying it
+		// would delete the rendered section. For dns in TUN mode that is
+		// fatal rather than cosmetic: every query is hijacked into
+		// sing-box, so the rendered block is the tunnel's only resolver,
+		// and a stored {} left lookups to fall back to the local
+		// resolver — which on a filtering network answers blocked names
+		// with the interceptor's address.
+		if isEmptyOverride(v) {
+			continue
+		}
 		cfg[key] = v
 	}
 	return nil
+}
+
+// isEmptyOverride reports whether a decoded section override holds
+// nothing: an empty object for route/dns/experimental, an empty array for
+// inbound. Such a value cannot express a setting, so the only effect of
+// applying it is deleting what the renderer produced.
+func isEmptyOverride(v any) bool {
+	switch t := v.(type) {
+	case map[string]any:
+		return len(t) == 0
+	case []any:
+		return len(t) == 0
+	}
+	return false
 }
 
 // rawOverrideKey is the CoreOverrides key holding the Phase G full raw
@@ -2429,6 +2678,13 @@ func rawCoreOverride(overrides map[string]json.RawMessage) (map[string]any, bool
 	var full map[string]any
 	if err := json.Unmarshal(raw, &full); err != nil {
 		return nil, false, fmt.Errorf("coreOverrides[%q]: %w", rawOverrideKey, err)
+	}
+	// JSON null decodes WITHOUT an error into a nil map, and {} carries no
+	// sections either: either one would replace the whole config with a
+	// document no engine can start. Treat them as "no override" so a
+	// profile already holding one falls back to the rendered default.
+	if len(full) == 0 {
+		return nil, false, nil
 	}
 	return full, true, nil
 }
@@ -2503,6 +2759,9 @@ func (a *App) GetCoreConfigSection(section string) (string, error) {
 	if p == nil {
 		return "", fmt.Errorf("no profiles: add a profile first")
 	}
+	if p.Core.IsMihomo() {
+		return "", fmt.Errorf("%s", mihomoConfigEditorMessage)
+	}
 	xray := p.Core.IsXray()
 	key, ok := sectionConfigKey(section, xray)
 	if !ok {
@@ -2552,6 +2811,16 @@ func (a *App) SetCoreConfigSection(section, jsonText string) (string, error) {
 	v, err := validateCoreSectionJSON(section, jsonText)
 	if err != nil {
 		return "", err
+	}
+	// An empty section is "no override", not an override that deletes the
+	// rendered block at connect (see mergeCoreOverrides). Clear the key and
+	// hand back the default the editor shows anyway, so saving an emptied
+	// box can never leave a section-deleter stored.
+	if isEmptyOverride(v) {
+		if err := a.ResetCoreConfigSection(section); err != nil {
+			return "", err
+		}
+		return a.GetCoreConfigSection(section)
 	}
 	norm, err := json.Marshal(v)
 	if err != nil {
@@ -2710,6 +2979,13 @@ func (a *App) ImportAllData(blob string) error {
 	return nil
 }
 
+// mihomoConfigEditorMessage explains why the Advanced config readers
+// refuse a mihomo target: those editors slice sing-box/Xray sections out
+// of a rendered document and store app-wide overrides the mihomo renderer
+// never merges, so showing one would offer an edit that cannot take
+// effect. The live document is still readable while connected.
+const mihomoConfigEditorMessage = "The mihomo core renders its own Clash Meta document, so the section and raw config editors do not apply to it. Connect the profile and use Backup → View raw config to read what mihomo was given."
+
 // renderActiveConfig renders the exact config JSON the given profile
 // would receive on the next Connect, overrides merged in.
 func renderActiveConfig(p *Profile, settings Settings) (string, error) {
@@ -2719,6 +2995,9 @@ func renderActiveConfig(p *Profile, settings Settings) (string, error) {
 			addr = "127.0.0.1:10085"
 		}
 		return BuildXrayConfig(p, settings, addr)
+	}
+	if p.Core.IsMihomo() {
+		return "", fmt.Errorf("%s", mihomoConfigEditorMessage)
 	}
 	return BuildSingBoxConfig(p, settings)
 }
@@ -2735,6 +3014,15 @@ func (a *App) ViewRawConfig() (string, error) {
 	if !ok {
 		return "", nil
 	}
+	if p.Core.IsMihomo() {
+		// The document the running child was actually given: mihomo's
+		// controller port and secret are chosen per Start, so only the
+		// manager can report them.
+		if a.mihomoMgr == nil {
+			return "", nil
+		}
+		return a.mihomoMgr.LiveConfig(), nil
+	}
 	return renderActiveConfig(&p, a.store.GetSettings())
 }
 
@@ -2743,6 +3031,12 @@ func (a *App) ViewRawConfig() (string, error) {
 // be an array; route/routing/dns/experimental must be objects when
 // present), core-agnostic so one blob works for either engine.
 func validateRawConfig(v map[string]any) error {
+	// Saving a raw override also wipes every section override, so an
+	// empty document would cost the user their edits and leave a config
+	// no engine can start.
+	if len(v) == 0 {
+		return fmt.Errorf("raw config must be a non-empty JSON object")
+	}
 	if inb, ok := v["inbounds"]; ok && inb != nil {
 		if _, ok := inb.([]any); !ok {
 			return fmt.Errorf("\"inbounds\" must be a JSON array")
@@ -2853,6 +3147,12 @@ func (a *App) ReloadCoreNow() error {
 		start = func(p *Profile, s Settings) error { return a.cores.Start(p, s) }
 	}
 	if err := start(&p, a.store.GetSettings()); err != nil {
+		// Same contract as Connect: the Stop above closed the listener and
+		// reports no EngineExit, so a failed restart must not leave the OS
+		// proxy pointing at a port nothing listens on.
+		if _, _, running := a.cores.Status(); !running {
+			a.revertSystemProxyOnExit("failed reload")
+		}
 		return fmt.Errorf("start: %w", err)
 	}
 	a.refreshTray()

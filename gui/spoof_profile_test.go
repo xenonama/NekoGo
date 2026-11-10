@@ -173,10 +173,10 @@ func TestShouldRescueLoopbackProfile(t *testing.T) {
 
 	dead := base()
 	dead.Port = deadPort
-	if !shouldRescueLoopbackProfile(&dead) {
+	if !shouldRescueLoopbackProfile(&dead, DefaultSettings()) {
 		t.Fatal("dead eligible loopback: want rescue")
 	}
-	if shouldRescueLoopbackProfile(nil) {
+	if shouldRescueLoopbackProfile(nil, DefaultSettings()) {
 		t.Fatal("nil profile: want no rescue")
 	}
 
@@ -188,23 +188,23 @@ func TestShouldRescueLoopbackProfile(t *testing.T) {
 	defer live.Close()
 	alive := base()
 	alive.Port = live.Addr().(*net.TCPAddr).Port
-	if shouldRescueLoopbackProfile(&alive) {
+	if shouldRescueLoopbackProfile(&alive, DefaultSettings()) {
 		t.Fatal("live listener: want no rescue (never hijack)")
 	}
 
 	spoofed := base()
 	spoofed.Core = CoreSpoof
-	if shouldRescueLoopbackProfile(&spoofed) {
+	if shouldRescueLoopbackProfile(&spoofed, DefaultSettings()) {
 		t.Fatal("already spoof core: want no rescue")
 	}
 	direct := base()
 	direct.Address = "www.calmlunch.com"
-	if shouldRescueLoopbackProfile(&direct) {
+	if shouldRescueLoopbackProfile(&direct, DefaultSettings()) {
 		t.Fatal("non-loopback address: want no rescue")
 	}
 	tcpT := base()
 	tcpT.Network = "tcp"
-	if shouldRescueLoopbackProfile(&tcpT) {
+	if shouldRescueLoopbackProfile(&tcpT, DefaultSettings()) {
 		t.Fatal("ineligible transport: want no rescue")
 	}
 }
@@ -221,30 +221,30 @@ func TestShouldRescueDirectSpoofProfile(t *testing.T) {
 			TLS: true, Network: "ws", ServerName: "www.calmlunch.com", Path: "/assignment",
 		}
 	}
-	if p := base(); !shouldRescueDirectSpoofProfile(&p) {
+	if p := base(); !shouldRescueDirectSpoofProfile(&p, DefaultSettings()) {
 		t.Fatal("eligible direct domain: want rescue")
 	}
-	if shouldRescueDirectSpoofProfile(nil) {
+	if shouldRescueDirectSpoofProfile(nil, DefaultSettings()) {
 		t.Fatal("nil profile: want no rescue")
 	}
 	spoofed := base()
 	spoofed.Core = CoreSpoof
-	if shouldRescueDirectSpoofProfile(&spoofed) {
+	if shouldRescueDirectSpoofProfile(&spoofed, DefaultSettings()) {
 		t.Fatal("already spoof core: want no rescue")
 	}
 	lit := base()
 	lit.Address = "104.18.9.83"
-	if shouldRescueDirectSpoofProfile(&lit) {
+	if shouldRescueDirectSpoofProfile(&lit, DefaultSettings()) {
 		t.Fatal("IP literal: want no rescue (never auto-tag)")
 	}
 	v6 := base()
 	v6.Address = "2a06:98c1:3101::6812:202f"
-	if shouldRescueDirectSpoofProfile(&v6) {
+	if shouldRescueDirectSpoofProfile(&v6, DefaultSettings()) {
 		t.Fatal("IPv6 literal (normal config): want no rescue")
 	}
 	tcpT := base()
 	tcpT.Network = "tcp"
-	if shouldRescueDirectSpoofProfile(&tcpT) {
+	if shouldRescueDirectSpoofProfile(&tcpT, DefaultSettings()) {
 		t.Fatal("ineligible transport: want no rescue")
 	}
 }
@@ -257,6 +257,11 @@ func TestConnectRescuesDeadLoopbackProfile(t *testing.T) {
 	if runtime.GOOS != "windows" {
 		t.Skip("loopback rescue is Windows-only (sni-spoof.exe)")
 	}
+	// The rescue converts this profile to the spoof core, and a spoof connect
+	// now needs an elevated process for WinDivert. This test is about the
+	// conversion, not the driver, so declare the side explicitly (the
+	// elevation gate has its own tests in elevate_test.go).
+	withElevated(t, true)
 	store, err := NewConfigStore(t.TempDir())
 	if err != nil {
 		t.Fatalf("NewConfigStore: %v", err)

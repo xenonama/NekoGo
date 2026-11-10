@@ -17,6 +17,9 @@ thiserror = "1.0"
 rand = "0.8"
 md5 = "0.7"
 parking_lot = "0.12"
+# Plan A DoH lookups. native-tls = Schannel on Windows, so no C toolchain is
+# needed, unlike the default rustls provider (ring).
+ureq = { version = "3.5", default-features = false, features = ["native-tls"] }
 eframe = "0.28"
 egui = "0.28"
 # Features are set per-crate (backend needs Win32_Security for CreateMutexW).

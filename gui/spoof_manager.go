@@ -15,6 +15,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
+	"log"
 	"net"
 	"os"
 	"os/exec"
@@ -47,9 +49,12 @@ var spoofStartupTimeout = 10 * time.Second
 
 // SpoofManager spawns sni-spoof.exe and scrapes its stdout.
 type SpoofManager struct {
-	mu         sync.Mutex
-	cmd        *exec.Cmd
-	process    *os.Process
+	mu      sync.Mutex
+	cmd     *exec.Cmd
+	process *os.Process
+	// stdin is the stop-request channel (see Stop): the only graceful-shutdown
+	// path Windows gives a Go parent over its child.
+	stdin      io.WriteCloser
 	configPath string
 	port       int
 	running    bool
@@ -163,8 +168,9 @@ var parsedCFCIDRs = func() []*net.IPNet {
 }()
 
 // isCloudflareIP reports whether ip belongs to a Cloudflare-fronted
-// range. The engine only makes sense in front of Cloudflare, so
-// anything else is a configuration error, not a dial-and-hope.
+// range. A CF edge is the preferred dial target (any edge serves any
+// CF-hosted site), but it is a preference, not a requirement — a
+// non-CF site is dialed at its own address.
 func isCloudflareIP(ip string) bool {
 	parsed := net.ParseIP(strings.TrimSpace(ip))
 	if parsed == nil {
@@ -207,6 +213,16 @@ func isDomainAddress(addr string) bool {
 func normalizeFakeSNI(s string) string {
 	s = strings.TrimSpace(strings.ToLower(s))
 	return strings.Trim(s, ".")
+}
+
+// spoofPlanA reports whether the SNI tab is in Plan A: the engine
+// derives its connect endpoint by resolving each fake SNI over DoH
+// ("RESOLVE_SNI", CORE_REPORT.md section 17) instead of dialing the
+// curated IP pool. Anything but "A" — including the empty value every
+// settings file written before this switch has — is Plan B, the
+// historical behaviour, unchanged.
+func spoofPlanA(settings Settings) bool {
+	return strings.EqualFold(strings.TrimSpace(settings.SNIConfig.Plan), "A")
 }
 
 // spoofEligibilityIssue reports why a profile cannot ride the
@@ -256,23 +272,92 @@ func cfIPLiteral(addr string) (string, bool) {
 	return v4.String(), true
 }
 
-// resolveDomainToCFIP resolves a domain to its first Cloudflare IP.
-// Non-CF resolutions are rejected with the resolved set named.
-// The lookup budget is 3s: this runs synchronously inside Start
-// (which holds the manager mutex), so a slow resolver would stall
-// both Connect and the SNI tab's 2s status poll behind it.
+// resolveSpoofEndpointIP resolves the IPv4 the engine dials for a fake SNI.
+// A Cloudflare edge wins when the answer set has one: any CF edge serves any
+// CF-hosted site, so that pool is deep and anycast-fast. Otherwise the name's
+// own public IPv4 is used — requiring Cloudflare made every non-CF site fail
+// inside Start, before the engine was even spawned, which is why youtube.com,
+// instagram.com and google.com could never ride the spoof core at all.
+//
+// The answer set is validated, and the lookup repeats up to
+// spoofResolveAttempts times when a set holds nothing usable. That budget
+// exists because the DNS poisoning measured on this network is per-query
+// probabilistic: the same name alternates between the real edge address and a
+// captive-portal 10.x, so one poisoned answer set does not mean the resolver is
+// lying permanently. Retries are only spent on the path that used to fail
+// outright.
 // Private/reserved hits (e.g. a localhost/DPI interceptor answering
 // 10.x for a public domain) are skipped, not fatal: the lookup
-// keeps scanning the answer set for a real CF edge IP before
+// keeps scanning the answer set for a usable edge IP before
 // failing.
-func resolveDomainToCFIP(domain string) (string, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-	defer cancel()
-	ips, err := net.DefaultResolver.LookupIPAddr(ctx, domain)
-	if err != nil {
-		return "", fmt.Errorf("resolve %q: %w", domain, err)
+func resolveSpoofEndpointIP(domain string) (string, error) {
+	var seen []net.IPAddr
+	var lastErr error
+	for attempt := 0; attempt < spoofResolveAttempts; attempt++ {
+		// First lookup gets the full budget; the retries are cheap because
+		// this runs synchronously inside Start (which holds the manager
+		// mutex) and a slow resolver would otherwise stall Connect and the
+		// SNI tab's 2s status poll behind it.
+		budget := 1500 * time.Millisecond
+		if attempt == 0 {
+			budget = 3 * time.Second
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), budget)
+		ips, err := lookupSpoofEndpointAddr(ctx, domain)
+		cancel()
+		if err != nil {
+			lastErr = fmt.Errorf("resolve %q: %w", domain, err)
+			continue
+		}
+		seen = appendSeenIPAddrs(seen, ips)
+		ip, pickErr := pickSpoofEndpointIP(domain, seen)
+		if pickErr == nil {
+			if attempt > 0 {
+				log.Printf("[spoof] resolve %q needed %d lookups: the local resolver returned poisoned answers, %s is the first usable one",
+					domain, attempt+1, ip)
+			}
+			return ip, nil
+		}
+		lastErr = pickErr
 	}
-	seen := make([]string, 0, len(ips))
+	return "", fmt.Errorf("%w (%d lookups)", lastErr, spoofResolveAttempts)
+}
+
+// spoofResolveAttempts is the per-endpoint lookup budget.
+const spoofResolveAttempts = 3
+
+// lookupSpoofEndpointAddr is the resolver seam. It is a variable so the retry
+// and answer-set validation are unit-testable without live DNS: every resolver
+// path on this development network is intercepted, so the positive path could
+// only ever be exercised against a fake.
+var lookupSpoofEndpointAddr = func(ctx context.Context, domain string) ([]net.IPAddr, error) {
+	return net.DefaultResolver.LookupIPAddr(ctx, domain)
+}
+
+// appendSeenIPAddrs accumulates answer sets across retries without
+// duplicates, so the final error lists each distinct answer once.
+func appendSeenIPAddrs(seen, add []net.IPAddr) []net.IPAddr {
+	for _, a := range add {
+		dup := false
+		for _, s := range seen {
+			if s.IP.Equal(a.IP) {
+				dup = true
+				break
+			}
+		}
+		if !dup {
+			seen = append(seen, a)
+		}
+	}
+	return seen
+}
+
+// pickSpoofEndpointIP chooses the dial address out of one DNS answer set.
+// Split from resolveSpoofEndpointIP so the choice is testable without a
+// resolver: the Cloudflare-only gate this replaces was fused to live DNS,
+// which is why it shipped rejecting every non-CF site.
+func pickSpoofEndpointIP(domain string, ips []net.IPAddr) (string, error) {
+	firstPublic := ""
 	skipped := make([]string, 0, len(ips))
 	for _, ip := range ips {
 		v4 := ip.IP.To4()
@@ -284,18 +369,20 @@ func resolveDomainToCFIP(domain string) (string, error) {
 			skipped = append(skipped, s)
 			continue
 		}
-		seen = append(seen, s)
+		if firstPublic == "" {
+			firstPublic = s
+		}
 		if isCloudflareIP(s) {
 			return s, nil
 		}
 	}
-	if len(seen) == 0 {
-		if len(skipped) > 0 {
-			return "", fmt.Errorf("resolve %q: only private answers (%s) — local resolver/DPI intercepted it, retry with the SNI tab's pinned IP checked", domain, strings.Join(skipped, ", "))
-		}
-		return "", fmt.Errorf("resolve %q: no IPv4 address found (sni-spoof needs a Cloudflare IPv4 endpoint)", domain)
+	if firstPublic != "" {
+		return firstPublic, nil
 	}
-	return "", fmt.Errorf("resolve %q: %s is not Cloudflare-fronted (want 104./172.67./141.101./108.162.)", domain, strings.Join(seen, ", "))
+	if len(skipped) > 0 {
+		return "", fmt.Errorf("resolve %q: only private answers (%s) — local resolver/DPI intercepted it, retry with the SNI tab's pinned IP checked", domain, strings.Join(skipped, ", "))
+	}
+	return "", fmt.Errorf("resolve %q: no IPv4 address found (sni-spoof needs an IPv4 endpoint)", domain)
 }
 
 // spoofEndpointPort returns the remote port the engine must dial.
@@ -457,6 +544,14 @@ func buildSpoofConfigJSON(profile *Profile, settings Settings, listenPort int, e
 		"FAKE_SNIS":   buildSpoofSNIs(fakeSNI, settings),
 		"MODE":        "SNI Only",
 	}
+	if spoofPlanA(settings) {
+		// Plan A: the core derives the connect endpoint by resolving the
+		// fake SNIs over DoH, so ENDPOINTS is deactivated for dialing — but
+		// it stays in the document because it still carries the port (the
+		// core reads endpoint[0].port) and because switching the tab back to
+		// Plan B restores the old behaviour with the pool untouched.
+		cfg["RESOLVE_SNI"] = true
+	}
 	sc := settings.SNIConfig
 	if strings.TrimSpace(sc.Method) != "" {
 		cfg["BYPASS_METHOD"] = strings.TrimSpace(sc.Method)
@@ -516,7 +611,7 @@ func (m *SpoofManager) Start(profile *Profile, settings Settings) error {
 	}
 	m.mu.Unlock()
 	// Step 1: target resolution is the only network wait before spawn
-	// (3s DNS budget in resolveDomainToCFIP). Unlocked on purpose.
+	// (3s DNS budget in resolveSpoofEndpointIP). Unlocked on purpose.
 	m.log("info", fmt.Sprintf("[spoof] starting spoofer (profile %q)", profile.Name))
 	endpointIP, fakeSNI, endpointPort, err := resolveSNITarget(profile, settings)
 	if err != nil {
@@ -565,8 +660,21 @@ func (m *SpoofManager) Start(profile *Profile, settings Settings) error {
 	m.log("info", fmt.Sprintf("[spoof] rendering config (port %d, endpoint %s:%d)", port, endpointIP, endpointPort))
 	cmd := exec.Command(exe, "run", "-c", cfgPath)
 	setHideWindow(cmd)
+	// The stop request goes down this pipe: Windows offers no other way for
+	// a Go parent to ask its child to exit, because os.Process.signal returns
+	// EWINDOWS for every signal except Kill (read from this toolchain's own
+	// src/os/exec_windows.go). The previous os.Interrupt call therefore never
+	// reached the engine's shutdown path, not once.
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		_ = os.Remove(cfgPath)
+		m.lastError = err.Error()
+		m.mu.Unlock()
+		return fmt.Errorf("spoof stdin pipe: %w", err)
+	}
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
+		_ = stdin.Close()
 		_ = os.Remove(cfgPath)
 		m.lastError = err.Error()
 		m.mu.Unlock()
@@ -574,6 +682,7 @@ func (m *SpoofManager) Start(profile *Profile, settings Settings) error {
 	}
 	cmd.Stderr = &logWriter{ch: m.logCh, source: "spoof", ring: &m.recent}
 	if err := cmd.Start(); err != nil {
+		_ = stdin.Close()
 		_ = os.Remove(cfgPath)
 		m.lastError = err.Error()
 		m.mu.Unlock()
@@ -581,6 +690,7 @@ func (m *SpoofManager) Start(profile *Profile, settings Settings) error {
 	}
 	m.cmd = cmd
 	m.process = cmd.Process
+	m.stdin = stdin
 	m.configPath = cfgPath
 	m.port = port
 	m.running = true
@@ -721,7 +831,7 @@ func spoofReadyLine(msg string) bool {
 // and polls for the reaping (same contract as SingBoxManager.Stop).
 func (m *SpoofManager) Stop() error {
 	m.mu.Lock()
-	proc, cmd, cfgPath := m.process, m.cmd, m.configPath
+	proc, cmd, cfgPath, stdin := m.process, m.cmd, m.configPath, m.stdin
 	running := m.running
 	if running {
 		// The reaper must see this exit as requested, not as a fault.
@@ -749,33 +859,39 @@ func (m *SpoofManager) Stop() error {
 		m.mu.Unlock()
 		return nil
 	}
-	// SIGINT first: the engine runs its shutdown path ([WARN] engine
-	// stopped, exit 0 per CORE_REPORT.md section 6). Windows Go
-	// cannot deliver SIGINT to another process, so escalate to Kill
-	// when the graceful exit does not land.
-	_ = proc.Signal(os.Interrupt)
+	// Ask for a clean exit over the pipe the engine reads: it flips STOP,
+	// runs EngineHandle::shutdown and prints "[WARN] engine stopped" before
+	// exiting 0. proc.Signal(os.Interrupt) — what used to sit here — cannot
+	// work: os.Process.signal on Windows returns EWINDOWS for every signal
+	// except Kill, so the engine was TerminateProcess'd without its shutdown
+	// path ever running, on every single stop.
+	if stdin != nil {
+		_, _ = stdin.Write([]byte("stop\n"))
+		_ = stdin.Close()
+	}
 	deadline := time.Now().Add(3 * time.Second)
-	killed := false
+	graceful := false
 	for time.Now().Before(deadline) {
-		m.mu.Lock()
-		running := m.running
-		m.mu.Unlock()
-		if !running {
+		if !m.IsRunning() {
+			graceful = true
 			break
 		}
-		if time.Since(deadline.Add(-3*time.Second)) > 500*time.Millisecond && !killed {
-			_ = proc.Kill()
-			killed = true
-		}
-		time.Sleep(50 * time.Millisecond)
+		time.Sleep(25 * time.Millisecond)
 	}
-	_ = proc.Kill()
+	if !graceful {
+		// An engine wedged inside shutdown must not hold Connect open
+		// silently: escalate, and put the escalation in the log so a stuck
+		// WinDivert teardown is visible instead of looking like a clean stop.
+		_ = proc.Kill()
+		m.log("warn", "spoof engine did not answer the stop request; terminated")
+	}
 	_ = os.Remove(cfgPath)
 
 	m.mu.Lock()
 	m.running = false
 	m.cmd = nil
 	m.process = nil
+	m.stdin = nil
 	m.configPath = ""
 	m.mu.Unlock()
 	return nil

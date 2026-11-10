@@ -14,6 +14,7 @@
         @update:model-value="model.core = Number($event) as Profile['core']"
       />
       <p v-if="model.core === 2" class="muted">Routes trojan/vless through the built-in sni-spoof core. Requires admin + WinDivert (Windows only).</p>
+      <p v-if="model.core === 3" class="muted">Runs mihomo.exe (Clash Meta) with this profile as its only proxy. Needs mihomo.exe in the bin folder; traffic and the connection table come from its own controller.</p>
       <label>Protocol</label>
       <PickSelect v-model="model.protocol" icon="globe" title="Protocol" aria-label="Protocol" quiet :options="protocolOptions" />
       <p v-if="model.protocol === 'aether'" class="muted">Runs the Aether engine next to sing-box (like PattNG): the profile dials its internal SOCKS listener.</p>
@@ -70,6 +71,7 @@ const coreOptions = [
   { value: '0', label: 'sing-box (nekobox_core)' },
   { value: '1', label: 'xray' },
   { value: '2', label: 'SNI Spoofing' },
+  { value: '3', label: 'mihomo (Clash Meta)' },
 ]
 const protocolOptions = ['vless', 'vmess', 'trojan', 'shadowsocks', 'socks', 'http', 'wireguard', 'hysteria2', 'tuic', 'aether']
   .map((v) => ({ value: v, label: v }))

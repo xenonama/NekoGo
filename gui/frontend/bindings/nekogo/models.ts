@@ -209,6 +209,15 @@ export enum CoreType {
      * fake ClientHello via WinDivert. MODE is always "SNI Only".
      */
     CoreSpoof = 2,
+
+    /**
+     * CoreMihomo runs the profile with mihomo.exe (Clash Meta). The
+     * profile renders as one mihomo proxy behind a single-member select
+     * group matched by a MATCH rule, so every connection takes it;
+     * stats, the connection table and latency probes read mihomo's own
+     * external controller (the Clash REST API).
+     */
+    CoreMihomo = 3,
 };
 
 /**
@@ -430,7 +439,8 @@ export class LogEntry {
  * Profile is the GUI-side canonical profile format. It is deliberately a
  * superset: sing-box profiles are translated to a sing-box outbound JSON
  * snippet, Xray profiles are translated to an Xray config.json by
- * xray_manager.go.
+ * xray_manager.go, and mihomo profiles to a Clash Meta document by
+ * mihomo_manager.go.
  */
 export class Profile {
     "id": string;
@@ -755,6 +765,15 @@ export class SNIConfig {
     "seqOverlap"?: number;
     "paddingSize"?: number;
 
+    /**
+     * Plan picks where the engine gets its connect endpoint:
+     * "" or "B" = Plan B, the curated IP list is the endpoint pool
+     * (the historical behaviour); "A" = Plan A, the engine resolves
+     * each fake SNI itself (DoH) and dials that, so the IP list
+     * becomes a read-out of what Plan A derived.
+     */
+    "plan"?: string;
+
     /** Creates a new SNIConfig instance. */
     constructor($$source: Partial<SNIConfig> = {}) {
 
@@ -811,6 +830,13 @@ export class SNIPairResult {
     "tlsVersion"?: string;
     "error"?: string;
 
+    /**
+     * Warning is Plan A's non-fatal note: the handshake worked against an
+     * address that is not a Cloudflare edge, so the engine dials the SNI's
+     * own IP rather than riding a CF edge.
+     */
+    "warning"?: string;
+
     /** Creates a new SNIPairResult instance. */
     constructor($$source: Partial<SNIPairResult> = {}) {
         if (!("ip" in $$source)) {
@@ -848,6 +874,13 @@ export class SNISNI {
     "lastMs"?: number;
     "lastAt"?: string;
     "lastTls"?: string;
+
+    /**
+     * LastIP is Plan A's read-out: the address the last resolve of
+     * this host returned (empty until a Plan A scan runs). Plan B
+     * never writes it — its endpoints come from the IP list.
+     */
+    "lastIp"?: string;
     "selected"?: boolean | null;
 
     /** Creates a new SNISNI instance. */
@@ -1021,6 +1054,14 @@ export class Settings {
     "xrayPath": string;
 
     /**
+     * MihomoPath is the dedicated override for mihomo.exe (Clash Meta).
+     * Like UpstreamCorePath it is never shared with another engine's
+     * override: the binaries are separate and must not resolve to each
+     * other's file.
+     */
+    "mihomoPath"?: string;
+
+    /**
      * CoreEngine selects which sing-box binary runs sing-box profiles and
      * every sing-box transport (plain, SNI spoof, Aether).
      * "custom" = nekobox_core.exe (NekoBox fork with Thrift RPC).
@@ -1135,6 +1176,13 @@ export class Settings {
     "collapsedProxyGroups"?: string[];
 
     /**
+     * ProxyGroups lists user-created Proxies-tab remark groups. Feed groups
+     * are implicit from Profile.Group; this keeps a manually named group in
+     * the list before (or without) any profile being moved into it.
+     */
+    "proxyGroups"?: string[];
+
+    /**
      * AdvancedPeekSimple shows the Simple shell while Advanced Mode
      * stays ON (peek mode). Reset when Advanced Mode is disabled.
      */
@@ -1155,6 +1203,15 @@ export class Settings {
      * chain is exempt: its TUN inbound exists only on sing-box.
      */
     "spoofXray"?: boolean;
+
+    /**
+     * SpoofEnabled gates the SNI spoof engine at runtime. Absent means
+     * enabled (configs predate the toggle); false makes CoreSpoof
+     * profiles dial their own address with the normal transport instead
+     * of through the engine — e.g. a local 127.0.0.1 tunnel the user
+     * runs themselves.
+     */
+    "spoofEnabled"?: boolean | null;
 
     /**
      * AetherPsiphon runs Psiphon on top of an Aether connect through the
@@ -1279,34 +1336,38 @@ export class Settings {
      * Creates a new Settings instance from a string or object.
      */
     static createFrom($$source: any = {}): Settings {
-        const $$createField37_0 = $$createType14;
-        const $$createField42_0 = $$createType15;
-        const $$createField44_0 = $$createType2;
-        const $$createField49_0 = $$createType16;
-        const $$createField52_0 = $$createType18;
-        const $$createField53_0 = $$createType20;
-        const $$createField54_0 = $$createType22;
+        const $$createField38_0 = $$createType14;
+        const $$createField43_0 = $$createType15;
+        const $$createField45_0 = $$createType2;
+        const $$createField46_0 = $$createType2;
+        const $$createField52_0 = $$createType16;
+        const $$createField55_0 = $$createType18;
+        const $$createField56_0 = $$createType20;
+        const $$createField57_0 = $$createType22;
         let $$parsedSource = typeof $$source === 'string' ? JSON.parse($$source) : $$source;
         if ("subscriptions" in $$parsedSource) {
-            $$parsedSource["subscriptions"] = $$createField37_0($$parsedSource["subscriptions"]);
+            $$parsedSource["subscriptions"] = $$createField38_0($$parsedSource["subscriptions"]);
         }
         if ("coreOverrides" in $$parsedSource) {
-            $$parsedSource["coreOverrides"] = $$createField42_0($$parsedSource["coreOverrides"]);
+            $$parsedSource["coreOverrides"] = $$createField43_0($$parsedSource["coreOverrides"]);
         }
         if ("collapsedProxyGroups" in $$parsedSource) {
-            $$parsedSource["collapsedProxyGroups"] = $$createField44_0($$parsedSource["collapsedProxyGroups"]);
+            $$parsedSource["collapsedProxyGroups"] = $$createField45_0($$parsedSource["collapsedProxyGroups"]);
+        }
+        if ("proxyGroups" in $$parsedSource) {
+            $$parsedSource["proxyGroups"] = $$createField46_0($$parsedSource["proxyGroups"]);
         }
         if ("sniConfig" in $$parsedSource) {
-            $$parsedSource["sniConfig"] = $$createField49_0($$parsedSource["sniConfig"]);
+            $$parsedSource["sniConfig"] = $$createField52_0($$parsedSource["sniConfig"]);
         }
         if ("sniIps" in $$parsedSource) {
-            $$parsedSource["sniIps"] = $$createField52_0($$parsedSource["sniIps"]);
+            $$parsedSource["sniIps"] = $$createField55_0($$parsedSource["sniIps"]);
         }
         if ("sniSnis" in $$parsedSource) {
-            $$parsedSource["sniSnis"] = $$createField53_0($$parsedSource["sniSnis"]);
+            $$parsedSource["sniSnis"] = $$createField56_0($$parsedSource["sniSnis"]);
         }
         if ("aetherScanResults" in $$parsedSource) {
-            $$parsedSource["aetherScanResults"] = $$createField54_0($$parsedSource["aetherScanResults"]);
+            $$parsedSource["aetherScanResults"] = $$createField57_0($$parsedSource["aetherScanResults"]);
         }
         return new Settings($$parsedSource as Partial<Settings>);
     }
@@ -1352,6 +1413,18 @@ export class SpoofRanked {
     "fail": number;
     "rate": number;
 
+    /**
+     * LatencyMs is the engine's EWMA time for this method; nil until the row
+     * has been timed at all, which is why a 100% row can still look idle.
+     */
+    "latency_ms": number | null;
+
+    /**
+     * Score is what auto ordered the rows on (success rate minus latency
+     * drag) — without it the tab shows a rate and cannot explain the ranking.
+     */
+    "score": number;
+
     /** Creates a new SpoofRanked instance. */
     constructor($$source: Partial<SpoofRanked> = {}) {
         if (!("key" in $$source)) {
@@ -1365,6 +1438,12 @@ export class SpoofRanked {
         }
         if (!("rate" in $$source)) {
             this["rate"] = 0;
+        }
+        if (!("latency_ms" in $$source)) {
+            this["latency_ms"] = null;
+        }
+        if (!("score" in $$source)) {
+            this["score"] = 0;
         }
 
         Object.assign(this, $$source);
@@ -1671,7 +1750,7 @@ export class URLTestResult {
  */
 export class UpdatableComponent {
     /**
-     * "geoip" | "geosite" | "singbox" | "nekobox" | "xray" | "gui"
+     * "geoip" | "geosite" | "singbox" | "nekobox" | "xray" | "mihomo" | "gui"
      */
     "id": string;
     "name": string;

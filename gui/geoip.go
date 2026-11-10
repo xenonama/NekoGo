@@ -201,13 +201,29 @@ func (g *GeoIP) lookupIP(ip net.IP) (string, string, error) {
 }
 
 // splitRecord extracts the upper-cased code + English name, mapping
-// unknown countries to ("", "", nil).
+// unknown or malformed countries to ("", "", nil). A corrupt/customized
+// DB can return a non-ISO string (e.g. "GOOGLE"); only a two-letter
+// alpha-2 code is accepted so garbage never reaches the UI.
 func splitRecord(rec geoCountryRecord) (string, string, error) {
 	code := strings.ToUpper(strings.TrimSpace(rec.Country.ISOCode))
-	if code == "" {
+	if !validCountryCode(code) {
 		return "", "", nil
 	}
 	return code, rec.Country.Names["en"], nil
+}
+
+// validCountryCode reports whether code is an ISO-3166 alpha-2 shape:
+// exactly two ASCII letters (already upper-cased by the caller).
+func validCountryCode(code string) bool {
+	if len(code) != 2 {
+		return false
+	}
+	for i := 0; i < len(code); i++ {
+		if code[i] < 'A' || code[i] > 'Z' {
+			return false
+		}
+	}
+	return true
 }
 
 // isPublicIP rejects loopback, private, link-local and multicast space:

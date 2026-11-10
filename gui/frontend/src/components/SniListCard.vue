@@ -1,4 +1,4 @@
-<!-- Scalable candidate-list card for the SNI tab (Cloudflare IPs and
+<!-- Scalable candidate-list card for the SNI tab (IPs and
      decoy SNIs). Hundreds of entries used to render as one endless
      row list; this card bounds the DOM (capped, scrollable window),
      makes entries findable (live filter + health sort: scanned-OK
@@ -15,10 +15,15 @@
      checked entry can be starred, not just the first. Each row scans
      alone (an IP against the pinned SNI, an SNI against the pinned
      IP). The toolbar's "Scan checked (N)" probes only the checked
-     subset the same way — there is no IP x SNI matrix scan. -->
+     subset the same way — there is no IP x SNI matrix scan.
+     `readonly` is the same card without the editor: no add field, no
+     checkboxes, no star, no remove, and row clicks do nothing. The
+     caller supplies derived rows and keeps the scan button, which is
+     how Plan A's IPs card shows the addresses it resolved from the
+     SNI list instead of a pool the user maintains. -->
 <template>
   <div class="nb-card nb-page">
-    <h3>{{ title }} <span class="sni-count">{{ countText }} · {{ activeCount }} active</span></h3>
+    <h3>{{ title }} <span class="sni-count">{{ countText }} · {{ activeText }}</span></h3>
     <p class="muted">{{ hint }}<template v-if="primaryKey"> Primary: <strong>{{ primaryKey }}</strong>.</template></p>
     <div class="toolbar sni-toolbar">
       <slot name="toolbar" />
@@ -26,28 +31,30 @@
         <SearchBar v-model="query" :placeholder="searchPlaceholder" />
       </span>
       <PickSelect v-model="sortMode" icon="list" title="Sort order" aria-label="Sort order" neutral="health" :options="sortOptions" />
-      <button class="nb-act" :disabled="busy || scanning || sorted.length === 0" :title="checkAllTitle" @click="toggleCheckAll">
+      <button v-if="!readonly" class="nb-act" :disabled="busy || scanning || sorted.length === 0" :title="checkAllTitle" @click="toggleCheckAll">
         <Icon name="check" :size="14" />{{ allFilteredChecked ? 'Uncheck all' : 'Check all' }}
       </button>
-      <button v-if="failedCount > 0" class="nb-act nb-act--danger" :disabled="busy" :title="removeFailedTitle" @click="$emit('remove-failed')">
+      <button v-if="!readonly && failedCount > 0" class="nb-act nb-act--danger" :disabled="busy" :title="removeFailedTitle" @click="$emit('remove-failed')">
         <Icon name="trash" :size="14" />Remove {{ failedCount }} failed
       </button>
-      <span class="spacer" />
-      <input v-model="newValue" class="nb-field" :placeholder="placeholder" :aria-label="addLabel" @keydown.enter.prevent="add" />
-      <button class="nb-act nb-act--primary" :disabled="busy || !newValue.trim()" @click="add">{{ addLabel }}</button>
+      <template v-if="!readonly">
+        <span class="spacer" />
+        <input v-model="newValue" class="nb-field" :placeholder="placeholder" :aria-label="addLabel" @keydown.enter.prevent="add" />
+        <button class="nb-act nb-act--primary" :disabled="busy || !newValue.trim()" @click="add">{{ addLabel }}</button>
+      </template>
     </div>
     <div v-if="rows.length === 0" class="muted">{{ emptyText }}</div>
     <div v-else-if="sorted.length === 0" class="muted">No matches for "{{ query }}".</div>
     <div v-else class="nb-list sni-list">
-      <div v-for="r in visibleRows" :key="r.key" class="stg-row" :class="{ checked: r.checked, primary: r.primary }" @click="onRowClick($event, r)">
-        <input type="checkbox" :checked="r.checked" :disabled="busy || scanning" :title="checkTitle" @click.stop @change="$emit('toggle', r.key)" />
+      <div v-for="r in visibleRows" :key="r.key" class="stg-row" :class="{ checked: r.checked, primary: r.primary, 'stg-row--ro': readonly }" @click="onRowClick($event, r)">
+        <input v-if="!readonly" type="checkbox" :checked="r.checked" :disabled="busy || scanning" :title="checkTitle" @click.stop @change="$emit('toggle', r.key)" />
         <span class="stg-meta">
           <span class="stg-title">{{ r.label }}<span v-if="r.primary" class="sni-primary-badge" title="Primary: the pinned entry the engine dials">primary</span></span>
           <span class="stg-sub" :class="r.cls">{{ r.sub }}</span>
         </span>
         <span class="stg-ctl">
           <button
-            v-if="r.checked && !r.primary"
+            v-if="!readonly && r.checked && !r.primary"
             class="nb-act nb-act--sm sni-star"
             :disabled="busy || scanning"
             title="Make this the primary — the pinned entry the engine dials"
@@ -56,7 +63,7 @@
           <button class="nb-act nb-act--sm" :disabled="busy || scanning || !canScan" :title="scanTitle" @click="$emit('scan', r.key)">
             <Icon :name="scanningKey === r.key ? 'refresh' : 'search'" :size="13" />{{ scanningKey === r.key ? 'Scanning…' : 'Scan' }}
           </button>
-          <button class="nb-act nb-act--sm nb-act--ghost" :disabled="busy || scanning" @click="$emit('remove', r.index)">
+          <button v-if="!readonly" class="nb-act nb-act--sm nb-act--ghost" :disabled="busy || scanning" @click="$emit('remove', r.index)">
             <Icon name="trash" :size="13" />Remove
           </button>
         </span>
@@ -93,6 +100,9 @@ const props = defineProps<{
   emptyText: string
   removeFailedTitle: string
   busy: boolean
+  /** Read-out only: no add field, checkboxes, star or remove controls,
+   *  and row clicks are ignored. The scan button stays. */
+  readonly?: boolean
 }>()
 const emit = defineEmits<{
   (e: 'toggle', key: string): void
@@ -143,6 +153,9 @@ const failedCount = computed(() =>
   props.rows.filter((r) => r.at !== '' && !r.ok && !r.primary).length,
 )
 const activeCount = computed(() => props.rows.filter((r) => r.checked).length)
+// The read-only card has no checkboxes, so "N active" would only restate
+// the row count; say what the rows are instead.
+const activeText = computed(() => (props.readonly ? 'derived' : `${activeCount.value} active`))
 const countText = computed(() =>
   query.value.trim() ? `${sorted.value.length} / ${props.rows.length}` : `${props.rows.length}`,
 )
@@ -165,7 +178,7 @@ function toggleCheckAll() {
 // since the last plain click (anchored in the displayed sort order).
 let lastKey = ''
 function onRowClick(e: MouseEvent, r: SniListRow) {
-  if (props.busy || props.scanning) return
+  if (props.readonly || props.busy || props.scanning) return
   const t = e.target as HTMLElement | null
   if (t?.closest('button,input,select,a,textarea')) return
   if (e.shiftKey && lastKey) {

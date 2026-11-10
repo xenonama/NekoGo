@@ -4,8 +4,9 @@
     <ul>
       <li><b>sing-box</b> profiles: put extra <code>route.rules</code> by embedding a full outbound in <i>Raw outbound JSON</i>, or extend <code>BuildSingBoxConfig</code> defaults.</li>
       <li><b>xray</b> profiles: extend the generated <code>routing.rules</code> in <code>BuildXrayConfig</code>, or supply a complete config through raw JSON.</li>
+      <li><b>mihomo</b> profiles: the renderer sends every connection to the profile's own proxy (one <code>MATCH</code> rule into a single-member group). Per-profile rule lists are not editable.</li>
     </ul>
-    <p class="muted">Active connections (sing-box core only):</p>
+    <p class="muted">Active connections (the xray core exposes none):</p>
     <button class="nb-act" :disabled="loading" @click="load">
       <Icon name="refresh" :size="14" />{{ loading ? 'Refreshing…' : 'Refresh' }}
     </button>

@@ -24,10 +24,10 @@
         <span class="t">TUN Mode</span>
         <span class="s">{{ tunOn ? 'Enabled' : 'Full tunnel' }}</span>
       </button>
-      <button class="nb-qa" :class="{ active: sysProxyOn }" :disabled="sysProxyBusy" @click="toggleSysProxy">
+      <button class="nb-qa" :class="{ active: coreRunning && sysProxyOn }" :disabled="sysProxyBusy || !coreRunning" @click="toggleSysProxy">
         <span class="ico ico-pink"><Icon name="globe" :size="20" /></span>
         <span class="t">System Proxy</span>
-        <span class="s">{{ sysProxyOn ? 'On' : 'Off' }}</span>
+        <span class="s" :class="{ err: !!sysProxyMsg }">{{ sysProxyMsg || sysProxyLabel }}</span>
       </button>
     </div>
   </div>
@@ -50,7 +50,12 @@ const tunOn = computed(() => settings.settings.tunEnabled)
 // settings flag).
 const sysProxyLive = ref<boolean | null>(null)
 const sysProxyBusy = ref(false)
+const sysProxyMsg = ref('')
+const coreRunning = computed(() => connection.status.running)
 const sysProxyOn = computed(() => sysProxyLive.value ?? settings.settings.systemProxy)
+const sysProxyLabel = computed(() =>
+  coreRunning.value ? (sysProxyOn.value ? 'On' : 'Off') : 'Connect first',
+)
 const testing = ref(false)
 const testedCount = ref(0)
 
@@ -105,24 +110,27 @@ async function toggleTun() {
 }
 
 async function toggleSysProxy() {
-  if (sysProxyBusy.value) return
+  if (sysProxyBusy.value || !coreRunning.value) return
   sysProxyBusy.value = true
+  sysProxyMsg.value = ''
+  // Toggle FROM the displayed state (sysProxyOn = live ?? settings):
+  // checking sysProxyLive alone could show "On" (settings fallback)
+  // yet re-enable on click when the live probe never succeeded.
+  const wantOn = !sysProxyOn.value
   try {
-    // Toggle FROM the displayed state (sysProxyOn = live ?? settings):
-    // checking sysProxyLive alone could show "On" (settings fallback)
-    // yet re-enable on click when the live probe never succeeded.
-    if (sysProxyOn.value) {
-      await backend.disableSystemProxyGUI()
-      sysProxyLive.value = false
-    } else {
-      await backend.enableSystemProxyGUI()
-      sysProxyLive.value = true
-    }
-  } catch {
-    /* keep the previous live state; the System tab shows the error */
+    if (wantOn) await backend.enableSystemProxyGUI()
+    else await backend.disableSystemProxyGUI()
+  } catch (e) {
+    // This used to be a silent catch that deferred the message to the
+    // System card — which is often not even mounted, so a refused call
+    // rendered as a successful toggle.
+    sysProxyMsg.value = String(e)
   } finally {
     sysProxyBusy.value = false
   }
+  // Re-read the OS instead of assigning wantOn: this tile reports a
+  // real switch, and one that refused to move must not render as moved.
+  await refreshSysProxyLive()
 }
 
 async function refreshSysProxyLive() {

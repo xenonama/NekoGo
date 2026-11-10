@@ -8,7 +8,7 @@
       <button
         class="nb-power-btn"
         :class="{ on: running }"
-        :disabled="connection.busy || connection.connectBusy"
+        :disabled="connectDisabled"
         :title="connection.connectBusy ? 'Connecting…' : running ? 'Disconnect' : 'Connect'"
         @click="toggle"
       >
@@ -36,7 +36,7 @@
     <button
       class="nb-connect-btn"
       :class="{ 'is-on': running }"
-      :disabled="connection.busy || connection.connectBusy || (!running && !current)"
+      :disabled="connectDisabled || (!running && !current)"
       @click="toggle"
     >
       <span class="nb-connect-ico">
@@ -65,6 +65,11 @@ const profiles = useProfilesStore()
 const settings = useSettingsStore()
 
 const running = computed(() => connection.status.running)
+// switching covers the selection IPC that runs BEFORE the store sets its
+// busy flag: without it the button stayed enabled for that whole window
+// and a second click re-entered toggle and raced the first connect.
+const switching = ref(false)
+const connectDisabled = computed(() => switching.value || connection.busy || connection.connectBusy)
 // Core process alive but stats API unreachable: counters are stale, so
 // show "API down" instead of misleading rates.
 const apiDown = computed(() => connection.stats.apiDown === true)
@@ -176,20 +181,26 @@ onMounted(() => connection.acquire())
 onUnmounted(() => connection.release())
 
 async function toggle() {
-  if (running.value) {
-    await connection.disconnect()
-  } else {
-    const id = settings.settings.activeProfileId || profiles.profiles[0]?.id
-    if (!id) return
-    // Persist selection so the right panel and reconnect agree; abort
-    // the connect when persistence fails (same BUG-004 discipline as
-    // the other selection paths).
-    try {
-      await settings.setActiveProfileId(id)
-    } catch {
-      return
+  if (connectDisabled.value) return
+  switching.value = true
+  try {
+    if (running.value) {
+      await connection.disconnect()
+    } else {
+      const id = settings.settings.activeProfileId || profiles.profiles[0]?.id
+      if (!id) return
+      // Persist selection so the right panel and reconnect agree; abort
+      // the connect when persistence fails (same BUG-004 discipline as
+      // the other selection paths).
+      try {
+        await settings.setActiveProfileId(id)
+      } catch {
+        return
+      }
+      await connection.connect(id)
     }
-    await connection.connect(id)
+  } finally {
+    switching.value = false
   }
 }
 </script>

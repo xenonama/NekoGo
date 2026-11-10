@@ -13,7 +13,7 @@
           <span class="stg-head-sub">Egress IP through the active core</span>
         </span>
       </div>
-      <div class="toolbar" style="padding: 0 0 8px">
+      <div class="toolbar">
         <button class="nb-act nb-act--primary" :disabled="!canRun" @click="runIP">
           <Icon name="globe" :size="14" />Run IP Test
         </button>
@@ -44,7 +44,7 @@
           <span class="stg-head-sub">Throughput through the active core</span>
         </span>
       </div>
-      <div class="toolbar" style="padding: 0 0 8px">
+      <div class="toolbar">
         <button class="nb-act nb-act--primary" :disabled="!canRun" @click="runSpeed">
           <Icon name="download" :size="14" />Run Speed Test
         </button>
@@ -87,7 +87,7 @@
           <span class="stg-head-sub">Probe a custom URL through the active core</span>
         </span>
       </div>
-      <div class="toolbar" style="padding: 0 0 8px">
+      <div class="toolbar">
         <input
           v-model="urlInput"
           class="nb-mono nb-field"
@@ -273,7 +273,7 @@ async function stopTool(which: 'ip' | 'sp' | 'url') {
   }
 }
 
-/** Seed cards with last-known results (reporter reads / xray cache).
+/** Seed cards with last-known results (reporter reads / xray+mihomo cache).
  *  Never overwrites a displayed result: reporter reads drain, so a
  *  second load must not wipe the cards. Best-effort; offline or
  *  empty reporters simply leave the hints in place. */

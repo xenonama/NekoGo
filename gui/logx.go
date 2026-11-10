@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bufio"
 	"bytes"
 	"fmt"
 	"os"
@@ -213,14 +212,4 @@ func (w *logWriter) Write(p []byte) (int, error) {
 		}
 	}
 	return n, nil
-}
-
-// drainLines is a helper for tests: split s into lines.
-func drainLines(s string) []string {
-	var out []string
-	sc := bufio.NewScanner(strings.NewReader(s))
-	for sc.Scan() {
-		out = append(out, sc.Text())
-	}
-	return out
 }

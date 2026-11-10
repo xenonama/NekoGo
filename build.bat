@@ -9,28 +9,34 @@ REM  Produces:
 REM    - gui\build\bin\nekogo.exe            (dev test)
 REM    - gui\build\bin\nekobox_core.exe      (sing-box engine)
 REM    - gui\build\bin\sing-box.exe          (official CLI, optional)
+REM    - gui\build\bin\mihomo.exe            (Clash Meta core, optional)
 REM    - gui\build\bin\xray.exe              (Xray-core)
 REM    - dist\NekoGo-Portable-*.zip          (portable)
 REM    - dist\NekoGo-Setup-*.exe             (installer, needs NSIS)
-REM  A missing xray.exe / sing-box.exe / aether.exe is downloaded from its
-REM  official GitHub release (SHA256-checked when the release publishes one)
-REM  instead of failing / being skipped.
+REM  A missing xray.exe / sing-box.exe / mihomo.exe / aether.exe is downloaded
+REM  from its official GitHub release (SHA256-checked when the release
+REM  publishes one) instead of failing / being skipped.
 REM ============================================================
 
+REM ---------- Resolve root ----------
+REM Before the version read: VERSION lives next to this script, and a
+REM cwd-relative "if exist VERSION" silently falls back to the hardcoded
+REM tag when build.bat is invoked from anywhere else (wrong artifact names).
+set "ROOT=%~dp0"
+if "%ROOT:~-1%"=="\" set "ROOT=%ROOT:~0,-1%"
+
 REM ---------- Version ----------
-if exist "VERSION" (
-    set /p APP_VERSION=<VERSION
+if exist "%ROOT%\VERSION" (
+    set /p APP_VERSION=<"%ROOT%\VERSION"
 ) else (
     set "APP_VERSION=5.11.28.3-fork.1"
 )
+REM An empty/trailing-newline-only VERSION leaves APP_VERSION undefined.
+if not defined APP_VERSION set "APP_VERSION=5.11.28.3-fork.1"
 REM NSIS VIProductVersion needs 4 plain numbers (1.0.0.0), not a tag.
 set "APP_VERSION_VI=1.0.0.0"
 for /f "tokens=1,2,3 delims=.-" %%a in ("%APP_VERSION%") do set "APP_VERSION_VI=%%a.%%b.%%c.0"
 echo %APP_VERSION_VI%| findstr /r /c:"^[0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*$" >nul 2>nul || set "APP_VERSION_VI=1.0.0.0"
-
-REM ---------- Resolve root ----------
-set "ROOT=%~dp0"
-if "%ROOT:~-1%"=="\" set "ROOT=%ROOT:~0,-1%"
 
 set "CORE=%ROOT%\core\server"
 set "GUI=%ROOT%\gui"
@@ -38,7 +44,11 @@ set "FRONTEND=%ROOT%\gui\frontend"
 set "BUILDBIN=%ROOT%\gui\build\bin"
 set "RUNTIME=%ROOT%\runtime"
 set "DIST=%ROOT%\dist"
-set "PORTABLE_STAGE=%ROOT%\dist\portable"
+REM Portable staging: dist\portable normally, dist\portable-staging when that
+REM folder is stuck (see STEP 7). PORTABLE_STAGE is what STEP 7/8 read.
+set "PORTABLE_DIR=%ROOT%\dist\portable"
+set "PORTABLE_FALLBACK=%ROOT%\dist\portable-staging"
+set "PORTABLE_STAGE=%PORTABLE_DIR%"
 set "SETUP_BUILT="
 set "EXE=%ROOT%\gui\build\bin\nekogo.exe"
 set "CORE_EXE=%ROOT%\gui\build\bin\nekobox_core.exe"
@@ -68,6 +78,7 @@ if /i "%~1"=="--dry-run" (
     echo [dry-run] latest engine release assets this build would fetch:
     call :show_release XTLS/Xray-core "Xray-windows-64.zip"
     call :show_release SagerNet/sing-box "^sing-box-[0-9.]+-windows-amd64\.zip$"
+    call :show_release MetaCubeX/mihomo "^mihomo-windows-amd64-v1-v[0-9.]+\.zip$"
     call :show_release CluvexStudio/Aether "aether-windows-x86_64.zip"
     echo.
     exit /b 0
@@ -210,6 +221,34 @@ if exist "%BUILDBIN%\sing-box.exe" (
 )
 
 REM ============================================================
+REM  STEP 2e - mihomo core (optional; Clash Meta engine)
+REM ============================================================
+echo.
+echo [2e/9] mihomo core...
+if not exist "%BUILDBIN%\mihomo.exe" (
+    if not exist "%BUILDBIN%" mkdir "%BUILDBIN%" >nul 2>nul
+    REM The GOAMD64=v1 asset is the baseline x86-64 build. The plain
+    REM amd64 asset targets a newer instruction set and would not start
+    REM on every machine NekoGo ships to, so it is deliberately not the
+    REM one fetched here.
+    call :fetch_github_release MetaCubeX/mihomo "^mihomo-windows-amd64-v1-v[0-9.]+\.zip$" "%BUILDBIN%" "mihomo.exe"
+    if errorlevel 1 (
+        echo   [warn] mihomo download failed - mihomo ^(Clash Meta^) profiles will be unavailable.
+        echo          Tried: !FETCH_URL!
+        echo          Place mihomo.exe in "%BUILDBIN%" and rebuild, or set mihomoPath in settings.
+    )
+    REM The fetch helper keeps the archive's own file name, so normalize
+    REM it: the resolver prefers mihomo.exe and STEP 7/8 stage that name.
+    if not exist "%BUILDBIN%\mihomo.exe" for %%F in ("%BUILDBIN%\mihomo-*.exe") do move /Y "%%F" "%BUILDBIN%\mihomo.exe" >nul 2>nul
+)
+if exist "%BUILDBIN%\mihomo.exe" (
+    for %%A in ("%BUILDBIN%\mihomo.exe") do set "MIHOMO_SIZE=%%~zA"
+    echo   [ok] mihomo.exe ^(!MIHOMO_SIZE! bytes^)
+) else (
+    echo   [warn] mihomo.exe not staged - the mihomo core stays unavailable
+)
+
+REM ============================================================
 REM  STEP 3 - Wails bindings
 REM ============================================================
 echo.
@@ -262,7 +301,11 @@ echo [4b/9] GeoLite2 DB...
 if exist "%GUI%\assets\GeoLite2-Country.mmdb" (
     if not exist "%BUILDBIN%" mkdir "%BUILDBIN%" >nul 2>nul
     copy /Y "%GUI%\assets\GeoLite2-Country.mmdb" "%BUILDBIN%\GeoLite2-Country.mmdb" >nul 2>nul
-    echo   [ok] GeoLite2-Country.mmdb staged
+    if errorlevel 1 (
+        echo   [warn] GeoLite2-Country.mmdb could not be copied into bin\ ^(file locked?^) - the existing copy stays.
+    ) else (
+        echo   [ok] GeoLite2-Country.mmdb staged
+    )
 ) else (
     echo   [warn] GeoLite2-Country.mmdb not found in gui\assets\ - country detection will be disabled.
 )
@@ -306,13 +349,36 @@ echo.
 echo [7/9] Portable ZIP...
 
 if not exist "%DIST%" mkdir "%DIST%" >nul 2>nul
-if exist "%PORTABLE_STAGE%" rmdir /s /q "%PORTABLE_STAGE%" >nul 2>nul
-if exist "%PORTABLE_STAGE%" (
-    echo   [ERR] cannot clear %PORTABLE_STAGE% - a NekoGo build is running from it.
-    echo         Close it ^(and its engines^), then build again.
+REM Stage into dist\portable when it can be wiped - and it is not always
+REM wipeable. A LOADED driver image stays open in the kernel even after the
+REM app that installed it has exited, and the windivert service here points
+REM straight at dist\portable\bin\WinDivert64.sys, so rmdir deletes every
+REM other file and leaves that one. The old check read that as "a NekoGo
+REM build is running" and failed the build with nothing running at all;
+REM fall back to a second stage folder and name the file that is holding.
+set "PORTABLE_STAGE=%PORTABLE_DIR%"
+if not exist "%PORTABLE_DIR%" goto :stage_make
+rmdir /s /q "%PORTABLE_DIR%" >nul 2>nul
+if not exist "%PORTABLE_DIR%" goto :stage_make
+echo   [warn] cannot delete %PORTABLE_DIR% - still held open:
+for /r "%PORTABLE_DIR%" %%F in (*) do echo          %%F
+echo        A loaded WinDivert64.sys stays open after its app exits; from an
+echo        admin prompt "sc stop windivert" ^& "sc delete windivert" frees it
+echo        ^(or reboot^). Staging into %PORTABLE_FALLBACK% - build unaffected.
+set "PORTABLE_STAGE=%PORTABLE_FALLBACK%"
+if not exist "%PORTABLE_STAGE%" goto :stage_make
+rmdir /s /q "%PORTABLE_STAGE%" >nul 2>nul
+if not exist "%PORTABLE_STAGE%" goto :stage_make
+echo   [ERR] both portable stage folders are locked - close the NekoGo that
+echo         runs from either one ^(or clear the driver^), then build again.
+goto :fail
+
+:stage_make
+mkdir "%PORTABLE_STAGE%" >nul 2>nul
+if not exist "%PORTABLE_STAGE%" (
+    echo   [ERR] cannot create %PORTABLE_STAGE%
     goto :fail
 )
-mkdir "%PORTABLE_STAGE%" >nul 2>nul
 
 REM Copy from runtime/ folder (if exists). WinDivert files must sit
 REM next to the exes that load them (bin\, next to the engines).
@@ -320,8 +386,8 @@ if exist "%RUNTIME%\WinDivert.dll"   copy /Y "%RUNTIME%\WinDivert.dll"   "%BUILD
 if exist "%RUNTIME%\WinDivert64.sys" copy /Y "%RUNTIME%\WinDivert64.sys" "%BUILDBIN%\" >nul 2>nul
 
 REM PattN-style layout: nekogo.exe in the root, every engine binary in
-REM bin\ (nekobox_core, sing-box, xray, sni-spoof, aether + pt\, and the
-REM WinDivert runtime the cores load).
+REM bin\ (nekobox_core, sing-box, mihomo, xray, sni-spoof, aether + pt\,
+REM and the WinDivert runtime the cores load).
 set "PORTABLE_BIN=%PORTABLE_STAGE%\bin"
 mkdir "%PORTABLE_BIN%" >nul 2>nul
 
@@ -331,6 +397,10 @@ REM The official sing-box CLI is a separate binary (Upstream core engine),
 REM fetched by STEP 2d when missing and still optional at packaging.
 if exist "%BUILDBIN%\sing-box.exe" (
     copy /Y "%BUILDBIN%\sing-box.exe" "%PORTABLE_BIN%\" >nul 2>nul
+)
+REM mihomo (Clash Meta) is a separate optional core, fetched by STEP 2e.
+if exist "%BUILDBIN%\mihomo.exe" (
+    copy /Y "%BUILDBIN%\mihomo.exe" "%PORTABLE_BIN%\" >nul 2>nul
 )
 copy /Y "%BUILDBIN%\xray.exe"         "%PORTABLE_BIN%\" >nul 2>nul
 copy /Y "%BUILDBIN%\sni-spoof.exe"    "%PORTABLE_BIN%\" >nul 2>nul
@@ -369,6 +439,10 @@ if exist "%BUILDBIN%\sing-box.exe" (
     call :same "%BUILDBIN%\sing-box.exe" "%PORTABLE_BIN%\sing-box.exe"
     if errorlevel 1 goto :fail
 )
+if exist "%BUILDBIN%\mihomo.exe" (
+    call :same "%BUILDBIN%\mihomo.exe" "%PORTABLE_BIN%\mihomo.exe"
+    if errorlevel 1 goto :fail
+)
 if exist "%BUILDBIN%\pt\lyrebird.exe" (
     call :same "%BUILDBIN%\pt\lyrebird.exe" "%PORTABLE_BIN%\pt\lyrebird.exe"
     if errorlevel 1 goto :fail
@@ -395,6 +469,7 @@ REM README
     echo   nekogo.exe         - Wails3 GUI ^(sing-box + Xray^)
     echo   bin\nekobox_core.exe - custom sing-box core ^(Thrift RPC; the bundled engine^)
     echo   bin\sing-box.exe     - official sing-box CLI ^(Upstream core engine; optional^)
+    echo   bin\mihomo.exe       - mihomo / Clash Meta core ^(mihomo profiles; optional^)
     echo   bin\xray.exe         - Xray-core engine ^(gRPC stats^)
     echo   bin\sni-spoof.exe    - SNI spoofing engine
     echo   bin\aether.exe       - Aether WARP engine ^(optional; requires bin\pt\ next to it for Tor/Psiphon^)
@@ -425,12 +500,19 @@ REM README
 set "ZIP_NAME=NekoGo-Portable-v%APP_VERSION%.zip"
 if exist "%DIST%\%ZIP_NAME%" del "%DIST%\%ZIP_NAME%" >nul 2>nul
 
+set "ZIP_BUILT="
 powershell -NoProfile -Command ^
     "Compress-Archive -Path '%PORTABLE_STAGE%\*' -DestinationPath '%DIST%\%ZIP_NAME%' -Force" ^
     >nul 2>nul
 
-if exist "%DIST%\%ZIP_NAME%" (
+if errorlevel 1 (
+    REM Compress-Archive can leave a partial file behind; shipping it as
+    REM "BUILD OK" is worse than reporting no portable ZIP at all.
+    echo   [warn] Compress-Archive failed - no portable ZIP was produced
+    if exist "%DIST%\%ZIP_NAME%" del "%DIST%\%ZIP_NAME%" >nul 2>nul
+) else if exist "%DIST%\%ZIP_NAME%" (
     for %%A in ("%DIST%\%ZIP_NAME%") do set "ZIP_SIZE=%%~zA"
+    set "ZIP_BUILT=1"
     echo   [ok] %ZIP_NAME% ^(!ZIP_SIZE! bytes^)
 ) else (
     echo   [warn] zip creation failed
@@ -462,16 +544,28 @@ REM Compile to a .new file and publish it only after makensis succeeds.
 REM The old command sent every error to nul: a locked/failing setup left
 REM the PREVIOUS installer in dist while the build still printed BUILD OK,
 REM which is exactly how "the exe installer is not updated" looked.
-if exist "%SETUP_TMP%" del /f /q "%SETUP_TMP%" >nul 2>nul
+REM Both scratch files are cleared first: a run killed between makensis and
+REM the move leaves them behind, and they must not look like artifacts.
+if exist "%NSIS_LOG%" del /f /q "%NSIS_LOG%" >nul 2>nul
+if exist "%SETUP_TMP%" (
+    del /f /q "%SETUP_TMP%" >nul 2>nul
+    if exist "%SETUP_TMP%" (
+        echo   [ERR] cannot delete the leftover -new.exe installer ^(file is open or locked^).
+        echo         Close whatever holds %SETUP_TMP% and build again.
+        goto :fail
+    )
+)
 makensis /DAPP_VERSION="%APP_VERSION%" /DAPP_VERSION_VI="%APP_VERSION_VI%" /DPORTABLE_STAGE="%PORTABLE_STAGE%" /DDIST="%DIST%" /DOUTFILE="%SETUP_TMP%" installer.nsi >"%NSIS_LOG%" 2>&1
 if errorlevel 1 (
     echo   [ERR] makensis failed - full log follows:
     type "%NSIS_LOG%"
+    call :cleanup_installer
     goto :fail
 )
 if not exist "%SETUP_TMP%" (
     echo   [ERR] makensis returned success but produced no setup.exe
     type "%NSIS_LOG%"
+    call :cleanup_installer
     goto :fail
 )
 if exist "%NSIS_LOG%" del /f /q "%NSIS_LOG%" >nul 2>nul
@@ -505,7 +599,11 @@ echo ============================================================
 echo   BUILD OK
 echo.
 echo   Dev run:    %EXE%
-echo   Portable:   %DIST%\%ZIP_NAME%
+if defined ZIP_BUILT (
+    echo   Portable:   %DIST%\%ZIP_NAME%
+) else (
+    echo   Portable:   NOT BUILT - see [7/9] above
+)
 if defined SETUP_BUILT (
     echo   Installer:  %SETUP_FINAL%
 ) else (
@@ -648,6 +746,15 @@ set "FGR_RC=!errorlevel!"
 set "FGR_PS="
 exit /b !FGR_RC!
 
+REM ---------- helper: drop unpublished installer scratch files ----------
+REM A failed makensis leaves -new.exe and installer-build.log in dist\; both
+REM are scratch (the log was already echoed above) and a leftover -new.exe
+REM reads like a shipped installer in the dist listing.
+:cleanup_installer
+if defined SETUP_TMP if exist "%SETUP_TMP%" del /f /q "%SETUP_TMP%" >nul 2>nul
+if defined NSIS_LOG if exist "%NSIS_LOG%" del /f /q "%NSIS_LOG%" >nul 2>nul
+exit /b 0
+
 :fail
 echo.
 echo ============================================================
@@ -656,3 +763,4 @@ echo ============================================================
 echo.
 pause
 exit /b 1
+

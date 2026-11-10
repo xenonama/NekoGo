@@ -298,10 +298,11 @@ import PickSelect from './PickSelect.vue'
 import { backend } from '../api'
 import type { GeoIPStatus } from '../types'
 
-type BoolKey = 'startOnBoot' | 'closeToTray' | 'tunEnabled' | 'autoConnect' | 'sidebarLabels' | 'geoIPAutoDetect' | 'fragmentEnabled' | 'fingerprintEnabled' | 'systemProxy' | 'spoofXray'
-// No 'systemProxy' member: every Connect ensures the OS proxy now
-// (the flag no longer gates anything), so the row is gone — same
-// dead-toggle removal as 'notifications' below.
+type BoolKey = 'startOnBoot' | 'closeToTray' | 'tunEnabled' | 'autoConnect' | 'sidebarLabels' | 'geoIPAutoDetect' | 'fragmentEnabled' | 'fingerprintEnabled' | 'systemProxy' | 'spoofXray' | 'spoofEnabled'
+// 'systemProxy' keeps its member and its row: Connect auto-ensures the
+// OS proxy only when it is set, so the flag gates the auto path. It is
+// the remembered preference, not the live switch — the System card and
+// the Quick Actions tile read that from the OS.
 // No 'notifications' member: the toggle was dead (nothing reads the
 // flag; Wails beta.20 has no desktop-notify API), so the row is gone.
 type StrKey = 'language' | 'theme' | 'windowStyle' | 'xrayApiAddress' | 'testUrl' | 'geoIPDBPath' | 'logLevel' | 'logOutputPath' | 'inboundAddress' | 'dnsRemote' | 'dnsDirect' | 'fragmentMode' | 'fragmentLength' | 'fingerprintValue' | 'tunStack' | 'coreEngine'
@@ -604,8 +605,8 @@ const tabs: TabDef[] = [
     rows: [
       { key: 'mixed', icon: 'globe', title: 'Mixed port', sub: 'HTTP proxy on this port · SOCKS proxy on port + 1 (applies on reconnect)', kind: 'number', field: 'mixedPort' },
       { key: 'bind', icon: 'wifi', title: 'Listen address', sub: 'Empty = loopback only · 0.0.0.0 shares on the LAN (applies on reconnect)', kind: 'text', field: 'inboundAddress' },
-      { key: 'dnsremote', icon: 'cloud', title: 'Upstream DNS', sub: 'DoH URL, IP or "local" — empty = system default (sing-box)', kind: 'text', field: 'dnsRemote' },
-      { key: 'dnsdirect', icon: 'cloud', title: 'Direct DNS', sub: 'Bypass upstream for direct traffic — empty = system default', kind: 'text', field: 'dnsDirect' },
+      { key: 'dnsremote', icon: 'cloud', title: 'Remote DNS', sub: 'DoH: https://1.1.1.1/dns-query  ·  DoT: tls://8.8.8.8  ·  IP: 8.8.8.8  ·  empty = system default', kind: 'text', field: 'dnsRemote' },
+      { key: 'dnsdirect', icon: 'cloud', title: 'Direct DNS', sub: 'Lookups that bypass the proxy — same shapes, empty = system default', kind: 'text', field: 'dnsDirect' },
       { key: 'api', icon: 'bolt', title: 'Xray API', sub: 'StatsService endpoint, e.g. 127.0.0.1:10085', kind: 'text', field: 'xrayApiAddress' },
     ],
   },
@@ -631,6 +632,7 @@ const tabs: TabDef[] = [
       { key: 'tunstack', icon: 'tune', title: 'TUN stack', sub: 'System is fastest on Windows · gVisor costs more CPU per byte (applies on reconnect)', kind: 'select', field: 'tunStack', options: [{ value: 'system', label: 'System' }, { value: 'gvisor', label: 'gVisor' }, { value: 'mixed', label: 'Mixed' }] },
       { key: 'auto', icon: 'power', title: 'Auto-connect', sub: 'Connect last profile on launch', kind: 'toggle', field: 'autoConnect' },
       { key: 'sysproxy', icon: 'globe', title: 'System proxy on connect', sub: 'Point the OS proxy at NekoGo in proxy mode — ignored in TUN mode (including the SNI spoof + Psiphon chain), where TUN carries all traffic', kind: 'toggle', field: 'systemProxy' },
+      { key: 'spoof', icon: 'shield', title: 'SNI spoofing', sub: 'Run the spoof engine for SNI Spoofing profiles. Off = dial their own address with the normal transport (e.g. your own 127.0.0.1 tunnel).', kind: 'toggle', field: 'spoofEnabled' },
       { key: 'spoofxray', icon: 'layers', title: 'Xray for SNI spoofing', sub: 'Run SNI spoofing connects on the Xray transport instead of the NekoBox Core (applies on reconnect). The SNI spoof + Psiphon chain stays on sing-box: its TUN inbound exists there only.', kind: 'toggle', field: 'spoofXray' },
       { key: 'testurl', icon: 'bolt', title: 'Test URL', sub: 'Latency probe target (empty = default)', kind: 'text', field: 'testUrl' },
     ],

@@ -40,6 +40,8 @@ type orphanProc struct {
 // orphanImageNames are the only process names cleanupOrphanCores may kill.
 // sing-box.exe is the official upstream CLI child (CoreEngine=upstream):
 // a GUI crash leaves it holding the mixed port and the Clash API port.
+// mihomo.exe (and the release asset's own name) is the Clash Meta child
+// for CoreMihomo profiles, holding the same mixed port.
 // aether.exe and pt\psiphon-tunnel-core.exe are the Aether engine and the
 // Psiphon exit both engine shapes spawn; a crashed GUI leaves the latter
 // serving traffic with no supervisor to end it. sni-spoof.exe is the
@@ -48,6 +50,7 @@ type orphanProc struct {
 // transport the Aether engine spawns.
 var orphanImageNames = []string{
 	"xray.exe", "nekobox_core.exe", "sing-box.exe",
+	"mihomo.exe", "mihomo-windows-amd64.exe",
 	"aether.exe", "psiphon-tunnel-core.exe",
 	"sni-spoof.exe", "lyrebird.exe",
 }

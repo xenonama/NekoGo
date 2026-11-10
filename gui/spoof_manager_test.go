@@ -9,8 +9,11 @@ package main
 // no DNS resolution happens.
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -121,6 +124,24 @@ func TestSpoofManagerStartWithMockExe(t *testing.T) {
 		st, _ := m.GetStats()
 		return st != nil && st.Total > 0
 	})
+	// Every Ranked field has to survive the stdout scrape. The engine sorts
+	// these rows on `score` and times them into `latency_ms`; dropping either
+	// leaves the tab showing a 100% row that `auto` demoted for no visible
+	// reason, which is the whole point of the two fields.
+	st, _ := m.GetStats()
+	if st == nil {
+		t.Fatal("GetStats = nil after the scraper reported a snapshot")
+	}
+	if len(st.Methods) != 2 {
+		t.Fatalf("methods rows = %d, want 2", len(st.Methods))
+	}
+	if first := st.Methods[0]; first.Key != "split_seq" || first.LatencyMs == nil ||
+		*first.LatencyMs != 42.5 || first.Score != 0.912 {
+		t.Fatalf("ranked row lost its latency/score in the scrape: %+v", first)
+	}
+	if second := st.Methods[1]; second.LatencyMs != nil || second.Score != 0.8 {
+		t.Fatalf("unmeasured row must scrape as nil latency: %+v", second)
+	}
 	if got := m.GetLastError(); got != "" {
 		t.Fatalf("GetLastError = %q, want empty", got)
 	}
@@ -149,6 +170,46 @@ func TestSpoofManagerStopCleansConfig(t *testing.T) {
 	if err := m.Stop(); err != nil {
 		t.Fatalf("second Stop: %v", err)
 	}
+}
+
+// Stop must ask the engine to leave rather than knock it over, because only
+// an answered request runs EngineHandle::shutdown (WinDivert handles,
+// in-flight relays, the "[WARN] engine stopped" line). The proc.Signal
+// (os.Interrupt) call that sat here could never have worked: Go's Windows
+// os.Process.signal returns EWINDOWS for every signal except Kill — read
+// from src/os/exec_windows.go in this toolchain, and confirmed by the fact
+// that the stopped-engine log line never appears in a real run.
+func TestSpoofManagerStopIsGraceful(t *testing.T) {
+	buildSpoofMock(t)
+	logs := make(chan LogEntry, 1024)
+	m := NewSpoofManager(logs)
+	if err := m.Start(spoofTestProfile(), spoofTestSettings()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	if err := m.Stop(); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+	if m.IsRunning() {
+		t.Fatal("IsRunning = true after a graceful Stop")
+	}
+	// The mock prints this line only after it reads "stop" on stdin, so
+	// seeing it proves the request travelled the pipe and was acted on. The
+	// scraper strips the "[INFO] " tag before it reaches the log bus.
+	// Duplicated from testdata/spoofmock/main.go, which cannot be imported
+	// (package main).
+	const marker = "mock graceful stop"
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		select {
+		case le := <-logs:
+			if strings.Contains(le.Message, marker) {
+				return
+			}
+		default:
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
+	t.Fatal("no graceful-stop line: Stop fell back to TerminateProcess without asking the engine")
 }
 
 func TestSpoofManagerStartRejectsMissingExe(t *testing.T) {
@@ -386,6 +447,45 @@ func TestIsCloudflareIPFullRanges(t *testing.T) {
 	}
 }
 
+// Regression: the resolver used to require a Cloudflare answer, so every
+// non-CF site (youtube.com, instagram.com, google.com) failed inside Start
+// before the engine was spawned. A Cloudflare edge is now a preference and
+// the site's own public IPv4 is the fallback.
+func TestPickSpoofEndpointIP(t *testing.T) {
+	addrs := func(ips ...string) []net.IPAddr {
+		out := make([]net.IPAddr, 0, len(ips))
+		for _, s := range ips {
+			out = append(out, net.IPAddr{IP: net.ParseIP(s)})
+		}
+		return out
+	}
+
+	got, err := pickSpoofEndpointIP("www.youtube.com", addrs("216.239.38.119"))
+	if err != nil || got != "216.239.38.119" {
+		t.Fatalf("non-CF site = %s/%v, want its own IP and no error", got, err)
+	}
+
+	got, err = pickSpoofEndpointIP("example.com", addrs("93.184.216.34", "104.21.0.1"))
+	if err != nil || got != "104.21.0.1" {
+		t.Fatalf("mixed set = %s/%v, want the Cloudflare edge", got, err)
+	}
+
+	got, err = pickSpoofEndpointIP("example.com", addrs("2001:4860:4802:32::78", "172.217.14.110"))
+	if err != nil || got != "172.217.14.110" {
+		t.Fatalf("v6+v4 set = %s/%v, want the IPv4", got, err)
+	}
+
+	if _, err := pickSpoofEndpointIP("example.com", addrs("10.10.34.35")); err == nil {
+		t.Fatal("private-only answer set must fail, not dial the interceptor")
+	} else if !strings.Contains(err.Error(), "only private answers") {
+		t.Fatalf("private-only error = %v, want the interceptor hint", err)
+	}
+
+	if _, err := pickSpoofEndpointIP("example.com", nil); err == nil {
+		t.Fatal("empty answer set must fail")
+	}
+}
+
 // The engine config must carry the curated lists as failover pools,
 // primary first.
 func TestBuildSpoofConfigRendersPools(t *testing.T) {
@@ -584,5 +684,124 @@ func TestSpoofEngineDeathTearsTheGroupDown(t *testing.T) {
 	}
 	if p, ok := currentSpoofFrontPort(); ok {
 		t.Fatalf("the dead engine's front port is still published: %d", p)
+	}
+}
+
+// --- endpoint resolution against a lying resolver -------------------------
+//
+// Measured on this network: UDP/53 to every public resolver is redirected, and
+// the system resolver alternates between the real edge IP and a captive 10.x
+// for the same name. That is per-query, not permanent, so one poisoned answer
+// set must not end Start — and the retry must stay bounded, because this runs
+// synchronously while the manager mutex is held.
+
+type spoofLookupAnswer struct {
+	ips []net.IPAddr
+	err error
+}
+
+// queueSpoofLookups replaces the resolver with a scripted one, one entry per
+// call, and reports how many calls were actually made. Calls beyond the script
+// return an error so an unbounded retry fails the test instead of hanging.
+func queueSpoofLookups(t *testing.T, answers ...spoofLookupAnswer) *int {
+	t.Helper()
+	old := lookupSpoofEndpointAddr
+	calls := new(int)
+	lookupSpoofEndpointAddr = func(_ context.Context, _ string) ([]net.IPAddr, error) {
+		i := *calls
+		*calls = i + 1
+		if i >= len(answers) {
+			return nil, fmt.Errorf("resolver called %d times, only %d answers scripted", i+1, len(answers))
+		}
+		return answers[i].ips, answers[i].err
+	}
+	t.Cleanup(func() { lookupSpoofEndpointAddr = old })
+	return calls
+}
+
+func ipAddrs(ips ...string) []net.IPAddr {
+	out := make([]net.IPAddr, 0, len(ips))
+	for _, s := range ips {
+		out = append(out, net.IPAddr{IP: net.ParseIP(s)})
+	}
+	return out
+}
+
+func TestResolveSpoofEndpointIPRetriesPastAPoisonedAnswer(t *testing.T) {
+	calls := queueSpoofLookups(t,
+		spoofLookupAnswer{ips: ipAddrs("10.10.34.36")},
+		spoofLookupAnswer{ips: ipAddrs("57.144.244.34")},
+	)
+	got, err := resolveSpoofEndpointIP("www.instagram.com")
+	if err != nil {
+		t.Fatalf("poisoned first answer = %v, want the retry to find the real edge", err)
+	}
+	if got != "57.144.244.34" {
+		t.Fatalf("got %s, want the public answer from the second lookup", got)
+	}
+	if *calls != 2 {
+		t.Fatalf("resolver calls = %d, want 2", *calls)
+	}
+}
+
+// The success path must not pay for the retries: a usable first answer returns
+// immediately.
+func TestResolveSpoofEndpointIPStopsAtTheFirstUsableAnswer(t *testing.T) {
+	calls := queueSpoofLookups(t, spoofLookupAnswer{ips: ipAddrs("93.184.216.34", "104.21.5.6")})
+	got, err := resolveSpoofEndpointIP("example.com")
+	if err != nil || got != "104.21.5.6" {
+		t.Fatalf("got %s/%v, want the Cloudflare edge", got, err)
+	}
+	if *calls != 1 {
+		t.Fatalf("resolver calls = %d, want exactly 1", *calls)
+	}
+}
+
+func TestResolveSpoofEndpointIPIsBoundedWhenEveryAnswerIsPoison(t *testing.T) {
+	calls := queueSpoofLookups(t,
+		spoofLookupAnswer{ips: ipAddrs("10.10.34.36")},
+		spoofLookupAnswer{ips: ipAddrs("10.10.34.36")},
+		spoofLookupAnswer{ips: ipAddrs("10.10.34.36")},
+	)
+	_, err := resolveSpoofEndpointIP("www.instagram.com")
+	if err == nil {
+		t.Fatal("all-poison answers must fail, not dial the interceptor")
+	}
+	if !strings.Contains(err.Error(), "only private answers") {
+		t.Fatalf("error = %v, want the interceptor hint", err)
+	}
+	if !strings.Contains(err.Error(), "3 lookups") {
+		t.Fatalf("error = %v, want it to say how many lookups ran", err)
+	}
+	if strings.Count(err.Error(), "10.10.34.36") != 1 {
+		t.Fatalf("error = %v, want each distinct answer listed once", err)
+	}
+	if *calls != spoofResolveAttempts {
+		t.Fatalf("resolver calls = %d, want the budget of %d", *calls, spoofResolveAttempts)
+	}
+}
+
+// A lookup error is retried too, and answer sets accumulate: the second
+// response can add a usable edge next to the address the first one poisoned.
+func TestResolveSpoofEndpointIPAccumulatesAnswersAcrossLookups(t *testing.T) {
+	calls := queueSpoofLookups(t,
+		spoofLookupAnswer{err: errors.New("dns server misbehaving")},
+		spoofLookupAnswer{ips: ipAddrs("10.10.34.36")},
+		spoofLookupAnswer{ips: ipAddrs("10.10.34.36", "172.67.10.1")},
+	)
+	got, err := resolveSpoofEndpointIP("www.youtube.com")
+	if err != nil || got != "172.67.10.1" {
+		t.Fatalf("got %s/%v, want the Cloudflare edge from the accumulated set", got, err)
+	}
+	if *calls != 3 {
+		t.Fatalf("resolver calls = %d, want 3", *calls)
+	}
+}
+
+func TestAppendSeenIPAddrsDeduplicates(t *testing.T) {
+	seen := appendSeenIPAddrs(nil, ipAddrs("10.10.34.36", "216.239.38.119"))
+	seen = appendSeenIPAddrs(seen, ipAddrs("216.239.38.119", "57.144.244.34"))
+	if len(seen) != 3 {
+		t.Fatalf("seen = %v, want 3 distinct addresses", seen)
 	}
 }

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"net"
 	"os"
 	"path/filepath"
@@ -141,5 +142,89 @@ func TestXrayStartEarlyDeath(t *testing.T) {
 		if !before[dir] {
 			t.Fatalf("temp config leaked after failed Start: %s", dir)
 		}
+	}
+}
+
+// TestXrayStartProbesTheBoundAPIAddress — splitAPIAddr tolerates and
+// rewrites malformed settings (a path-bearing host, padded whitespace)
+// and BuildXrayConfig binds the REWRITTEN address. Start used to probe,
+// dial and publish the raw string instead, so a perfectly healthy xray
+// was killed 5s later as "API not reachable". Every case below keeps the
+// chosen free port while the raw string is undialable.
+func TestXrayStartProbesTheBoundAPIAddress(t *testing.T) {
+	bin, err := filepath.Abs(filepath.Join("build", "bin", "xray.exe"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(bin); err != nil {
+		t.Skipf("xray binary not built: %s", bin)
+	}
+	mixedPort, err := freePort()
+	if err != nil {
+		t.Fatal(err)
+	}
+	apiPort, err := distinctPort(mixedPort, mixedPort+1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	port := strconv.Itoa(apiPort)
+	want := net.JoinHostPort("127.0.0.1", port)
+	// An unreachable outbound is fine: xray must still bind api-in. The
+	// shared testProfile() carries a placeholder REALITY key that the real
+	// binary rejects outright, which would mask the address bug.
+	profile := &Profile{
+		Name: "api-addr", Core: CoreXray, Protocol: "vless",
+		Address: "127.0.0.1", Port: 19999,
+		IDOrPassword: "11111111-2222-4333-8444-555555555555",
+		Network:      "tcp",
+	}
+	for _, raw := range []string{"127.0.0.1/:" + port, " 127.0.0.1 :" + port, "127.0.0.1: " + port} {
+		t.Run(raw, func(t *testing.T) {
+			logCh := make(chan LogEntry, 64)
+			m := NewXrayManager(bin, "", logCh)
+			settings := DefaultSettings()
+			settings.MixedPort = mixedPort
+			settings.XrayAPIAddress = raw
+			if err := m.Start(profile, settings); err != nil {
+			draining:
+				for {
+					select {
+					case e := <-logCh:
+						t.Logf("xray-log [%s] %s", e.Level, e.Message)
+					default:
+						break draining
+					}
+				}
+				t.Fatalf("Start with XrayAPIAddress=%q: %v", raw, err)
+			}
+			defer func() { _ = m.Stop() }()
+			if m.apiAddr != want {
+				t.Fatalf("published apiAddr = %q, want the bound %q", m.apiAddr, want)
+			}
+			cfgBytes, err := os.ReadFile(filepath.Join(m.workDir, "config.json"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			var cfg struct {
+				Inbounds []struct {
+					Tag    string `json:"tag"`
+					Listen string `json:"listen"`
+					Port   int    `json:"port"`
+				} `json:"inbounds"`
+			}
+			if err := json.Unmarshal(cfgBytes, &cfg); err != nil {
+				t.Fatal(err)
+			}
+			for _, in := range cfg.Inbounds {
+				if in.Tag != "api-in" {
+					continue
+				}
+				if got := net.JoinHostPort(in.Listen, strconv.Itoa(in.Port)); got != m.apiAddr {
+					t.Fatalf("api-in binds %q but Start probes %q", got, m.apiAddr)
+				}
+				return
+			}
+			t.Fatal("no api-in inbound in the rendered config")
+		})
 	}
 }

@@ -1,9 +1,10 @@
 <!-- Advanced Mode Phase B: editable raw-JSON profile editor.
      Plain <textarea> only (no editor deps). Validation is hand-rolled:
      JSON parse + required fields + immutable id + port range +
-     numeric core enum (0 = sing-box, 1 = xray). Saves through the
-     existing backend.saveProfile; backend errors are shown verbatim
-     and the modal stays open with the draft preserved. -->
+     numeric core enum (0 = sing-box, 1 = xray, 2 = sni-spoof,
+     3 = mihomo). Saves through the existing backend.saveProfile;
+     backend errors are shown verbatim and the modal stays open with
+     the draft preserved. -->
 <template>
   <div
     v-if="modelValue && profile"
@@ -145,7 +146,7 @@ interface DraftValidation {
 
 /** Hand-rolled Profile shape check (no schema library per Phase B spec).
  *  NOTE: core is the numeric CoreType (0 = sing-box, 1 = xray,
- *  2 = sni-spoof), not the 'singbox'/'xray' strings — the Go backend
+ *  2 = sni-spoof, 3 = mihomo), not the 'singbox'/'xray' strings — the Go backend
  *  unmarshals it into an int. Core 2 passes any protocol through:
  *  the spoof engine enforces trojan/vless at Start, not at save. */
 function validateDraft(
@@ -172,8 +173,11 @@ function validateDraft(
   }
   if (p['id'] !== original.id)
     return { ok: false, error: 'id cannot be changed' }
-  if (p['core'] !== 0 && p['core'] !== 1 && p['core'] !== 2)
-    return { ok: false, error: 'core must be 0 (sing-box), 1 (xray) or 2 (sni-spoof)' }
+  if (p['core'] !== 0 && p['core'] !== 1 && p['core'] !== 2 && p['core'] !== 3)
+    return {
+      ok: false,
+      error: 'core must be 0 (sing-box), 1 (xray), 2 (sni-spoof) or 3 (mihomo)',
+    }
   const hasRaw = typeof p['rawOutbound'] === 'string' && p['rawOutbound'] !== ''
   if (!hasRaw) {
     if (p['address'] === undefined || p['address'] === null || p['address'] === '')
@@ -193,14 +197,17 @@ function validateDraft(
   // trojan/vless at Start with a clear error, not at save.
   // Lists mirror gui/app.go validateProfileForSave — keep in sync.
   if (!hasRaw && p['core'] !== 2) {
+    const coreName = p['core'] === 1 ? 'xray' : p['core'] === 3 ? 'mihomo' : 'sing-box'
     const routable =
       p['core'] === 1
         ? ['vless', 'vmess', 'trojan', 'shadowsocks']
-        : ['shadowsocks', 'vmess', 'vless', 'trojan', 'socks', 'http', 'direct']
+        : p['core'] === 3
+          ? ['vless', 'vmess', 'trojan', 'shadowsocks', 'socks', 'http', 'aether']
+          : ['shadowsocks', 'vmess', 'vless', 'trojan', 'socks', 'http', 'direct']
     if (!routable.includes(p['protocol'] as string))
       return {
         ok: false,
-        error: `protocol "${String(p['protocol'])}" needs rawOutbound JSON for ${p['core'] === 1 ? 'xray' : 'sing-box'}`,
+        error: `protocol "${String(p['protocol'])}" needs rawOutbound JSON for ${coreName}`,
       }
   }
   // TLS fingerprint/fragment mirror gui/fingerprint.go + validateFragment:

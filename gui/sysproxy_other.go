@@ -18,3 +18,7 @@ func sysproxyRestore() error {
 }
 
 func cleanupStaleSysproxy() {}
+
+// sysproxyOwned: nothing is ever ours off Windows, since nothing here
+// can install it. Var for symmetry with sysproxy_windows.go.
+var sysproxyOwned = func() bool { return false }

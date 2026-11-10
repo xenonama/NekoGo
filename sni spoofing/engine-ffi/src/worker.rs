@@ -16,12 +16,12 @@ use parking_lot::Mutex as ParkMutex;
 use serde::Serialize;
 use sni_core::{
     config::{Config, Endpoint},
-    fake_tcp::BypassMethod,
+    fake_tcp::{BypassMethod, Strategy},
     picker::{
         build_ipv6_drop_filter, build_quic_filter, build_tcp_filter, ep_key, pick_sni,
         EndpointPicker,
     },
-    stats::Stats,
+    stats::{connection_verdict, Stats, MIN_RELAY_BYTES},
 };
 use std::{
     collections::HashMap,
@@ -69,6 +69,9 @@ struct ActiveGuard {
     relays: Arc<ParkMutex<HashMap<ConnId, ActiveRelay>>>,
     // FIX(#6): per-connection resolved-method record, cleaned on drop.
     resolved_methods: Arc<ParkMutex<HashMap<ConnId, String>>>,
+    // Interceptor flags are per-connection too: a connection that never
+    // reaches the verdict line must not leave its flag behind.
+    intercepted: Arc<ParkMutex<std::collections::HashSet<ConnId>>>,
     id: ConnId,
 }
 
@@ -78,20 +81,27 @@ impl Drop for ActiveGuard {
         self.relays.lock().remove(&self.id);
         // FIX(#6): also drop the per-connection resolved-method record.
         self.resolved_methods.lock().remove(&self.id);
+        self.intercepted.lock().remove(&self.id);
     }
 }
 
-/// FIX(#7): adaptive method selection for the "auto" config.
-/// Starts on a random real method and sticks to it for a window
-/// of connections or time. Rotates when the current method is
-/// failing or a budget is exhausted, so the engine can discover
-/// which method works on the current network without paying the
-/// old "random per connection" penalty.
+/// FIX(#7)/v3: adaptive strategy selection for the "auto" config.
+///
+/// A *strategy* is a decoy shape plus whether the client's real ClientHello is
+/// segmented, so `auto` explores 15 combinations instead of the 9 method names
+/// the config file used to expose. Selection is sticky and scoreboard-driven:
+/// the current strategy keeps serving connections until it either fails
+/// repeatedly, gets slow, or the exploration queue says it is time to measure
+/// another one.
 pub struct AutoState {
-    pub current: BypassMethod,
+    pub current: Strategy,
     pub attempts: u32,
     pub failures: u32,
     pub started_at: Instant,
+    /// Strategies with zero samples since this process started, in a fresh
+    /// random order. A restart must re-measure the board rather than inherit a
+    /// row that was true for yesterday's network.
+    pending: Vec<Strategy>,
 }
 
 impl Default for AutoState {
@@ -101,60 +111,115 @@ impl Default for AutoState {
 }
 
 impl AutoState {
-    /// Rotate after this many connections on the same method.
-    pub const MAX_ATTEMPTS: u32 = 10;
-    /// Rotate after this many failures on the same method.
+    /// Rotate after this many consecutive failures on the same strategy.
     pub const MAX_FAILURES: u32 = 3;
-    /// Rotate after this many seconds on the same method.
-    pub const MAX_SECS: u64 = 60;
+    /// Even a strategy that works is re-examined after this many connections,
+    /// so exploration cannot stall forever on "good enough".
+    pub const EXPLORE_EVERY: u32 = 4;
+    /// A working strategy above this EWMA latency is replaced. This is the
+    /// 900-1000 ms case: it connects, and it feels broken.
+    pub const SLOW_SWITCH_MS: f64 = 800.0;
+    /// Latency judgement needs more than one sample.
+    pub const MIN_LATENCY_SAMPLES: u32 = 2;
 
     pub fn new() -> Self {
-        // BypassMethod::Auto.resolve() returns a random real method
-        // (see core/src/fake_tcp.rs). We reuse that pool so the
-        // two systems stay in sync.
+        let mut pending = Strategy::pool_shuffled();
+        let current = pending
+            .pop()
+            .unwrap_or_else(|| Strategy::plain(BypassMethod::WrongSeq));
         Self {
-            current: BypassMethod::Auto.resolve(),
+            current,
             attempts: 0,
             failures: 0,
             started_at: Instant::now(),
+            pending,
         }
     }
 
-    /// Record one connection outcome. Returns `true` when the
-    /// caller should rotate the current method.
-    pub fn record(&mut self, success: bool) -> bool {
+    /// Record one connection outcome and apply the rotation policy. Returns
+    /// `true` when `current` changed, so callers can log or re-plan.
+    ///
+    /// FIX(sticky-auto): a strategy that WORKS is kept. The pre-v3 state
+    /// rotated on `attempts >= MAX_ATTEMPTS` or `elapsed >= MAX_SECS` even when
+    /// every connection succeeded, so `auto` abandoned a bypass that defeated
+    /// the local DPI and thrashed back onto failing ones.
+    pub fn record(&mut self, stats: &Stats, success: bool) -> bool {
         self.attempts = self.attempts.saturating_add(1);
-        if !success {
+        if success {
+            self.failures = 0;
+        } else {
             self.failures = self.failures.saturating_add(1);
         }
-        self.failures >= Self::MAX_FAILURES
-            || self.attempts >= Self::MAX_ATTEMPTS
-            || self.started_at.elapsed().as_secs() >= Self::MAX_SECS
+
+        let key = self.current.board_key();
+        let exhausted = self.failures >= Self::MAX_FAILURES;
+        let slow = success
+            && self.attempts >= Self::MIN_LATENCY_SAMPLES
+            && stats
+                .strategy_latency(&key)
+                .is_some_and(|ms| ms > Self::SLOW_SWITCH_MS);
+        let explore = !self.pending.is_empty() && self.attempts >= Self::EXPLORE_EVERY;
+        if exhausted || slow || explore {
+            self.rotate(stats);
+            return true;
+        }
+        false
     }
 
-    /// Pick a fresh random real method, avoiding `self.current`.
-    /// A couple of retries is enough — the pool has 9 entries.
-    pub fn rotate(&mut self) {
+    /// Move to the next strategy: an unmeasured one while the queue has them,
+    /// otherwise the best-scoring one that is not the current row.
+    pub fn rotate(&mut self, stats: &Stats) {
         let previous = self.current;
-        let mut next = BypassMethod::Auto.resolve();
-        for _ in 0..3 {
-            if next != previous {
-                break;
-            }
-            next = BypassMethod::Auto.resolve();
-        }
+        let next = match self.pending.pop() {
+            Some(s) => s,
+            None => Self::best_scored(stats, &previous),
+        };
         tracing::info!(
-            "auto: rotating method {} -> {} (attempts={} failures={} elapsed={}s)",
-            previous.as_str(),
-            next.as_str(),
+            "auto: rotating strategy {} -> {} (attempts={} failures={} pending={} elapsed={}s)",
+            previous.board_key(),
+            next.board_key(),
             self.attempts,
             self.failures,
+            self.pending.len(),
             self.started_at.elapsed().as_secs()
         );
         self.current = next;
         self.attempts = 0;
         self.failures = 0;
-        self.started_at = Instant::now();
+    }
+
+    /// Highest score on the board, ties broken deterministically. Falls back to
+    /// the next entry in the pool when nothing else has been measured.
+    fn best_scored(stats: &Stats, previous: &Strategy) -> Strategy {
+        let mut best: Option<(f64, Strategy)> = None;
+        for s in Strategy::pool() {
+            if &s == previous {
+                continue;
+            }
+            if let Some(score) = stats.strategy_score(&s.board_key()) {
+                match &best {
+                    Some((bs, _)) if *bs >= score => {}
+                    _ => best = Some((score, s)),
+                }
+            }
+        }
+        match best {
+            Some((score, s)) => {
+                tracing::debug!("auto: best strategy {} score={:.3}", s.board_key(), score);
+                s
+            }
+            // Stepping to the next pool entry, rather than drawing at random,
+            // keeps a rotation from handing back the strategy it just dropped.
+            None => {
+                let pool = Strategy::pool();
+                let at = pool
+                    .iter()
+                    .position(|s| s == previous)
+                    .map(|i| (i + 1) % pool.len())
+                    .unwrap_or(0);
+                pool[at]
+            }
+        }
     }
 }
 
@@ -231,6 +296,12 @@ pub struct Worker {
     /// can rank the actual method instead of the useless "auto"
     /// placeholder. Cleaned up by ActiveGuard.
     pub resolved_methods: Arc<ParkMutex<HashMap<ConnId, String>>>,
+    /// Connections the DPI state machine saw answered by the interceptor
+    /// instead of a TLS endpoint. `ConnEntry` is evicted before the relay
+    /// starts, so the handshake signal cannot carry a late intercept to the
+    /// verdict; the relay takes this flag when it finishes and `ActiveGuard`
+    /// clears it on every exit path.
+    intercepted: Arc<ParkMutex<std::collections::HashSet<ConnId>>>,
 }
 
 impl Worker {
@@ -259,6 +330,7 @@ impl Worker {
             // FIX(#7): sticky-auto state + per-connection resolved methods.
             auto_state: Arc::new(ParkMutex::new(AutoState::new())),
             resolved_methods: Arc::new(ParkMutex::new(HashMap::new())),
+            intercepted: Arc::new(ParkMutex::new(std::collections::HashSet::new())),
         })
     }
 
@@ -301,35 +373,32 @@ impl Worker {
         self.active_relays.lock().contains_key(id)
     }
 
-    /// FIX(#7): returns the concrete method this connection should
-    /// use. For a non-auto config this is just the config method. For
-    /// "auto" it is the current sticky method from `auto_state`.
-    pub fn resolve_method_for_connection(&self, cfg_method: BypassMethod) -> BypassMethod {
+    /// FIX(#7): returns the concrete strategy this connection should use. For
+    /// a non-auto config this is just the config method's strategy. For "auto"
+    /// it is the current sticky strategy from `auto_state`.
+    pub fn resolve_strategy_for_connection(&self, cfg_method: BypassMethod) -> Strategy {
         match cfg_method {
             BypassMethod::Auto => self.auto_state.lock().current,
-            other => other,
+            other => other.into_strategy(),
         }
     }
 
-    /// FIX(#7): record a connection outcome and rotate the sticky
-    /// method if the auto budget is spent. No-op when the config is
-    /// not "auto".
+    /// FIX(#7): record a connection outcome and rotate the sticky strategy if
+    /// the auto policy says so. No-op when the config is not "auto".
     pub fn record_connection_result(&self, cfg_method: BypassMethod, success: bool) {
         if !matches!(cfg_method, BypassMethod::Auto) {
             return;
         }
         let mut st = self.auto_state.lock();
-        if st.record(success) {
-            st.rotate();
-        }
+        st.record(&self.stats, success);
     }
 
-    /// FIX(#6): called by the DPI dispatch when it commits to a fake
-    /// burst, so stats later record the actual resolved method.
-    pub fn record_resolved_method(&self, id: &ConnId, method: &str) {
+    /// FIX(#6): called by the DPI dispatch when it commits to a burst, so
+    /// stats later record the strategy that actually went on the wire.
+    pub fn record_resolved_strategy(&self, id: &ConnId, key: &str) {
         self.resolved_methods
             .lock()
-            .insert(id.clone(), method.to_string());
+            .insert(id.clone(), key.to_string());
     }
 
     /// Sync snapshot of live relay sessions for the U5 Active Connections
@@ -357,6 +426,17 @@ impl Worker {
 
     pub fn request_shutdown(&self) {
         self.shutdown.notify_waiters();
+    }
+
+    /// Called by the DPI state machine when the inbound payload was the
+    /// interceptor's own plaintext answer, not a TLS record. The relay reads
+    /// this at the verdict, because the `ConnEntry` is already gone by then.
+    pub fn mark_intercepted(&self, id: &ConnId) {
+        self.intercepted.lock().insert(id.clone());
+    }
+
+    fn take_intercepted(&self, id: &ConnId) -> bool {
+        self.intercepted.lock().remove(id)
     }
 
     /// Called by WinDivert injector threads on handshake outcome.
@@ -417,7 +497,7 @@ impl Worker {
         // hello here was dead code (never sent) with independent randomness,
         // causing stats-vs-wire SNI mismatch. Accounting SNI only.
 
-        let ordered = self.pick_endpoints();
+        let ordered = self.order_endpoints(self.pick_endpoints());
         if ordered.is_empty() {
             tracing::error!("dropping client: no endpoints configured");
             self.stats.increment_failed();
@@ -425,29 +505,40 @@ impl Worker {
         }
         let first_key = ep_key(&ordered[0]);
 
+        // FIX(#7): the strategy for this connection. Resolved once here so the
+        // scoreboard rows, the DPI burst and the failover budget all agree on
+        // what is being tried; the DPI re-resolves the same sticky value.
+        let cfg_method =
+            BypassMethod::parse(&self.config.bypass_method).unwrap_or(BypassMethod::WrongSeq);
+        let strategy = self.resolve_strategy_for_connection(cfg_method);
+        let strategy_key = strategy.board_key();
+
         // Failover connect (fresh socket per attempt; Python reused one fd —
         // same observable behavior, avoids consumed-socket reuse).
-        let (outgoing, connected_ep) = match self.try_connect(&ordered).await {
+        let (outgoing, connected_ep, connect_ms) = match self.try_connect(&ordered).await {
             Some(v) => v,
             None => {
                 // Mirrors `note_fail(None, ep_key(first), sni)`.
-                // FIX: use the configured method so the method scoreboard
-                // sees this failure. Previously empty "" was skipped by
-                // Stats::record_result.
-                let m = self.config.bypass_method.clone();
-                self.stats.record_result(&first_key, &sni, false, &m);
+                // FIX: use the strategy so the scoreboard sees this failure
+                // against the thing we actually tried. Previously the config
+                // string ("auto") was recorded, which made the auto row
+                // unrankable and hid which decoy shape failed.
+                self.stats
+                    .record_result(&first_key, &sni, false, &strategy_key);
                 self.stats.increment_failed();
+                self.record_connection_result(cfg_method, false);
                 return;
             }
         };
         let cur_key = ep_key(&connected_ep);
+        // v3: connect time is the sample the scoreboard ranks on. A strategy
+        // that eventually works after a 900 ms stall is measured as the slow
+        // row it is, so `auto` can prefer the one that answers in 40 ms.
+        self.stats
+            .record_latency(&cur_key, &strategy_key, connect_ms);
 
         // Register under the REAL endpoint (mirrors re-key on failover).
-        let method = self.config.bypass_method.clone();
-        // FIX(#7): parsed method is used for both the sticky resolver
-        // and the outcome recorder.
-        let cfg_method =
-            BypassMethod::parse(&self.config.bypass_method).unwrap_or(BypassMethod::WrongSeq);
+        let method = strategy_key.clone();
         let local: SocketAddr = match outgoing.local_addr() {
             Ok(a) => a,
             Err(e) => {
@@ -528,6 +619,7 @@ impl Worker {
             relays: Arc::clone(&self.active_relays),
             // FIX(#6): guard also owns the resolved-method cleanup.
             resolved_methods: Arc::clone(&self.resolved_methods),
+            intercepted: Arc::clone(&self.intercepted),
             id: relay_id.clone(),
         };
 
@@ -592,7 +684,13 @@ impl Worker {
         let bytes_moved = up.saturating_add(down);
         // Minimum threshold: a real TLS session will move at least a few
         // hundred bytes. Below that, the endpoint never answered.
-        let relay_ok = bytes_moved >= 100;
+        //
+        // The DPI's verdict overrides the byte count. This gateway's kill is a
+        // 415-byte plaintext `HTTP/1.1 302` sent toward the client, which the
+        // byte rule counted as a bypass success — so `auto` ranked destroyed
+        // connections next to traversed ones and had nothing to select on.
+        let intercepted = self.take_intercepted(&id);
+        let relay_ok = connection_verdict(bytes_moved, intercepted);
 
         // FIX(#6): prefer the DPI-resolved method (real one) over the
         // config string. Falls back to the config string if the DPI
@@ -624,9 +722,23 @@ impl Worker {
             self.stats
                 .record_result(&cur_key, &sni, false, &method_for_stats);
             self.stats.increment_failed();
+            let reason = if intercepted {
+                "interceptor answered in plaintext, no TLS session".to_string()
+            } else {
+                format!(
+                    "only {} bytes relayed (< {} minimum)",
+                    bytes_moved, MIN_RELAY_BYTES
+                )
+            };
             tracing::warn!(
-                "relay done key=({}, {}, {}, {}) up={} down={} result=fail reason=only {} bytes relayed (< 100 minimum)",
-                id.0, id.1, id.2, id.3, up, down, bytes_moved
+                "relay done key=({}, {}, {}, {}) up={} down={} result=fail reason={}",
+                id.0,
+                id.1,
+                id.2,
+                id.3,
+                up,
+                down,
+                reason
             );
         }
 
@@ -650,10 +762,41 @@ impl Worker {
         // Permit (`_permit`) drops here (mirrors `conn_sem.release()`).
     }
 
-    /// Try endpoints in order with 5s per-attempt timeout. Mirrors `try_connect`.
-    /// Every skipped/failed attempt logs [WARN] with endpoint + reason so a
-    /// dead endpoint list is diagnosable (Q9 item 1).
-    async fn try_connect(&self, ordered: &[Endpoint]) -> Option<(TcpStream, Endpoint)> {
+    /// Per-attempt connect budget: 4x the best latency we have measured,
+    /// floored at 800 ms and capped at the old flat 5 s.
+    ///
+    /// The flat 5 s was the second half of the "some configs give 900 ms"
+    /// complaint: with a black-holed endpoint list, every dead endpoint burned
+    /// the full budget before failover, so the first working one arrived after
+    /// tens of seconds. Once any endpoint has proven it answers quickly, a
+    /// connection that has not completed by 4x that time is not going to.
+    fn connect_budget(&self) -> Duration {
+        let best = self
+            .stats
+            .best_endpoint_latency()
+            .map(|ms| ms * 4.0)
+            .unwrap_or(5000.0);
+        Duration::from_millis(best.clamp(800.0, 5000.0) as u64)
+    }
+
+    /// v3: endpoints the board has already measured sort ahead of unmeasured
+    /// ones, so a known-fast anycast IP is tried before a stranger. Untried
+    /// endpoints take a neutral 0.5, which keeps them behind a working row and
+    /// ahead of a failing one. Round-robin order is preserved within ties.
+    fn order_endpoints(&self, mut ordered: Vec<Endpoint>) -> Vec<Endpoint> {
+        ordered.sort_by(|a, b| {
+            let sa = self.stats.endpoint_score(&ep_key(a)).unwrap_or(0.5);
+            let sb = self.stats.endpoint_score(&ep_key(b)).unwrap_or(0.5);
+            sb.partial_cmp(&sa).unwrap_or(std::cmp::Ordering::Equal)
+        });
+        ordered
+    }
+
+    /// Try endpoints with a scoreboard-derived per-attempt timeout. Mirrors
+    /// `try_connect`. Every skipped/failed attempt logs [WARN] with endpoint +
+    /// reason so a dead endpoint list is diagnosable (Q9 item 1).
+    /// Returns the stream, the endpoint, and the connect time in ms.
+    async fn try_connect(&self, ordered: &[Endpoint]) -> Option<(TcpStream, Endpoint, f64)> {
         for ep in ordered {
             // Last-mile guard (mirrors `sanitize_for_socket`).
             let ip: std::net::IpAddr = match ep.ip.parse() {
@@ -710,8 +853,12 @@ impl Worker {
                 }
                 _ => None,
             };
-            match tokio::time::timeout(Duration::from_secs(5), sock.connect(target)).await {
-                Ok(Ok(stream)) => return Some((stream, ep.clone())),
+            let budget = self.connect_budget();
+            let started = Instant::now();
+            match tokio::time::timeout(budget, sock.connect(target)).await {
+                Ok(Ok(stream)) => {
+                    return Some((stream, ep.clone(), started.elapsed().as_secs_f64() * 1000.0))
+                }
                 Ok(Err(e)) => {
                     // FIX(#2a): drop the seed if the connect failed.
                     if let Some(k) = seeded_key {
@@ -725,7 +872,11 @@ impl Worker {
                     if let Some(k) = seeded_key {
                         self.dpi_conns.lock().remove(&k);
                     }
-                    tracing::warn!("connect {} failed: timeout (5s)", ep_key(ep));
+                    tracing::warn!(
+                        "connect {} failed: timeout ({}ms budget)",
+                        ep_key(ep),
+                        budget.as_millis()
+                    );
                     continue;
                 }
             }
@@ -925,44 +1076,166 @@ async fn relay_bidirectional(
 
 #[cfg(test)]
 mod auto_state_tests {
-    use super::{AutoState, BypassMethod};
+    use super::{AutoState, BypassMethod, Strategy};
+    use sni_core::stats::Stats;
     use std::time::Instant;
 
     fn fresh() -> AutoState {
         AutoState {
-            current: BypassMethod::WrongSeq,
+            current: Strategy::plain(BypassMethod::WrongSeq),
             attempts: 0,
             failures: 0,
             started_at: Instant::now(),
+            pending: Vec::new(),
+        }
+    }
+
+    /// Measure `n` outcomes for `key` so the scoreboard has a row for it.
+    fn seed(stats: &Stats, key: &str, ok: u32, fail: u32, latency_ms: Option<f64>) {
+        for _ in 0..ok {
+            stats.record_result("1.1.1.1:443", "a.com", true, key);
+        }
+        for _ in 0..fail {
+            stats.record_result("1.1.1.1:443", "a.com", false, key);
+        }
+        if let Some(ms) = latency_ms {
+            for _ in 0..(ok + fail).max(1) {
+                stats.record_latency("1.1.1.1:443", key, ms);
+            }
         }
     }
 
     #[test]
-    fn sticky_until_attempt_budget_spent() {
-        let mut st = fresh();
-        for _ in 0..9 {
-            assert!(!st.record(true));
-        }
-        // 10th connection exhausts MAX_ATTEMPTS.
-        assert!(st.record(true));
+    fn new_state_has_an_exploration_queue() {
+        let st = AutoState::new();
+        // One strategy is current, the rest are queued for measurement.
+        assert_eq!(st.pending.len(), Strategy::pool().len() - 1);
+        assert!(!st.pending.contains(&st.current));
     }
 
     #[test]
-    fn three_failures_trigger_rotate() {
+    fn success_is_sticky_until_the_exploration_budget_is_spent() {
+        let stats = Stats::new();
         let mut st = fresh();
-        assert!(!st.record(false));
-        assert!(!st.record(false));
-        assert!(st.record(false));
+        st.pending = vec![Strategy::plain(BypassMethod::Padding)];
+        // FIX(sticky-auto): a working strategy is kept; the old attempt/time
+        // budget abandoned it after 10 connections / 60 s. It is only
+        // re-examined every EXPLORE_EVERY connections.
+        for _ in 0..(AutoState::EXPLORE_EVERY - 1) {
+            assert!(!st.record(&stats, true));
+        }
+        assert!(st.record(&stats, true));
+        assert_eq!(st.attempts, 0);
     }
 
     #[test]
-    fn rotate_resets_budgets() {
+    fn three_consecutive_failures_rotate() {
+        let stats = Stats::new();
         let mut st = fresh();
-        for _ in 0..10 {
-            st.record(false);
+        assert!(!st.record(&stats, false));
+        assert!(!st.record(&stats, false));
+        assert!(st.record(&stats, false));
+    }
+
+    #[test]
+    fn success_resets_consecutive_failures() {
+        let stats = Stats::new();
+        let mut st = fresh();
+        assert!(!st.record(&stats, false));
+        assert!(!st.record(&stats, false));
+        // A success clears the budget, so two more failures are not enough to
+        // rotate (exploration queue is empty here, so nothing else interferes).
+        assert!(!st.record(&stats, true));
+        assert!(!st.record(&stats, false));
+        assert!(!st.record(&stats, false));
+        assert!(st.record(&stats, false));
+    }
+
+    #[test]
+    fn a_slow_working_strategy_gets_replaced() {
+        // This is the 900 ms case: it connects, so success-rate ranking kept
+        // it forever. Latency alone must be enough to move off it.
+        let stats = Stats::new();
+        let key = Strategy::plain(BypassMethod::WrongSeq).board_key();
+        seed(&stats, &key, 4, 0, Some(1400.0));
+        let mut st = fresh();
+        st.attempts = AutoState::MIN_LATENCY_SAMPLES - 1;
+        assert!(st.record(&stats, true));
+        assert_ne!(st.current.board_key(), key);
+    }
+
+    #[test]
+    fn one_sample_is_not_enough_to_judge_latency() {
+        let stats = Stats::new();
+        let key = Strategy::plain(BypassMethod::WrongSeq).board_key();
+        seed(&stats, &key, 1, 0, Some(1400.0));
+        let mut st = fresh();
+        st.attempts = 0;
+        assert!(!st.record(&stats, true));
+    }
+
+    #[test]
+    fn exploration_picks_an_unmeasured_strategy_first() {
+        let stats = Stats::new();
+        seed(&stats, "padding", 9, 0, Some(10.0));
+        let mut st = AutoState::new();
+        // Pinned, not whatever the shuffled constructor drew: `current` is the
+        // measured champion, and the unmeasured row must still win the rotate.
+        st.current = Strategy::plain(BypassMethod::Padding);
+        st.pending = vec![Strategy::plain(BypassMethod::Fragmented)];
+        st.attempts = AutoState::EXPLORE_EVERY - 1;
+        assert!(st.record(&stats, true));
+        // A proven winner is NOT preferred over a strategy we have never
+        // measured — otherwise the board can never be falsified.
+        assert_eq!(st.current, Strategy::plain(BypassMethod::Fragmented));
+    }
+
+    #[test]
+    fn after_exploration_the_board_decides() {
+        let stats = Stats::new();
+        for s in Strategy::pool() {
+            let key = s.board_key();
+            if key == "padding" {
+                seed(&stats, &key, 6, 0, Some(30.0));
+            } else {
+                seed(&stats, &key, 1, 5, Some(900.0));
+            }
         }
-        st.rotate();
+        let mut st = fresh();
+        st.current = Strategy::plain(BypassMethod::WrongSeq);
+        st.attempts = AutoState::EXPLORE_EVERY;
+        st.failures = AutoState::MAX_FAILURES - 1;
+        assert!(st.record(&stats, false));
+        assert_eq!(st.current, Strategy::plain(BypassMethod::Padding));
+    }
+
+    #[test]
+    fn rotate_with_an_empty_board_falls_back_to_a_pool_strategy() {
+        let stats = Stats::new();
+        let mut st = fresh();
+        st.rotate(&stats);
+        assert!(Strategy::pool().contains(&st.current));
+        // An empty board must still move: a rotation that keeps the strategy it
+        // just dropped would let a stalled one run forever.
+        assert_ne!(st.current, Strategy::plain(BypassMethod::WrongSeq));
         assert_eq!(st.attempts, 0);
         assert_eq!(st.failures, 0);
+    }
+
+    #[test]
+    fn config_method_maps_to_a_strategy() {
+        assert_eq!(
+            BypassMethod::SplitHello.into_strategy(),
+            Strategy::split_only()
+        );
+        assert_eq!(
+            BypassMethod::Fragmented.into_strategy(),
+            Strategy::plain(BypassMethod::Fragmented)
+        );
+        // `auto` never reaches the wire as a decoy shape.
+        assert!(
+            !BypassMethod::Auto.into_strategy().decoy.plan_decoy()
+                || BypassMethod::Auto.into_strategy().decoy != BypassMethod::Auto
+        );
     }
 }

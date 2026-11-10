@@ -12,12 +12,8 @@ func isGuiElevated() (bool, error) {
 	return false, nil
 }
 
-// osProxyEnabled off Windows: the HKCU proxy switch does not exist.
-func osProxyEnabled() (bool, error) {
-	return false, fmt.Errorf("system proxy state is only available on Windows")
-}
-
-// osSystemProxy off Windows: same platform limitation as osProxyEnabled.
+// osSystemProxy off Windows: the HKCU proxy switch does not exist, so
+// there is no state to report and no proxy the GUI could have owned.
 func osSystemProxy() (bool, string, error) {
 	return false, "", fmt.Errorf("system proxy state is only available on Windows")
 }

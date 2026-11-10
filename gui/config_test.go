@@ -256,6 +256,29 @@ func TestSaveSettingsKeepsBackendOwnedFields(t *testing.T) {
 	}
 }
 
+// TestProxyGroupsRoundTrip — user-created Proxies remark groups have no
+// profile to be derived from, so they must survive SaveSettings and a
+// restart even while empty.
+func TestProxyGroupsRoundTrip(t *testing.T) {
+	store, err := NewConfigStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := store.GetSettings()
+	s.ProxyGroups = []string{"Asia", "Europe"}
+	if err := store.SaveSettings(s); err != nil {
+		t.Fatal(err)
+	}
+	reloaded, err := NewConfigStore(store.Dir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := reloaded.GetSettings().ProxyGroups
+	if len(got) != 2 || got[0] != "Asia" || got[1] != "Europe" {
+		t.Fatalf("ProxyGroups = %v, want [Asia Europe]", got)
+	}
+}
+
 // TestLoadConfigKeepsSettingsWhenMixedPortZero — a zero/missing mixedPort
 // used to discard the WHOLE settings block (feeds, core paths, theme) and
 // the next save persisted the loss. Only the port itself is repaired now.

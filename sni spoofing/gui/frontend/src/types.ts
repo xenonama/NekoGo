@@ -89,6 +89,11 @@ export interface ActiveConn {
 export type SortDir = "asc" | "desc" | null;
 export type TableSortKey = "name" | "latency" | "tls" | "status";
 
+// v3 vocabulary — must stay identical to `sni_core::fake_tcp::SUPPORTED_METHODS`
+// and `sni_core::config::SUPPORTED_FINGERPRINTS` (pinned by cli/tests/t9).
+// `delayed_retry` (a fixed 1.5 s injection) and `double_sni` (byte-identical to
+// `wrong_seq`) are gone; `hello_split` replaces them by segmenting the client's
+// real ClientHello instead of feeding DPI a decoy.
 export const METHODS = [
   "auto",
   "wrong_seq",
@@ -96,27 +101,25 @@ export const METHODS = [
   "split_seq",
   "fragmented",
   "padding",
-  "delayed_retry",
-  "double_sni",
+  "hello_split",
   "hostfakesplit",
   "fakedsplit",
 ] as const;
 
-export const FINGERPRINTS = [
-  "legacy",
-  "chrome_120",
-  "chrome_124",
-  "firefox_122",
-  "firefox_124",
-  "custom",
-] as const;
+// Three builders produce three distinct byte shapes; the per-version spellings
+// (`chrome_120`/`chrome_124`/`firefox_122`/`firefox_124`/`custom`) all collapsed
+// onto these and are still accepted on load, then canonicalized.
+export const FINGERPRINTS = ["legacy", "chrome", "firefox"] as const;
 
 export const QUIC_MODES = ["block", "spoof", "passthrough"] as const;
 
 // FIX #8: address family selection modes.
 export const IP_MODES = ["ipv4", "ipv6", "both"] as const;
 
-export const PROXY_MODES = ["SNI Only", "Trojan + Xray"] as const;
+// "Trojan + Xray" was the pre-audit spelling of the only mode this build
+// implements; it is gone from the picker so a saved config cannot be written
+// with a mode the core no longer accepts (older configs migrate on load).
+export const PROXY_MODES = ["SNI Only"] as const;
 
 export function defaultConfig(): AppConfig {
   return {

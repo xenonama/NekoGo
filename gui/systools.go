@@ -21,14 +21,22 @@ import (
 // dedicated throwaway transports per call, never the shared client.
 // These are all quick ops, so the default 30s socket conf suffices.
 //
-// xray gaps: upstream Xray-core has no system-proxy/DNS/cache RPCs.
-// Those three legs return a clear "sing-box only" error and the UI
-// disables their controls on xray. IsPrivileged, IsSupported and
-// GenWgKeyPair have local client-side legs (documented below), so
-// they work with either core — and even with no core running.
+// xray/mihomo gaps: upstream Xray-core has no system-proxy/DNS/cache
+// RPCs and mihomo exposes only its Clash REST controller. Those three
+// legs return a clear "sing-box only" error and the UI disables their
+// controls on both. IsPrivileged, IsSupported and GenWgKeyPair have local
+// client-side legs (documented below), so they work with any core — and
+// even with no core running.
 
 // errSingBoxOnly is returned for legs that need the nekobox_core RPCs.
 var errSingBoxOnly = fmt.Errorf("only available with the sing-box core")
+
+// noCoreRPCs reports whether the active engine exposes none of the
+// nekobox_core Thrift RPCs: xray speaks only its stats gRPC, mihomo only
+// its Clash REST controller. Their system legs run locally instead.
+func noCoreRPCs(core CoreType) bool {
+	return core == CoreXray || core == CoreMihomo
+}
 
 // validateMixedPort rejects out-of-range inbound ports BEFORE any
 // int32 cast (BUG-019): a huge int from a hand-edited config would
@@ -60,14 +68,18 @@ func normalizeInboundAddress(addr string) (string, error) {
 // rendered). The same parser the renderer uses decides acceptance, so
 // a value that saves can never fail at Connect (the old fallback
 // silently swapped unknown values for a public resolver).
+// Surrounding whitespace is trimmed rather than rejected — a pasted
+// value routinely carries it — while an over-long one cannot be a
+// server anyone meant.
 func validateDNSServer(v string) error {
-	if strings.TrimSpace(v) == "" {
+	t := strings.TrimSpace(v)
+	if t == "" {
 		return nil
 	}
-	if len(v) > 256 || strings.ContainsAny(v, " \t\r\n") {
-		return fmt.Errorf("invalid DNS server %q: must be a URL, IP or \"local\" without spaces", v)
+	if len(t) > 4096 {
+		return fmt.Errorf("invalid DNS server %q: too long (max 4096 bytes)", v)
 	}
-	_, err := parseDNSAddr(v)
+	_, err := parseDNSAddr(t)
 	return err
 }
 
@@ -252,9 +264,9 @@ func isSupportedLocal(kind string) bool {
 	return kind != "naive"
 }
 
-// osProxyEnabled is platform-specific (BUG-044): systools_windows.go
-// reads the ACTUAL OS proxy switch from HKCU Internet Settings
-// ProxyEnable (integration BUG-010 ground truth); systools_other.go
+// osSystemProxy is platform-specific (BUG-044): systools_windows.go reads
+// the ACTUAL OS proxy switch from HKCU Internet Settings ProxyEnable plus
+// ProxyServer (integration BUG-010 ground truth); systools_other.go
 // reports an unsupported error elsewhere.
 
 // --- CoreManager routing ---
@@ -279,7 +291,7 @@ func (m *CoreManager) requireSingBox() (*SingBoxManager, error) {
 	if !running {
 		return nil, fmt.Errorf("no active connection")
 	}
-	if core == CoreXray {
+	if noCoreRPCs(core) {
 		return nil, errSingBoxOnly
 	}
 	return m.singboxMgr, nil
@@ -308,13 +320,13 @@ func (m *CoreManager) SetSystemDNS(clear bool) error {
 }
 
 // IsPrivileged reports elevation: the CORE process via RPC when
-// sing-box is active, otherwise this GUI process (xray or offline).
+// sing-box is active, otherwise this GUI process (xray, mihomo or offline).
 func (m *CoreManager) IsPrivileged() (bool, error) {
 	core, running, err := m.sysTarget()
 	if err != nil {
 		return false, err
 	}
-	if running && core != CoreXray {
+	if running && !noCoreRPCs(core) {
 		return m.singboxMgr.IsPrivileged()
 	}
 	return isGuiElevated()
@@ -327,7 +339,7 @@ func (m *CoreManager) IsSupported(kind string) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	if running && core != CoreXray {
+	if running && !noCoreRPCs(core) {
 		return m.singboxMgr.IsSupported(kind)
 	}
 	return isSupportedLocal(kind), nil
@@ -340,7 +352,7 @@ func (m *CoreManager) GenWgKeyPair() (*WgKeyPair, error) {
 	if err != nil {
 		return nil, err
 	}
-	if running && core != CoreXray {
+	if running && !noCoreRPCs(core) {
 		return m.singboxMgr.GenWgKeyPair()
 	}
 	return genWgKeyPairLocal()

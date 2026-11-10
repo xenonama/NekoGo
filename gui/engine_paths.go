@@ -39,6 +39,25 @@ func firstEngineFile(names ...string) (string, bool) {
 	return firstFileIn(engineDirs(), names...)
 }
 
+// firstEngineGlob returns the first existing file in engineDirs matching a
+// filepath.Glob pattern, directory-major. Official releases name the
+// binary after the asset (mihomo-windows-amd64-v1.exe), so a prefix glob
+// resolves a downloaded engine without asking the user to rename it.
+func firstEngineGlob(pattern string) (string, bool) {
+	for _, dir := range engineDirs() {
+		matches, err := filepath.Glob(filepath.Join(dir, pattern))
+		if err != nil {
+			continue
+		}
+		for _, c := range matches {
+			if st, err := os.Stat(c); err == nil && !st.IsDir() {
+				return c, true
+			}
+		}
+	}
+	return "", false
+}
+
 // firstFileIn returns the first existing regular file among names in
 // dirs, directory-major.
 func firstFileIn(dirs []string, names ...string) (string, bool) {

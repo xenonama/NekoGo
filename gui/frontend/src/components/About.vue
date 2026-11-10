@@ -29,38 +29,19 @@
       </button>
     </div>
 
-    <!-- Card 3 — Advanced (Phase A shell; real tools land in Phases B-F) -->
+    <!-- Card 3 — Advanced. The export/reset entries this used to carry
+         were disabled "Phase F" placeholders; both shipped under
+         Settings → Backup & reset, so pointing at them from here would
+         only duplicate a live feature with a dead button. -->
     <div v-if="settings.settings.advancedMode" class="about-card">
       <div class="about-title">Advanced</div>
       <button class="about-link" @click="openFolder">
         <Icon name="folder" :size="20" />
         <span class="about-link-meta">
           <span class="about-link-label">Open config folder</span>
-          <span class="about-link-hint">backend.openConfigFolder()</span>
+          <span class="about-link-hint">The folder holding config.json</span>
         </span>
         <Icon name="chevron" :size="18" class="about-link-chev" />
-      </button>
-      <button class="about-link" @click="openFolder">
-        <Icon name="folder" :size="20" />
-        <span class="about-link-meta">
-          <span class="about-link-label">Open logs folder</span>
-          <span class="about-link-hint">Logs live next to config; split later</span>
-        </span>
-        <Icon name="chevron" :size="18" class="about-link-chev" />
-      </button>
-      <button class="about-link" disabled title="Phase F">
-        <Icon name="download" :size="20" />
-        <span class="about-link-meta">
-          <span class="about-link-label">Export all data</span>
-          <span class="about-link-hint">Phase F</span>
-        </span>
-      </button>
-      <button class="about-link" disabled title="Phase F">
-        <Icon name="trash" :size="20" />
-        <span class="about-link-meta">
-          <span class="about-link-label">Reset to defaults</span>
-          <span class="about-link-hint">Phase F</span>
-        </span>
       </button>
     </div>
 
@@ -105,6 +86,7 @@ const credits: { name: string; url: string }[] = [
   { name: 'CluvexStudio', url: 'https://github.com/CluvexStudio/Aether' },
   { name: 'sing-box', url: 'https://github.com/SagerNet/sing-box' },
   { name: 'Xray-core', url: 'https://github.com/XTLS/Xray-core' },
+  { name: 'mihomo', url: 'https://github.com/MetaCubeX/mihomo' },
   { name: 'Wails', url: 'https://wails.io' },
   { name: 'Vue 3', url: 'https://vuejs.org' },
   { name: 'Apache Thrift', url: 'https://thrift.apache.org' },

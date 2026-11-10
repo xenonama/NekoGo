@@ -19,25 +19,24 @@ const TEMPLATE_HEX: &str = "1603010200010001fc030341d5b549d9cd1adfa7296c8418d157
 // Template SNI `mci.ir` (6B): static4 bounds are [127+6 .. 262+6] = [133..268].
 const TEMPLATE_SNI_LEN: usize = 6;
 
+/// Decoy-ClientHello shape. Three, not six: `chrome_120`/`chrome_124` and
+/// `firefox_122`/`firefox_124` produced byte-identical wire output, and
+/// `custom` fell through to the legacy builder, so five of the old names were
+/// decoration. The old spellings still parse (see `TlsProfile::parse`) and
+/// `config::migrate` rewrites them, so saved configs keep working.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum TlsProfile {
     Legacy,
-    Chrome120,
-    Chrome124,
-    Firefox122,
-    Firefox124,
-    Custom,
+    Chrome,
+    Firefox,
 }
 
 impl TlsProfile {
     pub fn parse(name: &str) -> Result<Self, String> {
         match name.trim().to_lowercase().as_str() {
-            "legacy" => Ok(Self::Legacy),
-            "chrome_120" => Ok(Self::Chrome120),
-            "chrome_124" => Ok(Self::Chrome124),
-            "firefox_122" => Ok(Self::Firefox122),
-            "firefox_124" => Ok(Self::Firefox124),
-            "custom" => Ok(Self::Custom),
+            "legacy" | "custom" => Ok(Self::Legacy),
+            "chrome" | "chrome_120" | "chrome_124" => Ok(Self::Chrome),
+            "firefox" | "firefox_122" | "firefox_124" => Ok(Self::Firefox),
             other => Err(format!("unsupported TLS_FINGERPRINT: {:?}", other)),
         }
     }
@@ -45,11 +44,8 @@ impl TlsProfile {
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::Legacy => "legacy",
-            Self::Chrome120 => "chrome_120",
-            Self::Chrome124 => "chrome_124",
-            Self::Firefox122 => "firefox_122",
-            Self::Firefox124 => "firefox_124",
-            Self::Custom => "custom",
+            Self::Chrome => "chrome",
+            Self::Firefox => "firefox",
         }
     }
 }
@@ -65,7 +61,12 @@ pub enum TlsError {
 }
 
 /// Precondition check (mirrors Python guards). Returns 517 on success.
-pub fn check_hello_params(rnd: &[u8], sess_id: &[u8], sni: &[u8], key_share: &[u8]) -> Result<usize, TlsError> {
+pub fn check_hello_params(
+    rnd: &[u8],
+    sess_id: &[u8],
+    sni: &[u8],
+    key_share: &[u8],
+) -> Result<usize, TlsError> {
     if sni.is_empty() {
         return Err(TlsError::EmptySni);
     }
@@ -106,8 +107,8 @@ fn be16(n: usize) -> [u8; 2] {
 
 // FIX #2: GREASE table (RFC 8701).
 const GREASE: [u16; 16] = [
-    0x0a0a, 0x1a1a, 0x2a2a, 0x3a3a, 0x4a4a, 0x5a5a, 0x6a6a, 0x7a7a,
-    0x8a8a, 0x9a9a, 0xaaaa, 0xbaba, 0xcaca, 0xdada, 0xeaea, 0xfafa,
+    0x0a0a, 0x1a1a, 0x2a2a, 0x3a3a, 0x4a4a, 0x5a5a, 0x6a6a, 0x7a7a, 0x8a8a, 0x9a9a, 0xaaaa, 0xbaba,
+    0xcaca, 0xdada, 0xeaea, 0xfafa,
 ];
 
 // FIX #2: random GREASE value.
@@ -128,17 +129,14 @@ fn push_ext(out: &mut Vec<u8>, ext_type: u16, body: &[u8]) {
     out.extend_from_slice(body);
 }
 
-/// FIX #2: real Chrome 124 ClientHello. Uses GREASE + Chrome's
+/// FIX #2: real Chrome ClientHello. Uses GREASE + Chrome's
 /// cipher-suite and extension order. Total length is variable
 /// (padded to a 512-byte minimum with the standard padding ext).
-/// `version` is accepted for future Chrome 120 vs 124 tweaks; both
-/// currently produce the same wire bytes.
 fn build_chrome_hello(
     sni: &[u8],
     rnd: &[u8; 32],
     sess: &[u8; 32],
     key_share: &[u8; 32],
-    _version: u16,
 ) -> Vec<u8> {
     let mut rng = rand::thread_rng();
 
@@ -153,12 +151,21 @@ fn build_chrome_hello(
     let grease_cipher = pick_grease(&mut rng);
     let suites: [u16; 16] = [
         grease_cipher,
-        0x1301, 0x1302, 0x1303,
-        0xC02B, 0xC02F, 0xC02C, 0xC030,
-        0xCCA9, 0xCCA8,
-        0xC013, 0xC014,
-        0x009C, 0x009D,
-        0x002F, 0x0035,
+        0x1301,
+        0x1302,
+        0x1303,
+        0xC02B,
+        0xC02F,
+        0xC02C,
+        0xC030,
+        0xCCA9,
+        0xCCA8,
+        0xC013,
+        0xC014,
+        0x009C,
+        0x009D,
+        0x002F,
+        0x0035,
     ];
     push_u16(&mut body, suites.len() * 2);
     for s in suites {
@@ -236,8 +243,7 @@ fn build_chrome_hello(
     {
         // Chrome's order (simplified but valid)
         let sigs: [u16; 10] = [
-            0x0403, 0x0804, 0x0401, 0x0503, 0x0805,
-            0x0501, 0x0806, 0x0601, 0x0201, 0x0203,
+            0x0403, 0x0804, 0x0401, 0x0503, 0x0805, 0x0501, 0x0806, 0x0601, 0x0201, 0x0203,
         ];
         let mut e: Vec<u8> = Vec::new();
         push_u16(&mut e, sigs.len() * 2);
@@ -247,8 +253,9 @@ fn build_chrome_hello(
         push_ext(&mut exts, 0x000d, &e);
     }
 
-    // 11. signed_certificate_timestamp (empty)
-    push_ext(&mut exts, 0x0012, &[]);
+    // 11. signed_certificate_timestamp: an SCT *list*, so the empty case is a
+    // 2-byte vector header, not a zero-length extension body.
+    push_ext(&mut exts, 0x0012, &[0x00, 0x00]);
 
     // 12. key_share: GREASE + x25519
     {
@@ -281,14 +288,25 @@ fn build_chrome_hello(
         push_ext(&mut exts, 0x002b, &e);
     }
 
-    // 15. compress_certificate: brotli, zlib, zstd
-    push_ext(&mut exts, 0x001b, &[0x04, 0x00, 0x02, 0x00, 0x01, 0x00, 0x02]);
+    // 15. compress_certificate: the body is `opaque preferred_algorithms<0..2^16-1>`
+    // of 2-byte IDs, so the list needs a u16 length, not a u8. zstd is 0x0003.
+    push_ext(
+        &mut exts,
+        0x001b,
+        &[0x00, 0x06, 0x00, 0x02, 0x00, 0x01, 0x00, 0x03],
+    );
 
-    // 16. application_settings (ALPS), Chrome-specific 0x4469
+    // 16. application_settings (ALPS), Chrome-specific 0x4469.
+    // The extension value is a vector, `ProtocolSettings settings<1..2^16-1>`,
+    // whose entries are `opaque protocol_id<0..255>` + `opaque settings<0..2^16-1>`.
     {
+        let mut entry: Vec<u8> = Vec::new();
+        entry.push(2); // protocol_id length
+        entry.extend_from_slice(b"h2");
+        push_u16(&mut entry, 0); // settings len
         let mut e: Vec<u8> = Vec::new();
-        e.extend_from_slice(b"h2"); // protocol
-        push_u16(&mut e, 0); // settings len
+        push_u16(&mut e, entry.len());
+        e.extend_from_slice(&entry);
         push_ext(&mut exts, 0x4469, &e);
     }
 
@@ -303,7 +321,8 @@ fn build_chrome_hello(
     // (4 bytes header + 0 body), then pad the difference.
     {
         // 4 bytes = padding extension header + length field
-        let current = 5 /* record */ + 4 /* hs */ + body.len() + 2 /* exts total len */ + exts.len() + 4;
+        let current =
+            5 /* record */ + 4 /* hs */ + body.len() + 2 /* exts total len */ + exts.len() + 4;
         let target = 512usize;
         if current < target {
             let pad_len = target - current;
@@ -335,18 +354,14 @@ fn build_chrome_hello(
     rec
 }
 
-/// FIX(firefox): Firefox 122/124 ClientHello. No GREASE, no
+/// FIX(firefox): Firefox ClientHello. No GREASE, no
 /// ALPS, no compress_certificate. Uses Firefox's cipher order,
 /// extension order, and key_share shape (x25519 only).
-///
-/// `version` is accepted for future 122 vs 124 tweaks; both
-/// currently produce the same wire bytes.
 fn build_firefox_hello(
     sni: &[u8],
     rnd: &[u8; 32],
     sess: &[u8; 32],
     key_share: &[u8; 32],
-    _version: u16,
 ) -> Vec<u8> {
     let mut body: Vec<u8> = Vec::with_capacity(512);
 
@@ -361,13 +376,8 @@ fn build_firefox_hello(
     // ---- cipher_suites (Firefox order, no GREASE) ----
     // TLS 1.3 first, then ECDHE, then legacy RSA.
     let suites: [u16; 16] = [
-        0x1301, 0x1303, 0x1302,
-        0xC02B, 0xC02F, 0xCCA9, 0xCCA8,
-        0xC02C, 0xC030,
-        0x009E, 0x009C,
-        0x0035, 0x002F,
-        0x000A, 0x00FF,
-        0x0100,
+        0x1301, 0x1303, 0x1302, 0xC02B, 0xC02F, 0xCCA9, 0xCCA8, 0xC02C, 0xC030, 0x009E, 0x009C,
+        0x0035, 0x002F, 0x000A, 0x00FF, 0x0100,
     ];
     push_u16(&mut body, suites.len() * 2);
     for s in suites {
@@ -403,9 +413,7 @@ fn build_firefox_hello(
     // 4. supported_groups: x25519, secp256r1, secp384r1,
     //    secp521r1, ffdhe2048, ffdhe3072. No GREASE.
     {
-        let groups: [u16; 6] = [
-            0x001d, 0x0017, 0x0018, 0x0019, 0x0100, 0x0101,
-        ];
+        let groups: [u16; 6] = [0x001d, 0x0017, 0x0018, 0x0019, 0x0100, 0x0101];
         let mut e: Vec<u8> = Vec::new();
         push_u16(&mut e, groups.len() * 2);
         for g in groups {
@@ -470,8 +478,8 @@ fn build_firefox_hello(
     // 12. signature_algorithms (Firefox order)
     {
         let sigs: [u16; 12] = [
-            0x0403, 0x0503, 0x0603, 0x0804, 0x0805, 0x0806,
-            0x0401, 0x0501, 0x0601, 0x0807, 0x0808, 0x0809,
+            0x0403, 0x0503, 0x0603, 0x0804, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601, 0x0807, 0x0808,
+            0x0809,
         ];
         let mut e: Vec<u8> = Vec::new();
         push_u16(&mut e, sigs.len() * 2);
@@ -581,11 +589,9 @@ pub fn parse_client_hello(buf: &[u8]) -> Option<(Vec<u8>, Vec<u8>, Vec<u8>, Vec<
 }
 
 /// Fingerprint dispatcher (port of `build_fake_client_hello` in main.py).
-/// FIX #2: Legacy/Custom use the legacy 517B builder; Chrome 120/124
-/// use the realistic Chrome builder with GREASE, ALPS,
-/// compress_certificate and a 512-byte padding floor.
-/// FIX(firefox): Firefox 122/124 use the dedicated Firefox builder with
-/// no GREASE, delegated_credentials and record_size_limit.
+/// Legacy/Custom use the byte-exact 517B template; Chrome uses the realistic
+/// GREASE/ALPS/compress_certificate builder; Firefox uses the dedicated
+/// no-GREASE builder with delegated_credentials and record_size_limit.
 pub fn build_fake_client_hello(sni: &[u8], profile: TlsProfile) -> Vec<u8> {
     let mut rng = rand::thread_rng();
     let mut rnd = [0u8; 32];
@@ -597,15 +603,8 @@ pub fn build_fake_client_hello(sni: &[u8], profile: TlsProfile) -> Vec<u8> {
     // Validation already done by caller config; fallback is empty on bad SNI
     // (never panics — mirrors Python try/except fallback to legacy template).
     match profile {
-        TlsProfile::Legacy | TlsProfile::Custom => {
-            get_client_hello_with(&rnd, &sess, sni, &key).unwrap_or_default()
-        }
-        TlsProfile::Chrome120 | TlsProfile::Chrome124 => {
-            build_chrome_hello(sni, &rnd, &sess, &key, 0x0304)
-        }
-        TlsProfile::Firefox122 | TlsProfile::Firefox124 => {
-            // FIX(firefox): dedicated Firefox template.
-            build_firefox_hello(sni, &rnd, &sess, &key, 0x0304)
-        }
+        TlsProfile::Legacy => get_client_hello_with(&rnd, &sess, sni, &key).unwrap_or_default(),
+        TlsProfile::Chrome => build_chrome_hello(sni, &rnd, &sess, &key),
+        TlsProfile::Firefox => build_firefox_hello(sni, &rnd, &sess, &key),
     }
 }

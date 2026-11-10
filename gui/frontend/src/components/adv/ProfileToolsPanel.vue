@@ -1,13 +1,19 @@
-<!-- Advanced "Profile tools" panel: the per-profile expert
-     actions moved out of Simple's Proxies table (speed/IP probes,
-     duplicate, move-to-group, edit-as-JSON). Operates on the chosen
-     profile; the JSON editor is re-hosted untouched. Simple keeps
-     only Connect / Test / Edit / Delete / Re-detect. -->
+<!-- Advanced "Profile tools": the per-profile expert actions (speed/IP
+     probes, duplicate, move-to-group, edit-as-JSON) that the Proxies
+     table leaves out. Proxies itself keeps Connect / Test / Edit /
+     Delete / Re-detect. One card, one head, five rows. -->
 <template>
-  <div class="net-stack">
-    <div v-if="profiles.profiles.length === 0" class="muted">No profiles — add one in Simple Proxies first.</div>
+  <div class="stg-card">
+    <div class="stg-head">
+      <span class="stg-head-chip"><Icon name="wrench" :size="22" /></span>
+      <span class="stg-head-text">
+        <span class="stg-head-title">Profile tools</span>
+        <span class="stg-head-sub">Speed/IP probes, duplicate, move, raw JSON for one profile</span>
+      </span>
+    </div>
+    <div v-if="profiles.profiles.length === 0" class="muted">No profiles yet — add one in Proxies.</div>
     <template v-else>
-      <div class="toolbar" style="padding: 0 0 8px">
+      <div class="toolbar">
         <PickSelect
           v-model="targetId"
           icon="servers"
@@ -26,7 +32,7 @@
           <span class="stg-sub">Switches to this profile, measures, restores</span>
         </span>
         <span class="stg-ctl">
-          <button class="nb-act nb-act--primary" :disabled="busy || !target" @click="probeSpeed">
+          <button class="nb-act nb-act--primary" :disabled="probeBlocked || !target" @click="probeSpeed">
             <Icon name="download" :size="14" />{{ busy && busyWhat === 'speed' ? 'Measuring…' : 'Run speed test' }}
           </button>
         </span>
@@ -38,7 +44,7 @@
           <span class="stg-sub">Switches to this profile, probes egress, restores</span>
         </span>
         <span class="stg-ctl">
-          <button class="nb-act" :disabled="busy || !target" @click="probeIP">
+          <button class="nb-act" :disabled="probeBlocked || !target" @click="probeIP">
             <Icon name="globe" :size="14" />{{ busy && busyWhat === 'ip' ? 'Probing…' : 'Run IP test' }}
           </button>
         </span>
@@ -61,7 +67,7 @@
           <span class="stg-title">Move to group</span>
           <span class="stg-sub">Re-file this profile via saveProfile</span>
         </span>
-        <span class="stg-ctl" style="display: flex; gap: 8px">
+        <span class="stg-ctl stg-ctl--pair">
           <PickSelect
             v-model="moveGroup"
             icon="folder"
@@ -124,6 +130,11 @@ const editingProfile = ref<Profile | null>(null)
 
 const target = computed(() => profiles.profiles.find((p) => p.id === targetId.value) ?? null)
 
+// A row probe switches the active profile and reconnects, so it must not
+// start while another connect owns the core — the switch would be refused
+// and the measurement would ride whatever tunnel is already up.
+const probeBlocked = computed(() => busy.value || connection.busy || connection.connectBusy)
+
 const groupNames = computed(() =>
   [...new Set(profiles.profiles.map((p) => p.group).filter((g): g is string => !!g))].sort(),
 )
@@ -157,7 +168,12 @@ async function withSwitchedProfile(id: string, fn: () => Promise<void>) {
   }
   await settings.setActiveProfileId(id)
   try {
-    await connection.connect(id)
+    if (!(await connection.connect(id))) {
+      // Measuring now would ride the PREVIOUS tunnel while the note labels
+      // the result with this profile's name — a wrong answer presented as
+      // a right one. The finally below still restores the old selection.
+      throw new Error(connection.error || 'another connect is in progress')
+    }
     await fn()
   } finally {
     try {
@@ -175,7 +191,7 @@ async function withSwitchedProfile(id: string, fn: () => Promise<void>) {
 }
 
 async function probeSpeed() {
-  if (busy.value || !target.value) return
+  if (probeBlocked.value || !target.value) return
   busy.value = true
   busyWhat.value = 'speed'
   note.value = 'Switching…'
@@ -196,7 +212,7 @@ async function probeSpeed() {
 }
 
 async function probeIP() {
-  if (busy.value || !target.value) return
+  if (probeBlocked.value || !target.value) return
   busy.value = true
   busyWhat.value = 'ip'
   note.value = 'Switching…'

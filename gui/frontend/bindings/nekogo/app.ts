@@ -386,10 +386,14 @@ export function GetStats(): $CancellablePromise<$models.Stats | null> {
 }
 
 /**
- * GetSystemProxyState reports the ACTUAL OS proxy switch by reading it
- * from the OS (integration BUG-010). The Console System tab queries
- * this on mount so the toggle reflects reality — a crash leftover, an
- * external change, or a restart — instead of its own stale local state.
+ * GetSystemProxyState reports whether the OS proxy is ON *and ours*
+ * (integration BUG-010). It used to return the raw ProxyEnable switch,
+ * which a corporate or third-party proxy also sets: the toggle then
+ * showed ON, the user clicked it off, ClearSystemProxy rightly refused
+ * to revert a proxy it never installed — and the card painted "Off"
+ * while that foreign proxy kept steering the browser. osProxyOwned is
+ * the same predicate Connect's auto path uses, so the two can no longer
+ * disagree about who owns the switch.
  */
 export function GetSystemProxyState(): $CancellablePromise<boolean> {
     return $Call.ByID(2227202591);
@@ -496,6 +500,19 @@ export function ListUpdatables(): $CancellablePromise<$models.UpdatableComponent
     return $Call.ByID(3240550730).then(($result: any) => {
         return $$createType9($result);
     });
+}
+
+/**
+ * MihomoVersion runs "<resolved mihomo path> -v" and returns the first
+ * non-empty stdout line, cached per resolved path like the other cores
+ * (a transient "" is never cached, so the next call retries). Measured
+ * on v1.19.33: -v prints "Mihomo Meta v1.19.33 windows amd64 with
+ * go1.26.10 …" on STDOUT and exits 0, leaving stderr empty. The cache
+ * keys on the resolved binary, not settings.MihomoPath, because that
+ * override may name a directory.
+ */
+export function MihomoVersion(): $CancellablePromise<string> {
+    return $Call.ByID(944345914);
 }
 
 /**
@@ -731,12 +748,13 @@ export function ShouldHideOnClose(): $CancellablePromise<boolean> {
 }
 
 /**
- * Shutdown stops cores; called on app exit. A leftover system-DNS
- * override is restored best-effort first (BUG-009: quitting with
- * system DNS applied must not leave it installed); an auto-enabled
- * system proxy is likewise restored best-effort, but only when this
- * session enabled it (autoProxyOn) — a manually-enabled proxy is left
- * untouched. Failures are ignored so shutdown never blocks. cores.Stop
+ * Shutdown stops cores; called on app exit. A background GeoIP refresh
+ * is cancelled and drained first so no SaveFile writes config.json after
+ * exit. A leftover system-DNS override is restored best-effort next
+ * (BUG-009: quitting with system DNS applied must not leave it
+ * installed); the system proxy is restored the same way whenever this
+ * session owns it, auto-enabled or manual — quitting takes the listener
+ * with it. Failures are ignored so shutdown never blocks. cores.Stop
  * aborts any in-flight Start via the epoch instead of blocking on its
  * probe.
  */

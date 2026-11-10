@@ -4,16 +4,81 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/oschwald/maxminddb-golang"
 )
+
+// skipUnlessStockGeoDB skips when path is absent or is not a stock MaxMind
+// GeoLite2-Country DB. A hand-"Customized" DB carries unknown mappings
+// (the one shipped here maps 8.8.8.8 -> "GOOGLE"), so it is not a valid
+// fixture for asserting the canonical 8.8.8.8 -> US result. Against a
+// genuine DB the assertion still runs, so this never masks a reader bug.
+func skipUnlessStockGeoDB(t *testing.T, path string) {
+	t.Helper()
+	if _, err := os.Stat(path); err != nil {
+		t.Skip("no real GeoLite2 DB present")
+	}
+	db, err := maxminddb.Open(path)
+	if err != nil {
+		t.Skipf("GeoLite2 DB at %s is unreadable: %v", path, err)
+	}
+	defer db.Close()
+	md := db.Metadata
+	if md.DatabaseType != "GeoLite2-Country" || strings.Contains(strings.ToLower(md.Description["en"]), "custom") {
+		t.Skipf("%s is not a stock GeoLite2-Country DB (type=%q desc=%q); replace it with a genuine MaxMind DB to exercise this test", path, md.DatabaseType, md.Description["en"])
+	}
+}
 
 // All tests run WITHOUT a real .mmdb (the user places it later), except
 // TestGeoIPRealDB which skips when absent.
 
+// TestSplitRecordRejectsMalformedCode — a corrupt/customized DB can
+// return a non-ISO string (the shipped one maps 8.8.8.8 -> "GOOGLE").
+// splitRecord must accept only two-letter alpha-2 codes and degrade
+// everything else to empty so garbage never reaches the UI.
+func TestSplitRecordRejectsMalformedCode(t *testing.T) {
+	cases := []struct {
+		raw      string
+		wantCode string
+	}{
+		{"us", "US"},
+		{"  de ", "DE"},
+		{"GB", "GB"},
+		{"", ""},
+		{"GOOGLE", ""},
+		{"USA", ""},
+		{"U", ""},
+		{"U1", ""},
+		{"1S", ""},
+		{"ÜS", ""},
+	}
+	for _, c := range cases {
+		var rec geoCountryRecord
+		rec.Country.ISOCode = c.raw
+		rec.Country.Names = map[string]string{"en": "Example"}
+		code, name, err := splitRecord(rec)
+		if err != nil {
+			t.Fatalf("splitRecord(%q) err = %v", c.raw, err)
+		}
+		if code != c.wantCode {
+			t.Fatalf("splitRecord(%q) code = %q, want %q", c.raw, code, c.wantCode)
+		}
+		if code == "" && name != "" {
+			t.Fatalf("splitRecord(%q) dropped code but kept name %q", c.raw, name)
+		}
+	}
+}
+
 // TestGeoIPMissingDB — missing file degrades: not available, empty lookup.
 func TestGeoIPMissingDB(t *testing.T) {
+	// Isolate from any user-placed DB: resolveDBPath auto-discovers
+	// ./assets/GeoLite2-Country.mmdb relative to CWD, so run from an
+	// empty dir to prove the missing-DB path regardless of the asset.
+	t.Chdir(t.TempDir())
 	g := NewGeoIP("Z:\\definitely\\not\\here\\GeoLite2-Country.mmdb")
 	if g.Available() {
 		t.Fatal("Available() = true with a missing DB")
@@ -67,6 +132,7 @@ func newGeoTestApp(t *testing.T) *App {
 
 // TestDetectCountryNoDB — no DB: profile comes back unchanged, no error.
 func TestDetectCountryNoDB(t *testing.T) {
+	t.Chdir(t.TempDir()) // no auto-discovered assets DB (see TestGeoIPMissingDB)
 	a := newGeoTestApp(t)
 	saved, err := a.store.SaveProfile(Profile{Name: "t", Address: "8.8.8.8", Port: 443})
 	if err != nil {
@@ -86,6 +152,7 @@ func TestDetectCountryNoDB(t *testing.T) {
 
 // TestRefreshAllCountriesNoDB — Updated=0, Skipped=N, Failed=0, no error.
 func TestRefreshAllCountriesNoDB(t *testing.T) {
+	t.Chdir(t.TempDir()) // no auto-discovered assets DB (see TestGeoIPMissingDB)
 	a := newGeoTestApp(t)
 	for _, p := range []Profile{
 		{Name: "a", Address: "1.1.1.1", Port: 443},
@@ -117,11 +184,9 @@ func TestRefreshAllCountriesNoDB(t *testing.T) {
 	}
 }
 
-// TestGeoIPRealDB — optional: runs only when the user-placed DB exists.
+// TestGeoIPRealDB — optional: runs only when a stock user-placed DB exists.
 func TestGeoIPRealDB(t *testing.T) {
-	if _, err := os.Stat("assets/GeoLite2-Country.mmdb"); err != nil {
-		t.Skip("no real GeoLite2 DB present")
-	}
+	skipUnlessStockGeoDB(t, "assets/GeoLite2-Country.mmdb")
 	g := NewGeoIP("assets/GeoLite2-Country.mmdb")
 	if !g.Available() {
 		t.Fatal("Available() = false with a real DB present")
@@ -222,6 +287,7 @@ func TestNewestExistingPrefersTheUpdatedCopy(t *testing.T) {
 // succeeds despite the live mapping, and the Reload that follows serves the
 // new file.
 func TestGeoIPUpdateWhileMapped(t *testing.T) {
+	skipUnlessStockGeoDB(t, "assets/GeoLite2-Country.mmdb")
 	raw, err := os.ReadFile("assets/GeoLite2-Country.mmdb")
 	if err != nil {
 		t.Skip("no real GeoLite2 DB present")

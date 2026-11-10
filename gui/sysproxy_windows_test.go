@@ -287,3 +287,285 @@ func setScratchProxyEnable(t *testing.T, v uint32) error {
 	defer key.Close()
 	return key.SetDWordValue("ProxyEnable", v)
 }
+
+func readScratchOverride(t *testing.T) (string, bool) {
+	t.Helper()
+	key, err := registry.OpenKey(registry.CURRENT_USER, sysproxyKeyPath, registry.QUERY_VALUE)
+	if err != nil {
+		t.Fatalf("open scratch key: %v", err)
+	}
+	defer key.Close()
+	v, _, err := key.GetStringValue("ProxyOverride")
+	if err != nil {
+		return "", false
+	}
+	return v, true
+}
+
+func setScratchProxyOverride(t *testing.T, v string) error {
+	t.Helper()
+	key, _, err := registry.CreateKey(registry.CURRENT_USER, sysproxyKeyPath, registry.ALL_ACCESS)
+	if err != nil {
+		return err
+	}
+	defer key.Close()
+	return key.SetStringValue("ProxyOverride", v)
+}
+
+// TestSystemProxyOverrideRoundTrip: "<local>" is a value NekoGo invents
+// so the loopback stays reachable. It used to be written on apply and
+// never removed on restore — one session permanently edited the user's
+// exception list, even though the ProxyServer case right next to it
+// already deleted what it had created.
+func TestSystemProxyOverrideRoundTrip(t *testing.T) {
+	t.Run("created then deleted", func(t *testing.T) {
+		restore := isolateSysproxy(t)
+		defer restore()
+		if err := sysproxyApply(ProxyPorts{HTTP: 2080, SOCKS: 2080, Mixed: true}); err != nil {
+			t.Fatal(err)
+		}
+		if v, ok := readScratchOverride(t); !ok || v != "<local>" {
+			t.Fatalf("apply override = %q/%v, want \"<local>\"", v, ok)
+		}
+		if err := sysproxyRestore(); err != nil {
+			t.Fatal(err)
+		}
+		if v, ok := readScratchOverride(t); ok {
+			t.Fatalf("restore left ProxyOverride=%q, want the value gone (the user had none)", v)
+		}
+	})
+	t.Run("the user's own list survives", func(t *testing.T) {
+		restore := isolateSysproxy(t)
+		defer restore()
+		if err := setScratchProxyOverride(t, "10.0.0.0/8"); err != nil {
+			t.Fatal(err)
+		}
+		if err := sysproxyApply(ProxyPorts{HTTP: 2080, SOCKS: 2080, Mixed: true}); err != nil {
+			t.Fatal(err)
+		}
+		if err := sysproxyRestore(); err != nil {
+			t.Fatal(err)
+		}
+		if v, ok := readScratchOverride(t); !ok || v != "10.0.0.0/8" {
+			t.Fatalf("restore override = %q/%v, want the user's list back untouched", v, ok)
+		}
+	})
+}
+
+// TestApplyOrderNeverEnablesAStaleServer: the commit order is only a
+// claim until one write is failed on purpose. ProxyServer is what the
+// switch reads, so a session that cannot install it must leave
+// ProxyEnable exactly where the user had it — enabling first, as the
+// old order did, handed WinINET a switched-on proxy at an address it
+// never finished writing.
+func TestApplyOrderNeverEnablesAStaleServer(t *testing.T) {
+	restore := isolateSysproxy(t)
+	defer restore()
+	oldWrite := sysproxyWriteString
+	defer func() { sysproxyWriteString = oldWrite }()
+	sysproxyWriteString = func(k registry.Key, name, v string) error {
+		if name == "ProxyServer" {
+			return fmt.Errorf("injected ProxyServer failure")
+		}
+		return oldWrite(k, name, v)
+	}
+	app := runningProxyApp(t, 2080, CoreSingBox)
+	if err := app.SetSystemProxy(app.ActiveProxyPorts()); err == nil {
+		t.Fatal("SetSystemProxy with a failing ProxyServer write = nil, want an error")
+	}
+	if en, srv := readScratchProxy(t); en != 0 || srv != "prev-proxy:8888" {
+		t.Fatalf("partial apply left ProxyEnable=%d ProxyServer=%q, want the user's pair intact", en, srv)
+	}
+	if sysproxyOwned() {
+		t.Fatal("a failed apply claimed ownership of the OS proxy")
+	}
+	if sysproxyMarkerExists() {
+		t.Fatal("a failed apply wrote the crash-recovery marker")
+	}
+}
+
+// TestSysproxyOwnedTracksApplyAndRestore: ownership is what the UI and
+// the exit revert key off, so it must appear on apply and vanish on
+// restore — and a fresh process must not start out owning it.
+func TestSysproxyOwnedTracksApplyAndRestore(t *testing.T) {
+	restore := isolateSysproxy(t)
+	defer restore()
+	if sysproxyOwned() {
+		t.Fatal("a fresh process already owns the OS proxy")
+	}
+	if err := sysproxyApply(ProxyPorts{HTTP: 2080, SOCKS: 2080, Mixed: true}); err != nil {
+		t.Fatal(err)
+	}
+	if !sysproxyOwned() {
+		t.Fatal("apply did not claim ownership")
+	}
+	if err := sysproxyRestore(); err != nil {
+		t.Fatal(err)
+	}
+	if sysproxyOwned() {
+		t.Fatal("restore still claims ownership")
+	}
+}
+
+// TestExitRevertsManuallyEnabledProxy: the toggle path records no
+// autoProxyOn, which is precisely why Shutdown and noteFault used to
+// skip it — so after a crash or a quit the browser stayed pointed at
+// our closed port until NekoGo happened to start again.
+func TestExitRevertsManuallyEnabledProxy(t *testing.T) {
+	restore := isolateSysproxy(t)
+	defer restore()
+	app := runningProxyApp(t, 2080, CoreSingBox)
+	if err := app.EnableSystemProxyGUI(); err != nil {
+		t.Fatalf("EnableSystemProxyGUI: %v", err)
+	}
+	if app.getAutoProxy() {
+		t.Fatal("the manual path set autoProxyOn, which is not its job")
+	}
+	if en, srv := readScratchProxy(t); en != 1 || srv != "127.0.0.1:2080" {
+		t.Fatalf("after manual enable ProxyEnable=%d ProxyServer=%q", en, srv)
+	}
+
+	app.revertSystemProxyOnExit("test")
+
+	if en, srv := readScratchProxy(t); en != 0 || srv != "prev-proxy:8888" {
+		t.Fatalf("after exit revert ProxyEnable=%d ProxyServer=%q, want the user's pair back", en, srv)
+	}
+	if sysproxyMarkerExists() {
+		t.Fatal("exit revert left the crash marker behind")
+	}
+	if !app.store.GetSettings().SystemProxy {
+		t.Fatal("exit revert cleared the remembered setting: Disconnect owns that, not shutdown")
+	}
+}
+
+// TestExitLeavesAForeignProxyAlone: the widen-from-autoProxyOn-to-
+// ownership change must not turn into "clear whatever the OS says",
+// which would silently switch off a corporate proxy on quit.
+func TestExitLeavesAForeignProxyAlone(t *testing.T) {
+	restore := isolateSysproxy(t)
+	defer restore()
+	if err := setScratchProxyEnable(t, 1); err != nil {
+		t.Fatal(err)
+	}
+	app := runningProxyApp(t, 2080, CoreSingBox)
+	app.revertSystemProxyOnExit("test")
+	if en, srv := readScratchProxy(t); en != 1 || srv != "prev-proxy:8888" {
+		t.Fatalf("exit reverted a proxy it never installed: (%d, %q)", en, srv)
+	}
+}
+
+// failingConnectApp seeds an owned OS proxy on a running core, then
+// arranges for the next Connect to fail. coreStillRunning=false models
+// the real Start, which stops the previous group before probing the new
+// one; true models the epoch-abort loser, where the winner's core lives.
+func failingConnectApp(t *testing.T, coreStillRunning bool) (*App, Profile) {
+	t.Helper()
+	t.Cleanup(isolateSysproxy(t))
+	app := runningProxyApp(t, 2080, CoreSingBox)
+	prof, err := app.store.SaveProfile(Profile{Name: "p", Core: CoreSingBox, Address: "203.0.113.7", Port: 443})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := app.store.SetActiveProfileID(prof.ID); err != nil {
+		t.Fatal(err)
+	}
+	app.cores.mu.Lock()
+	app.cores.activeID = prof.ID
+	app.cores.mu.Unlock()
+	if err := app.EnableSystemProxyGUI(); err != nil {
+		t.Fatalf("EnableSystemProxyGUI: %v", err)
+	}
+	if en, srv := readScratchProxy(t); en != 1 || srv != "127.0.0.1:2080" {
+		t.Fatalf("seed ProxyEnable=%d ProxyServer=%q", en, srv)
+	}
+	if !coreStillRunning {
+		app.cores.mu.Lock()
+		app.cores.running = false
+		app.cores.mu.Unlock()
+	}
+	app.coreStarter = func(*Profile, Settings) error { return fmt.Errorf("probe failed") }
+	return app, prof
+}
+
+// TestFailedConnectRevertsOwnedProxy: Start tears the previous group
+// down before probing this one, and a deliberate stop reports no
+// EngineExit — so noteFault never ran and a failed connect left the OS
+// proxy pointing at a closed port until Disconnect or a later success.
+func TestFailedConnectRevertsOwnedProxy(t *testing.T) {
+	app, prof := failingConnectApp(t, false)
+	if err := app.Connect(prof.ID); err == nil {
+		t.Fatal("Connect succeeded with a failing starter")
+	}
+	if en, srv := readScratchProxy(t); en != 0 || srv != "prev-proxy:8888" {
+		t.Fatalf("after failed connect ProxyEnable=%d ProxyServer=%q, want the user's pair back", en, srv)
+	}
+	if sysproxyMarkerExists() {
+		t.Fatal("failed connect left the crash marker behind")
+	}
+	if app.getAutoProxy() {
+		t.Fatal("autoProxyOn still true with no core running")
+	}
+}
+
+// TestFailedConnectKeepsProxyWhenACoreStillRuns: the revert must stay
+// conditional. An epoch-abort loser returns an error while the winner's
+// core is listening on that very port; clearing the proxy there would
+// break a connection that actually succeeded.
+func TestFailedConnectKeepsProxyWhenACoreStillRuns(t *testing.T) {
+	app, prof := failingConnectApp(t, true)
+	if err := app.Connect(prof.ID); err == nil {
+		t.Fatal("Connect succeeded with a failing starter")
+	}
+	if en, srv := readScratchProxy(t); en != 1 || srv != "127.0.0.1:2080" {
+		t.Fatalf("failed connect cleared a live core's proxy: (%d, %q)", en, srv)
+	}
+	if !sysproxyMarkerExists() {
+		t.Fatal("failed connect dropped ownership of a live proxy")
+	}
+}
+
+// TestFailedConnectLeavesAForeignProxyAlone: the failed-connect revert
+// reuses the ownership rule, so a corporate proxy this process never
+// installed must survive a connect that could not start anything.
+func TestFailedConnectLeavesAForeignProxyAlone(t *testing.T) {
+	restore := isolateSysproxy(t)
+	defer restore()
+	if err := setScratchProxyEnable(t, 1); err != nil {
+		t.Fatal(err)
+	}
+	app := runningProxyApp(t, 2080, CoreSingBox)
+	prof, err := app.store.SaveProfile(Profile{Name: "p", Core: CoreSingBox, Address: "203.0.113.7", Port: 443})
+	if err != nil {
+		t.Fatal(err)
+	}
+	app.cores.mu.Lock()
+	app.cores.running = false
+	app.cores.mu.Unlock()
+	app.coreStarter = func(*Profile, Settings) error { return fmt.Errorf("probe failed") }
+	if err := app.Connect(prof.ID); err == nil {
+		t.Fatal("Connect succeeded with a failing starter")
+	}
+	if en, srv := readScratchProxy(t); en != 1 || srv != "prev-proxy:8888" {
+		t.Fatalf("failed connect reverted a proxy it never installed: (%d, %q)", en, srv)
+	}
+}
+
+// TestFailedReloadRevertsOwnedProxy: ReloadCoreNow stops the running core
+// itself and then restarts it, so a failed restart leaves the same dead
+// port as a failed Connect — and the same absence of an EngineExit, since
+// the stop was deliberate.
+func TestFailedReloadRevertsOwnedProxy(t *testing.T) {
+	app, _ := failingConnectApp(t, true)
+	if err := app.ReloadCoreNow(); err == nil {
+		t.Fatal("ReloadCoreNow succeeded with a failing starter")
+	}
+	if _, _, running := app.cores.Status(); running {
+		t.Fatal("Stop did not run before the failing restart")
+	}
+	if en, srv := readScratchProxy(t); en != 0 || srv != "prev-proxy:8888" {
+		t.Fatalf("after failed reload ProxyEnable=%d ProxyServer=%q, want the user's pair back", en, srv)
+	}
+	if sysproxyMarkerExists() {
+		t.Fatal("failed reload left the crash marker behind")
+	}
+}

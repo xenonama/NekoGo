@@ -26,11 +26,7 @@
             @import-link="showImport = true"
           />
           <ProfileForm v-else :profile="editingProfile" @saved="saved" @cancel="editing = false" />
-          <div v-if="advanced && !editing" class="nb-card nb-page">
-            <h3>Profile tools</h3>
-            <p class="muted">Speed/IP probes, duplicate, move, raw JSON for one profile.</p>
-            <ProfileToolsPanel />
-          </div>
+          <ProfileToolsPanel v-if="advanced && !editing" />
         </template>
         <!-- Subscription: add bar + v2rayN-style feed table. -->
         <template v-else-if="view === 'subscription'">
@@ -139,11 +135,9 @@
           <SettingsPanel />
           <RoutingRules />
           <template v-if="advanced">
-            <BackupWorkspace @goto="onGoto" />
-            <div class="nb-card nb-page">
-              <h3>Core config</h3>
-              <p class="muted">Section editors and the full rendered config for the active profile.</p>
-            </div>
+            <h4 class="nb-adv-div">Backup &amp; reset</h4>
+            <BackupWorkspace />
+            <h4 class="nb-adv-div">Core config</h4>
             <ConfigWorkspace ref="configPanel" @goto="onGoto" />
           </template>
         </template>
@@ -156,17 +150,11 @@
           </div>
           <ConsolePanel :only="['traffic', 'logs', 'connection']" />
           <template v-if="advanced">
-            <div class="nb-card nb-page">
-              <h3>Network tools</h3>
-              <p class="muted">Egress IP, throughput and custom URL probes.</p>
-              <p v-if="!connection.status.running" class="muted">Connect a profile to run network tests.</p>
-              <NetworkTools v-else />
-            </div>
-            <div class="nb-card nb-page">
-              <h3>System tools</h3>
-              <p class="muted">OS integration, keys, capability probes.</p>
-              <SystemTools />
-            </div>
+            <h4 class="nb-adv-div">Network tools</h4>
+            <NetworkTools v-if="connection.status.running" />
+            <p v-else class="nb-adv-note">Connect a profile to run IP, speed and URL tests.</p>
+            <h4 class="nb-adv-div">System tools</h4>
+            <SystemTools />
           </template>
         </template>
         <template v-else-if="view === 'sni'">

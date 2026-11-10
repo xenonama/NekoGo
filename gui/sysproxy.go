@@ -98,6 +98,41 @@ func systemProxyPointsAt(p ProxyPorts) (bool, error) {
 // registry.
 var sysProxyReader func() (bool, string, error)
 
+// proxyStateRead picks the OS proxy reader for this App: the per-test
+// hook, the package hook, or the real registry. One helper so the two
+// readers (ensureSystemProxy and osProxyOwned) cannot drift apart in
+// which fake they honour.
+func (a *App) proxyStateRead() func() (bool, string, error) {
+	if a.sysStateHook != nil {
+		return a.sysStateHook
+	}
+	if sysProxyReader != nil {
+		return sysProxyReader
+	}
+	return osSystemProxy
+}
+
+// osProxyOwned reports whether the OS proxy is on AND ours — the
+// predicate the UI toggles show, and the same one ensureSystemProxy acts
+// on, so a card can no longer claim "On" for a proxy that Connect is
+// going to replace anyway. "Ours" is either the live switch pointing at
+// the running core's port, or the ownership this process still holds
+// (including one inherited from a crashed session via the marker).
+func (a *App) osProxyOwned() (bool, error) {
+	on, server, err := a.proxyStateRead()()
+	if err != nil {
+		return false, err
+	}
+	p := a.ActiveProxyPorts()
+	if (p.HTTP > 0 || p.SOCKS > 0) && on && server == proxyServerValue(p) {
+		return true, nil
+	}
+	// On but pointing elsewhere is somebody else's proxy: OFF as far as
+	// this toggle goes, which then offers to take it over and restore it
+	// on revert. Off but still marked ours is the same story in reverse.
+	return on && sysproxyOwned(), nil
+}
+
 // ensureSystemProxy makes the OS proxy point at the given ports on
 // every Connect: if it is already ON and already targets our proxy
 // it is left alone; if it is OFF or points elsewhere it is

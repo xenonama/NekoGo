@@ -1,5 +1,5 @@
 // Shared types mirroring gui/types.go.
-export type CoreType = 0 | 1 | 2 // 0 = sing-box, 1 = xray, 2 = sni-spoof
+export type CoreType = 0 | 1 | 2 | 3 // 0 = sing-box, 1 = xray, 2 = sni-spoof, 3 = mihomo
 
 /** Aether engine options (mirrors gui/aether.go aetherSettings). */
 export interface AetherSettings {
@@ -193,9 +193,12 @@ export interface Settings {
   mixedPort: number
   /** Local listen address (empty = loopback; 0.0.0.0 shares on LAN). */
   inboundAddress?: string
-  /** Upstream DNS (DoH URL, IP or "local"); empty = system default. */
+  /** Remote DNS: https://host/path, tls://host, tcp://host, udp://host,
+   *  quic://host, an IP or hostname (with an optional :port), or "local".
+   *  A pasted sing-box server JSON object also works. Empty = system default. */
   dnsRemote?: string
-  /** Direct-path DNS; empty = system default. */
+  /** Direct-path DNS (never detoured through the proxy); same shapes,
+   *  empty = system default. */
   dnsDirect?: string
   /** Global fragment override: when on, every mapped profile renders
    *  with these fragment options instead of its own (raw-JSON profiles
@@ -226,12 +229,16 @@ export interface Settings {
    *  with corePath. Omitted by Go while empty. */
   upstreamCorePath?: string
   xrayPath: string
+  /** mihomo.exe (Clash Meta) override; never shared with corePath or
+   *  xrayPath. Omitted by Go while empty. */
+  mihomoPath?: string
   /** Core backend: 'custom' (nekobox_core with Thrift RPC, default) or
    *  'upstream' (official sing-box.exe CLI, Clash API stats; no
    *  Mieru/Juicity/TrustTunnel/VLESS-encryption). The choice covers every
    *  sing-box transport: plain profiles, the SNI spoof transport and the
-   *  Aether transport. Omitted by Go when a legacy config file predates
-   *  the setting — GetSettings reports 'custom' then. */
+   *  Aether transport. Xray and mihomo profiles never run a sing-box
+   *  binary, so the choice is inert for them. Omitted by Go when a legacy
+   *  config file predates the setting — GetSettings reports 'custom' then. */
   coreEngine?: string
   /** aether.exe override (empty = bin\ next to the app; omitted by Go when empty). */
   aetherPath?: string
@@ -279,6 +286,10 @@ export interface Settings {
   /** Collapsed Proxies remark groups (subscription feeds), persisted so
    *  a restart keeps the list folded the same way. */
   collapsedProxyGroups?: string[]
+  /** User-created Proxies remark groups (mirrors gui/types.go). Feed
+   *  groups are implicit from Profile.group; these persist even while
+   *  empty. Omitted by Go when empty. */
+  proxyGroups?: string[]
   /** Peek into the Simple shell while Advanced Mode stays ON
    *  (mirrors gui/types.go; transient UI state, persisted). */
   advancedPeekSimple?: boolean
@@ -293,6 +304,11 @@ export interface Settings {
    *  sing-box (mirrors gui Settings; omitted by Go when false). The
    *  Psiphon chain stays on sing-box: its TUN inbound is sing-box only. */
   spoofXray?: boolean
+  /** Run the SNI spoof engine at all. Off = SNI Spoofing profiles dial
+   *  their own address with the normal transport (e.g. a local
+   *  127.0.0.1 tunnel). Go sends true/false (null only for a raw *bool
+   *  null); unset means enabled. */
+  spoofEnabled?: boolean | null
   /** Chain Psiphon on top of every Aether connect through the aether
    *  core's own chain mode (mirrors gui Settings; omitted by Go when
    *  false). Separate from spoofPsiphon: this rides the Aether tunnel. */
@@ -301,9 +317,11 @@ export interface Settings {
   sniSelectedIp?: string
   /** Loopback-profile decoy SNI override. */
   sniSelectedSni?: string
-  /** Curated Cloudflare IP list (mirrors gui SNIIP). */
+  /** Plan B endpoint pool (mirrors gui SNIIP). Under Plan A the tab shows
+   *  the derived addresses instead, and this list stays saved untouched. */
   sniIps?: SNIIP[]
-  /** Curated decoy-SNI list (mirrors gui SNISNI). */
+  /** Curated decoy-SNI list (mirrors gui SNISNI). Under Plan A these are
+   *  the endpoints: each checked host is resolved over DoH and dialed. */
   sniSnis?: SNISNI[]
   /** Persisted Aether scan results (mirrors gui Settings). */
   aetherScanResults?: AetherScanResult[]
@@ -334,6 +352,7 @@ export const defaultSettings: Settings = {
   corePath: '',
   upstreamCorePath: '',
   xrayPath: '',
+  mihomoPath: '',
   coreEngine: 'custom',
   aetherPath: '',
   language: 'en',
@@ -361,6 +380,7 @@ export const defaultSettings: Settings = {
   sniConfig: { method: 'auto' },
   spoofPsiphon: false,
   spoofXray: false,
+  spoofEnabled: true,
   aetherPsiphon: false,
 }
 
@@ -477,6 +497,10 @@ export interface SNIConfig {
   fakeDelay?: number
   seqOverlap?: number
   paddingSize?: number
+  /** SNI tab mode: "A" resolves each decoy SNI over DoH and dials that
+   *  (the IP list becomes a read-out); "B" (or absent) dials the curated
+   *  IP pool — the historical behaviour. Backend normalizes "" to "B". */
+  plan?: string
 }
 
 export interface SNIIP {
@@ -499,6 +523,9 @@ export interface SNISNI {
   lastMs?: number
   lastAt?: string
   lastTls?: string
+  /** Plan A's read-out: the address the last DoH resolve of this host
+   *  returned (empty until a Plan A scan runs; Plan B never writes it). */
+  lastIp?: string
   /** Checked in the SNI tab = handed to the spoof engine. Absent/null
    *  = active (legacy configs); explicit false = the user unchecked
    *  it. null mirrors the Go *bool binding. */
@@ -541,6 +568,10 @@ export interface SpoofRanked {
   ok: number
   fail: number
   rate: number
+  /** Engine EWMA handshake time in ms; null until this method has been timed. */
+  latency_ms: number | null
+  /** What auto ordered the row on: recent success rate minus latency drag. */
+  score: number
 }
 
 export interface SpoofStats {
@@ -564,6 +595,9 @@ export interface SNIPairResult {
   latencyMs: number
   tlsVersion?: string
   error?: string
+  /** Plan A only: the handshake passed but the resolved address is not
+   *  Cloudflare-fronted, so a Cloudflare-hosted profile cannot ride it. */
+  warning?: string
 }
 
 export interface SNIScanStatus {

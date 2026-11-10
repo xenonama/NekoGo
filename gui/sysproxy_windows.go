@@ -127,6 +127,28 @@ func sysproxyMarkerExists() bool {
 	return err == nil
 }
 
+// sysproxyOwned reports whether the OS proxy is OURS: installed by this
+// process, or left behind by one that crashed (the marker is only ever
+// removed by a successful restore). It is the ownership half of the
+// answer the UI needs — ProxyEnable alone cannot tell our proxy from a
+// corporate one. A var so app-level tests can pin ownership without a
+// registry or a marker on disk.
+var sysproxyOwned = func() bool {
+	sysproxyMu.Lock()
+	defer sysproxyMu.Unlock()
+	return sysproxyIsSet || sysproxyMarkerExists()
+}
+
+// sysproxyWriteDWord/sysproxyWriteString/sysproxyDelete are the registry
+// write seams. They exist so a test can fail ONE value mid-transaction
+// and check which state the registry is left in: the commit orders below
+// are only a claim until that is measured (see sysproxyApply).
+var (
+	sysproxyWriteDWord  = func(k registry.Key, name string, v uint32) error { return k.SetDWordValue(name, v) }
+	sysproxyWriteString = func(k registry.Key, name, v string) error { return k.SetStringValue(name, v) }
+	sysproxyDelete      = func(k registry.Key, name string) error { return k.DeleteValue(name) }
+)
+
 // refreshWinINET notifies WinINET so the new proxy applies without an
 // app restart. Via LazyDLL so no new modules are needed.
 func refreshWinINET() {
@@ -169,16 +191,20 @@ func sysproxyApply(p ProxyPorts) error {
 		return fmt.Errorf("open internet settings for write: %w", err)
 	}
 	defer key.Close()
-	if err := key.SetDWordValue("ProxyEnable", 1); err != nil {
-		return fmt.Errorf("set ProxyEnable: %w", err)
-	}
-	if err := key.SetStringValue("ProxyServer", proxyServerValue(p)); err != nil {
-		return fmt.Errorf("set ProxyServer: %w", err)
-	}
+	// Commit order: values first, ProxyEnable last. ProxyEnable is what
+	// makes WinINET read ProxyServer at all, so a write that fails part
+	// way through this list leaves the switch wherever the user had it —
+	// never switched on at an address we did not finish installing.
 	if !sysproxyPrev.haveOverride {
-		if err := key.SetStringValue("ProxyOverride", "<local>"); err != nil {
+		if err := sysproxyWriteString(key, "ProxyOverride", "<local>"); err != nil {
 			return fmt.Errorf("set ProxyOverride: %w", err)
 		}
+	}
+	if err := sysproxyWriteString(key, "ProxyServer", proxyServerValue(p)); err != nil {
+		return fmt.Errorf("set ProxyServer: %w", err)
+	}
+	if err := sysproxyWriteDWord(key, "ProxyEnable", 1); err != nil {
+		return fmt.Errorf("set ProxyEnable: %w", err)
 	}
 	refreshWinINET()
 	sysproxyIsSet = true
@@ -218,31 +244,36 @@ func sysproxyRestore() error {
 		return fmt.Errorf("open internet settings for write: %w", err)
 	}
 	defer key.Close()
+	// Mirror of the apply order: take the switch off first, so a write
+	// that fails below leaves the proxy disabled rather than enabled at
+	// our address, which no longer has a listener. The user's own switch
+	// is put back last, once their addresses are home again.
+	if err := sysproxyWriteDWord(key, "ProxyEnable", 0); err != nil {
+		return fmt.Errorf("restore ProxyEnable: %w", err)
+	}
 	if sysproxyCached {
-		if sysproxyPrev.haveEnable {
-			if err := key.SetDWordValue("ProxyEnable", uint32(sysproxyPrev.enable)); err != nil {
-				return fmt.Errorf("restore ProxyEnable: %w", err)
-			}
-		} else {
-			if err := key.SetDWordValue("ProxyEnable", 0); err != nil {
-				return fmt.Errorf("restore ProxyEnable: %w", err)
-			}
-		}
 		if sysproxyPrev.haveServer {
-			if err := key.SetStringValue("ProxyServer", sysproxyPrev.server); err != nil {
+			if err := sysproxyWriteString(key, "ProxyServer", sysproxyPrev.server); err != nil {
 				return fmt.Errorf("restore ProxyServer: %w", err)
 			}
 		} else {
-			_ = key.DeleteValue("ProxyServer")
+			_ = sysproxyDelete(key, "ProxyServer")
 		}
 		if sysproxyPrev.haveOverride {
-			if err := key.SetStringValue("ProxyOverride", sysproxyPrev.override); err != nil {
+			if err := sysproxyWriteString(key, "ProxyOverride", sysproxyPrev.override); err != nil {
 				return fmt.Errorf("restore ProxyOverride: %w", err)
 			}
+		} else {
+			// sysproxyApply created this value; the user had none, so
+			// leaving it behind would be a permanent edit of their
+			// exception list (the ProxyServer case above already
+			// deleted what it had created).
+			_ = sysproxyDelete(key, "ProxyOverride")
 		}
-	} else {
-		if err := key.SetDWordValue("ProxyEnable", 0); err != nil {
-			return fmt.Errorf("restore ProxyEnable: %w", err)
+		if sysproxyPrev.haveEnable && sysproxyPrev.enable != 0 {
+			if err := sysproxyWriteDWord(key, "ProxyEnable", uint32(sysproxyPrev.enable)); err != nil {
+				return fmt.Errorf("restore ProxyEnable: %w", err)
+			}
 		}
 	}
 	refreshWinINET()

@@ -122,6 +122,59 @@ func TestParseSS(t *testing.T) {
 	}
 }
 
+func TestParseSSQueryShape(t *testing.T) {
+	// Generated subscriptions routinely carry an empty query before the
+	// name, which used to leave "?" glued to the port: "ss: bad port 443?".
+	userinfo := base64.URLEncoding.EncodeToString([]byte("chacha20-ietf-poly1305:ARgvGZywA+gacgGV26Bvmu05+wZmRW/j+AdU+Z8Bt44="))
+	p := mustParse(t, "ss://"+userinfo+"@185.213.23.63:990?#%40DeltaKroneckerGithub")
+	if p.Method != "chacha20-ietf-poly1305" {
+		t.Fatalf("method = %q", p.Method)
+	}
+	// PathUnescape must not turn the base64 punctuation in the password
+	// into spaces.
+	if p.IDOrPassword != "ARgvGZywA+gacgGV26Bvmu05+wZmRW/j+AdU+Z8Bt44=" {
+		t.Fatalf("password mangled: %q", p.IDOrPassword)
+	}
+	if p.Address != "185.213.23.63" || p.Port != 990 {
+		t.Fatalf("endpoint = %s:%d", p.Address, p.Port)
+	}
+	if p.Name != "@DeltaKroneckerGithub" {
+		t.Fatalf("name = %q, want the fragment un-escaped", p.Name)
+	}
+
+	// A parameter NekoGo does not use is still not part of the endpoint.
+	p = mustParse(t, "ss://YWVzLTEyOC1nY206c2hhZG93c29ja3M@141.98.101.179:443?0rtt=true#Node")
+	if p.Port != 443 || p.Method != "aes-128-gcm" || p.IDOrPassword != "shadowsocks" {
+		t.Fatalf("bad mapping with a query: %+v", p)
+	}
+
+	// A SIP003 plugin cannot be honoured, so say so instead of storing a
+	// profile that silently never connects.
+	for _, ln := range []string{
+		"ss://YWVzLTEyOC1nY206c2hhZG93c29ja3M@1.2.3.4:443?plugin=obfs-local%3Bobfs%3Dhttp#P",
+		"ss://YWVzLTEyOC1nY206c2hhZG93c29ja3M@1.2.3.4:443?Plugin=simple-obfs#P",
+	} {
+		if _, err := parseOneLink(ln); err == nil {
+			t.Errorf("plugin link accepted: %s", ln)
+		} else if !strings.Contains(err.Error(), "plugin") {
+			t.Errorf("error %q does not name the plugin", err)
+		}
+	}
+
+	// The other two shapes keep working: plaintext userinfo, and the 2019
+	// form whose base64 covers the whole link (no "?" in base64 to cut on).
+	p = mustParse(t, "ss://aes-256-gcm:pw@ss.example:8388#Plain")
+	if p.Method != "aes-256-gcm" || p.IDOrPassword != "pw" || p.Port != 8388 {
+		t.Fatalf("plaintext userinfo broke: %+v", p)
+	}
+	whole := base64.URLEncoding.EncodeToString([]byte("aes-256-gcm:pw@ss.example:8388"))
+	p = mustParse(t, "ss://"+whole+"#Whole")
+	if p.Method != "aes-256-gcm" || p.IDOrPassword != "pw" ||
+		p.Address != "ss.example" || p.Port != 8388 {
+		t.Fatalf("2019 whole-link form broke: %+v", p)
+	}
+}
+
 func TestParseSocks(t *testing.T) {
 	p := mustParse(t, "socks://user:pass@so.example:1080#SO")
 	if p.Protocol != "socks" || p.Address != "so.example" || p.Port != 1080 || p.IDOrPassword != "user:pass" {
@@ -156,6 +209,10 @@ func TestAppImportLinksEndToEnd(t *testing.T) {
 	}
 	logCh := make(chan LogEntry, 16)
 	app := NewApp(store, logCh)
+	// ImportLinks kicks off a tracked background GeoIP refresh when
+	// GeoIPAutoDetect is on (the default). Drain it before TempDir is
+	// removed, or its late SaveFile races RemoveAll on Windows.
+	t.Cleanup(app.waitCountryRefresh)
 	payload := base64.StdEncoding.EncodeToString([]byte(
 		`{"v":"2","ps":"e2e-vm","add":"9.9.9.9","port":1234,"id":"aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee","aid":0,"net":"tcp","tls":""}`))
 	res, err := app.ImportLinks("vmess://" + payload + "\nthis-is-not-a-link")

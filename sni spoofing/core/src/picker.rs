@@ -78,11 +78,7 @@ pub fn build_ipv6_drop_filter(endpoints: &[Endpoint]) -> String {
 /// FIX P3/P4: scope to the endpoint ports so non-handshake traffic (80/8080/
 /// probe/relay data) doesn't hit DPI; guard empty to avoid `tcp and ()`
 /// syntax error.
-pub fn build_tcp_filter(
-    interface_ipv4: &str,
-    endpoints: &[Endpoint],
-    ip_mode: &str,
-) -> String {
+pub fn build_tcp_filter(interface_ipv4: &str, endpoints: &[Endpoint], ip_mode: &str) -> String {
     if endpoints.is_empty() {
         return "tcp and false".to_string();
     }

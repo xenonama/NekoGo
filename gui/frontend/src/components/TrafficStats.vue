@@ -63,6 +63,8 @@ const coreLabel = computed(() => {
       return 'Xray'
     case 'spoof':
       return 'SNI Spoof'
+    case 'mihomo':
+      return 'Mihomo'
     default:
       return stats.value.core
   }

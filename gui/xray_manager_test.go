@@ -72,6 +72,13 @@ func TestSplitAPIAddrRejectsBadPorts(t *testing.T) {
 		{"localhost:10085", "localhost", 10085},
 		{"127.0.0.1:abc", "127.0.0.1", xrayAPIDefaultPort},
 		{"[::1]:10085", "::1", 10085},
+		// Bare IPv6 is "too many colons" for SplitHostPort, so the whole
+		// address falls back — port included. Start must probe this
+		// rewritten address, not the raw one (see
+		// TestXrayStartProbesTheBoundAPIAddress).
+		{"::1:12345", "127.0.0.1", xrayAPIDefaultPort},
+		{"127.0.0.1/:12345", "127.0.0.1", 12345},
+		{" 127.0.0.1 :12345", "127.0.0.1", 12345},
 	}
 	for _, c := range cases {
 		h, p := splitAPIAddr(c.in)

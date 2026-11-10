@@ -312,6 +312,13 @@ func TestManualProxyToggleRemembers(t *testing.T) {
 	}
 	app := NewApp(store, make(chan LogEntry, 8))
 	app.sysProxyHook = func(enable bool) error { return nil }
+	// EnableSystemProxyGUI refuses without a running core: it is the
+	// live OS-proxy control, and with no core there is no port to point
+	// the OS at, so a nil return would have been a lie.
+	app.cores.mu.Lock()
+	app.cores.activeCore = CoreSingBox
+	app.cores.running = true
+	app.cores.mu.Unlock()
 	if err := app.DisableSystemProxyGUI(); err != nil {
 		t.Fatalf("DisableSystemProxyGUI: %v", err)
 	}
@@ -323,5 +330,101 @@ func TestManualProxyToggleRemembers(t *testing.T) {
 	}
 	if !app.store.GetSettings().SystemProxy {
 		t.Fatal("SystemProxy still false after manual enable, want remembered true")
+	}
+}
+
+// spoofConnectTestApp mirrors tunConnectTestApp with TUN off and a
+// CoreSpoof profile, so only the WinDivert gate can fire.
+func spoofConnectTestApp(t *testing.T) (*App, string, *bool) {
+	t.Helper()
+	store, err := NewConfigStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := DefaultSettings()
+	s.TunEnabled = false
+	s.SystemProxy = false
+	if err := store.SaveSettings(s); err != nil {
+		t.Fatal(err)
+	}
+	p, err := store.SaveProfile(Profile{Name: "spoof", Core: CoreSpoof,
+		Protocol: "trojan", Address: "203.0.113.10", Port: 443,
+		IDOrPassword: "pw"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	app := NewApp(store, make(chan LogEntry, 64))
+	started := false
+	app.coreStarter = func(*Profile, Settings) error {
+		started = true
+		return nil
+	}
+	return app, p.ID, &started
+}
+
+// The spoof engine injects through WinDivert, so an unelevated connect has
+// to be refused with the admin remedy BEFORE anything starts. Without the
+// gate the engine died on "Access is denied (code 5)" while the UI still
+// reported a connection: every site dead, nothing actionable on screen.
+func TestConnectSpoofWithoutAdminRefusesAndPersistsTarget(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("the WinDivert elevation gate is a Windows path")
+	}
+	withElevated(t, false)
+	app, id, started := spoofConnectTestApp(t)
+	err := app.Connect(id)
+	if err == nil {
+		t.Fatal("Connect = nil, want the spoof elevation error")
+	}
+	if !strings.Contains(err.Error(), "requires administrator rights") {
+		t.Fatalf("error = %q, want the phrase the frontend turns into a relaunch", err)
+	}
+	if !strings.Contains(err.Error(), "WinDivert") {
+		t.Fatalf("error = %q, want the driver named", err)
+	}
+	if *started {
+		t.Fatal("the core started despite an unelevated spoof connect")
+	}
+	if got := app.store.GetSettings().ActiveProfileID; got != id {
+		t.Fatalf("active profile = %q, want %q for the elevated resume", got, id)
+	}
+}
+
+// Elevated, the same connect proceeds: the gate is about the driver, not
+// about the profile.
+func TestConnectSpoofElevatedStartsCore(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("the WinDivert elevation gate is a Windows path")
+	}
+	withElevated(t, true)
+	app, id, started := spoofConnectTestApp(t)
+	if err := app.Connect(id); err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	if !*started {
+		t.Fatal("core not started while elevated")
+	}
+}
+
+// With Settings -> SNI spoofing off the profile dials its own address on
+// the normal transport: no driver is involved, so an unelevated connect
+// must not be gated.
+func TestConnectSpoofDisabledNeedsNoAdmin(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("the WinDivert elevation gate is a Windows path")
+	}
+	withElevated(t, false)
+	app, id, started := spoofConnectTestApp(t)
+	off := false
+	s := app.store.GetSettings()
+	s.SpoofEnabled = &off
+	if err := app.store.SaveSettings(s); err != nil {
+		t.Fatal(err)
+	}
+	if err := app.Connect(id); err != nil {
+		t.Fatalf("Connect with the engine disabled: %v", err)
+	}
+	if !*started {
+		t.Fatal("core not started for a spoof-disabled profile")
 	}
 }

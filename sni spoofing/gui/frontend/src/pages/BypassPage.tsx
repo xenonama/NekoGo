@@ -1,8 +1,8 @@
 // FIX(design): redesigned BypassPage — card-with-header Sections, grouped config subsections.
 import { useState } from "react";
 import { useAppStore, formatBytes } from "../stores/appStore";
-// FIX #8: IP mode selector options.
-import { IP_MODES, normalizeConfig } from "../types";
+// Option lists live in types.ts so they stay in sync with the Rust constants.
+import { FINGERPRINTS, IP_MODES, QUIC_MODES, normalizeConfig } from "../types";
 import { useConfirmStore } from "../stores/confirmStore";
 import * as api from "../api";
 import Section from "../components/Section";
@@ -245,19 +245,20 @@ export default function BypassPage() {
           <div>
             <SubLabel>Bypass</SubLabel>
             <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
-              {/* FIX(#7): auto is sticky with rotation budget; Best method shows the real winner. */}
-              <Field label="Bypass method" hint="auto = the engine sticks to one real method for up to 10 connections / 60s, then rotates if it sees 3+ failures. The Best method panel shows the real winning method, not 'auto'. Pick a specific method to disable rotation.">
+              {/* auto is sticky: it keeps the best-scoring strategy and only
+                  rotates on 3 failures, on >800ms latency, or while some
+                  strategy is still unmeasured. */}
+              <Field label="Bypass method" hint="auto = the engine ranks 15 strategies (decoy shape x real-ClientHello splitting) by recent success and measured latency, sticks to the best, and rotates only after 3 failures or when the winner is slow. The Best method panel shows the real winning strategy, not 'auto'. Pick a specific method to stop ranking.">
                 <MethodPicker value={cfg.BYPASS_METHOD} onChange={(m) => patch({ BYPASS_METHOD: m })} />
               </Field>
-              {/* FIX(#5a): honesty — only legacy differs today (see audit #5). */}
-              <Field label="TLS fingerprint" hint="Which browser ClientHello to mimic. Only 'legacy' produces a distinct template today; chrome_* and firefox_* currently reuse the legacy 517B template (see audit #5).">
+              <Field label="TLS fingerprint" hint="Which browser ClientHello the decoy mimics. Each of the three builds a genuinely different hello; the old versioned spellings (chrome_120, firefox_124, ...) are accepted and rewritten to these three.">
                 <select
                   className="input cursor-pointer"
                   value={cfg.TLS_FINGERPRINT}
-                  title="Which browser ClientHello to mimic. Only 'legacy' produces a distinct template today; chrome_* and firefox_* currently reuse the legacy 517B template (see audit #5)."
+                  title="Which browser ClientHello the decoy mimics. Each of the three builds a genuinely different hello; the old versioned spellings (chrome_120, firefox_124, ...) are accepted and rewritten to these three."
                   onChange={(e) => patch({ TLS_FINGERPRINT: e.target.value })}
                 >
-                  {["legacy", "chrome_120", "chrome_124", "firefox_122", "firefox_124", "custom"].map((f) => (
+                  {FINGERPRINTS.map((f) => (
                     <option key={f} value={f} className="bg-surface">
                       {f}
                     </option>
@@ -272,7 +273,7 @@ export default function BypassPage() {
                   title="block = drop UDP/443. spoof = same as block until QUIC Initial crypto lands (see audit #4). passthrough = forward untouched."
                   onChange={(e) => patch({ QUIC_MODE: e.target.value })}
                 >
-                  {["block", "spoof", "passthrough"].map((f) => (
+                  {QUIC_MODES.map((f) => (
                     <option key={f} value={f} className="bg-surface">
                       {f}
                     </option>

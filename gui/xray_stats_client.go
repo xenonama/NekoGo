@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"strings"
 	"sync"
-	"time"
 
 	"github.com/golang/protobuf/proto"
 	"google.golang.org/grpc"
@@ -139,35 +138,6 @@ func (c *XrayStatsClient) QueryStats(ctx context.Context, pattern string, reset 
 		return nil, fmt.Errorf("QueryStats: %w", err)
 	}
 	return &resp, nil
-}
-
-// Totals aggregates uplink/downlink across all outbounds within timeout.
-func (c *XrayStatsClient) Totals(timeout time.Duration) (up, down int64, err error) {
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
-	defer cancel()
-	resp, err := c.QueryStats(ctx, "", false)
-	if err != nil {
-		return 0, 0, err
-	}
-	for _, s := range resp.Stat {
-		if s == nil {
-			continue
-		}
-		switch {
-		case hasSuffix(s.Name, ">>>traffic>>>uplink"):
-			up += s.Value
-		case hasSuffix(s.Name, ">>>traffic>>>downlink"):
-			down += s.Value
-		}
-	}
-	return up, down, nil
-}
-
-func hasSuffix(s, suffix string) bool {
-	if len(s) < len(suffix) {
-		return false
-	}
-	return s[len(s)-len(suffix):] == suffix
 }
 
 // parseXrayStats folds a QueryStats response into lifetime totals plus

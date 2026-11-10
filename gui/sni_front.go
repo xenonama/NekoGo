@@ -19,6 +19,7 @@ package main
 //     same rewrite (chained setup). Domain addresses never rewrite.
 
 import (
+	"context"
 	"fmt"
 	"net"
 	"strconv"
@@ -67,6 +68,21 @@ func currentSpoofFrontPort() (port int, ok bool) {
 		return 0, false
 	}
 	return p, true
+}
+
+// spoofEnabled reports whether the SNI spoof engine may run. Absent
+// (nil) means enabled, so configs written before the toggle existed keep
+// their behaviour.
+func spoofEnabled(s Settings) bool {
+	return s.SpoofEnabled == nil || *s.SpoofEnabled
+}
+
+// spoofConnectEnabled reports whether a CoreSpoof profile actually runs
+// the spoof engine. Settings → SNI spoofing can turn it off so the
+// profile dials its own address with the normal transport (e.g. a local
+// 127.0.0.1 tunnel the user runs themselves).
+func spoofConnectEnabled(p *Profile, s Settings) bool {
+	return p != nil && p.Core.IsSpoof() && spoofEnabled(s)
 }
 
 // isLoopbackAddress reports whether addr is a loopback endpoint:
@@ -124,9 +140,17 @@ func loopbackListenerAlive(addr string, port int) bool {
 // (trojan://...@127.0.0.1:40443 ws imported before the auto-detect):
 // sing-box "connects" while every dial is refused. A live listener
 // means a legitimate local relay chain on that port — never hijack
-// it. Callers gate on GOOS (the engine ships as sni-spoof.exe).
-func shouldRescueLoopbackProfile(p *Profile) bool {
-	if p == nil || p.Core.IsSpoof() {
+// it. Callers gate on GOOS (the engine ships as sni-spoof.exe). mihomo is
+// excluded like an already-spoof profile: the rescue converges stale
+// imports, and a core the user explicitly picked is not one — rewriting
+// it would silently run a different engine than the one selected.
+func shouldRescueLoopbackProfile(p *Profile, settings Settings) bool {
+	if p == nil || p.Core.IsSpoof() || p.Core.IsMihomo() {
+		return false
+	}
+	if !spoofEnabled(settings) {
+		// The user turned the engine off on purpose: a loopback address is
+		// their own local tunnel, not a dead end to convert.
 		return false
 	}
 	if !isLoopbackAddress(p.Address) {
@@ -147,9 +171,10 @@ func shouldRescueLoopbackProfile(p *Profile) bool {
 // auto-tag rule (import.go), so Connect converges a stale profile
 // to the same core a fresh import would get. IP literals are
 // excluded (never auto-tag: proving CF-fronting needs a live
-// lookup). Callers gate on GOOS like the loopback rescue.
-func shouldRescueDirectSpoofProfile(p *Profile) bool {
-	if p == nil || p.Core.IsSpoof() {
+// lookup). Callers gate on GOOS like the loopback rescue, and mihomo is
+// excluded for the reason given there.
+func shouldRescueDirectSpoofProfile(p *Profile, settings Settings) bool {
+	if p == nil || p.Core.IsSpoof() || p.Core.IsMihomo() || !spoofEnabled(settings) {
 		return false
 	}
 	if spoofEligibilityIssue(p) != nil {
@@ -176,6 +201,9 @@ func resolveSNITarget(p *Profile, settings Settings) (ip, sni string, port int, 
 	if p == nil {
 		return "", "", 0, fmt.Errorf("nil profile")
 	}
+	if spoofPlanA(settings) {
+		return resolvePlanATarget(p, settings)
+	}
 	if isLoopbackAddress(p.Address) {
 		// SNI: checked-entry pin wins, else the profile's own SNI
 		// (the link already carries sni=...&host=...).
@@ -193,9 +221,9 @@ func resolveSNITarget(p *Profile, settings Settings) (ip, sni string, port int, 
 		// domain.
 		ip = spoofPinIP(&settings)
 		if ip == "" {
-			ip, err = resolveDomainToCFIP(sni)
+			ip, err = resolveSpoofEndpointIP(sni)
 			if err != nil {
-				return "", "", 0, fmt.Errorf("loopback profile %q: auto-target %q failed: %w (or check a Cloudflare IP in the SNI Spoofing tab)", p.Name, sni, err)
+				return "", "", 0, fmt.Errorf("loopback profile %q: auto-target %q failed: %w (or pin an IP in the SNI Spoofing tab)", p.Name, sni, err)
 			}
 		}
 		return ip, sni, 443, nil
@@ -208,7 +236,7 @@ func resolveSNITarget(p *Profile, settings Settings) (ip, sni string, port int, 
 		// Bare CF IPv4 literal: use it directly, no lookup.
 		ip = ip4
 	} else {
-		ip, err = resolveDomainToCFIP(strings.TrimSpace(p.Address))
+		ip, err = resolveSpoofEndpointIP(strings.TrimSpace(p.Address))
 		if err != nil {
 			return "", "", 0, err
 		}
@@ -237,14 +265,50 @@ func resolveSNITarget(p *Profile, settings Settings) (ip, sni string, port int, 
 	return ip, sni, port, nil
 }
 
+// resolvePlanATarget is Plan A's target rule: the pinned decoy SNI (or
+// the profile's own SNI/Host with no pin) drives everything, and its
+// address comes from DoH — never from the curated IP pool and never from
+// the local resolver, which is the thing Plan A exists to bypass.
+//
+// The engine re-resolves on its own (RESOLVE_SNI); NekoGo resolves here
+// only so that (a) a SNI with no usable A record fails as a readable
+// Start error instead of a child process that dies after the startup
+// timeout, and (b) the ENDPOINTS entry the config still carries is the
+// honest current answer rather than a stale pool IP. The Cloudflare
+// range check that Plan B applies is deliberately NOT applied: in Plan A
+// the endpoint is by definition whatever the SNI resolves to.
+func resolvePlanATarget(p *Profile, settings Settings) (ip, sni string, port int, err error) {
+	sni = spoofPinSNI(&settings)
+	if sni == "" {
+		sni = normalizeFakeSNI(p.ServerName)
+	}
+	if sni == "" {
+		sni = normalizeFakeSNI(p.Host)
+	}
+	if sni == "" {
+		return "", "", 0, fmt.Errorf("plan A has nothing to resolve: check a decoy SNI in the SNI Spoofing tab, or set sni/host on profile %q", p.Name)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*dohAttemptTimeout)
+	defer cancel()
+	ip, err = resolveA(ctx, sni)
+	if err != nil {
+		return "", "", 0, fmt.Errorf("plan A: %w (switch the SNI tab back to Plan B, or check a plain IP there)", err)
+	}
+	port = p.Port
+	if isLoopbackAddress(p.Address) || port < 1 || port > 65535 {
+		port = 443
+	}
+	return ip, sni, port, nil
+}
+
 // spoofPortForProfile decides the rewrite for one rendered config:
 //   - CoreSpoof: always via the engine (loopback or domain — the
 //     engine endpoints already hold the real target).
 //   - Other cores: only loopback addresses while an engine runs.
 //
 // Returns ok=false when the config renders unchanged.
-func spoofPortForProfile(profile *Profile) (port int, ok bool) {
-	if profile == nil {
+func spoofPortForProfile(profile *Profile, settings Settings) (port int, ok bool) {
+	if profile == nil || !spoofEnabled(settings) {
 		return 0, false
 	}
 	p, live := currentSpoofFrontPort()

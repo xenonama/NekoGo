@@ -328,8 +328,9 @@ async function save(connect: boolean) {
       } catch {
         /* selection is best effort; connect still takes the id */
       }
-      await connection.connect(saved.id)
-      if (connection.error) err.value = connection.error
+      if (!(await connection.connect(saved.id))) {
+        err.value = connection.error || 'Another connect is in progress.'
+      }
     }
   } catch (e) {
     err.value = String(e)

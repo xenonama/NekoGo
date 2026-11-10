@@ -1,32 +1,37 @@
-<!-- Advanced Config: simple card stack. Section editors + raw editor. -->
+<!-- Advanced Config: three cards, one head each. The "Core config"
+     group label comes from the shell divider and each card states its
+     subject once, so no line here repeats another's text. -->
 <template>
-  <div class="nb-card nb-page">
-    <h3>Active overrides</h3>
-    <p class="muted">What's stored in Settings (raw wins over sections).</p>
-    <div v-if="overrideKeys.length === 0" class="nb-card nb-empty">
-      <p class="muted">No overrides stored — editors render manager defaults.</p>
-      <button class="nb-act nb-act--primary" @click="focusEditors">
-        <Icon name="tune" :size="14" />Edit a section
-      </button>
+  <div class="stg-card">
+    <div class="stg-head">
+      <span class="stg-head-chip"><Icon name="layers" :size="22" /></span>
+      <span class="stg-head-text">
+        <span class="stg-head-title">Active overrides</span>
+        <span class="stg-head-sub">What Settings stores — a raw override wins over the sections</span>
+      </span>
     </div>
-    <template v-else>
-      <div v-for="k in overrideKeys" :key="k" class="stg-row">
-        <span class="stg-chip"><Icon name="tune" :size="18" /></span>
-        <span class="stg-meta">
-          <span class="stg-title">{{ k === '*' ? 'raw (whole config)' : k }}</span>
-          <span class="stg-sub">{{ overrideSize(k) }}</span>
-        </span>
-      </div>
-    </template>
+    <p v-if="overrideKeys.length === 0" class="muted">No overrides stored — the editors render manager defaults.</p>
+    <div v-for="k in overrideKeys" :key="k" class="stg-row">
+      <span class="stg-chip"><Icon name="tune" :size="18" /></span>
+      <span class="stg-meta">
+        <span class="stg-title">{{ k === '*' ? 'raw (whole config)' : k }}</span>
+        <span class="stg-sub">{{ overrideSize(k) }}</span>
+      </span>
+    </div>
   </div>
 
-  <div class="nb-card nb-page">
-    <h3>Section editors</h3>
-    <p class="muted">{{ cfgDesc }}</p>
-    <div v-if="!activeProfile" class="nb-card nb-empty">
-      <p class="muted">No active profile — pick one in Proxies.</p>
-      <button class="nb-act nb-act--primary" @click="$emit('goto', 'proxies')">
-        <Icon name="servers" :size="14" />Open Proxies
+  <div class="stg-card">
+    <div class="stg-head">
+      <span class="stg-head-chip"><Icon name="tune" :size="22" /></span>
+      <span class="stg-head-text">
+        <span class="stg-head-title">Section editors</span>
+        <span class="stg-head-sub">{{ cfgDesc }}</span>
+      </span>
+    </div>
+    <div v-if="!activeProfile" class="nb-adv-blank">
+      <span class="muted">No active profile — pick one in Proxies.</span>
+      <button class="nb-act nb-act--sm nb-act--ghost" @click="$emit('goto', 'proxies')">
+        <Icon name="servers" :size="13" />Open Proxies
       </button>
     </div>
     <template v-else>
@@ -43,27 +48,28 @@
           {{ st.label }}
         </button>
       </div>
-      <p v-if="cfgTab === 'raw'" class="muted">Raw config lives in the panel below — section edits are disabled while it is open.</p>
       <CoreConfigEditor
-        v-else
         ref="cfgEditor"
         :section="cfgTab"
         mode="section"
-        :notice="rawNotice"
-        :description="cfgDesc"
         :disabled="cfgDisabledNote !== ''"
         :disabled-note="cfgDisabledNote"
       />
     </template>
   </div>
 
-  <div class="nb-card nb-page">
-    <h3>Raw config</h3>
-    <p class="muted">The entire rendered config in one editor.</p>
-    <div v-if="!activeProfile" class="nb-card nb-empty">
-      <p class="muted">No active profile — pick one in Proxies.</p>
-      <button class="nb-act nb-act--primary" @click="$emit('goto', 'proxies')">
-        <Icon name="servers" :size="14" />Open Proxies
+  <div class="stg-card">
+    <div class="stg-head">
+      <span class="stg-head-chip"><Icon name="code" :size="22" /></span>
+      <span class="stg-head-text">
+        <span class="stg-head-title">Raw config</span>
+        <span class="stg-head-sub">The entire rendered config for the active profile</span>
+      </span>
+    </div>
+    <div v-if="!activeProfile" class="nb-adv-blank">
+      <span class="muted">No active profile — pick one in Proxies.</span>
+      <button class="nb-act nb-act--sm nb-act--ghost" @click="$emit('goto', 'proxies')">
+        <Icon name="servers" :size="13" />Open Proxies
       </button>
     </div>
     <CoreConfigEditor
@@ -72,7 +78,6 @@
       section="raw"
       mode="raw"
       :notice="rawNotice"
-      description="The entire rendered config for the active profile in one editor. Saving replaces the per-section overrides above."
       :disabled="rawDisabledNote !== ''"
       :disabled-note="rawDisabledNote"
     />
@@ -96,10 +101,9 @@ const connection = useConnectionStore()
 
 const cfgSections = [
   { key: 'route', label: 'Route Rules', desc: 'Route rules decide which outbound each connection uses. Edits sing-box "route" (xray "routing").' },
-  { key: 'dns', label: 'DNS Rules', desc: 'DNS servers and rules for the core resolver. Edits "dns" on either core.' },
-  { key: 'inbound', label: 'Inbound', desc: 'Local listener set (a JSON array). Edits "inbounds" on either core.' },
+  { key: 'dns', label: 'DNS Rules', desc: 'DNS servers and rules for the core resolver. Edits "dns" on sing-box and xray.' },
+  { key: 'inbound', label: 'Inbound', desc: 'Local listener set (a JSON array). Edits "inbounds" on sing-box and xray.' },
   { key: 'experimental', label: 'Experimental', desc: 'Sing-box experimental block (cache, clash API, ...). Sing-box only.' },
-  { key: 'raw', label: 'Raw Config', desc: 'The entire rendered config for the active profile in one editor. Saving replaces the per-section overrides above.' },
 ]
 const rawNotice = 'Saving this raw config will replace your per-section overrides.'
 const cfgTab = ref('route')
@@ -125,16 +129,21 @@ function switchTo(sub: string) {
 }
 defineExpose({ switchTo, isDirty })
 
-function focusEditors() {
-  if (cfgTab.value === 'raw') switchCfgTab('route')
-}
-
 const activeProfile = computed(() => {
   const id = settings.settings.activeProfileId
   return profiles.profiles.find((p) => p.id === id) ?? profiles.profiles[0] ?? null
 })
 
+// The backend refuses both editors for a mihomo profile: it renders its
+// own Clash Meta document and never merges these overrides, so offering
+// an edit here would be an edit that cannot take effect. Gate on the
+// profile (as Go does), not the running core — it holds while idle too.
+const mihomoProfile = computed(() => activeProfile.value?.core === 3)
+const mihomoNote =
+  'mihomo renders its own Clash Meta document — these editors do not apply. Use Backup → View raw config to read what mihomo was given.'
+
 const cfgDisabledNote = computed(() => {
+  if (mihomoProfile.value) return mihomoNote
   if (!connection.status.running)
     return 'Connect first - the editor follows the active core.'
   if (cfgTab.value === 'experimental' && connection.status.core === 'xray')
@@ -143,6 +152,7 @@ const cfgDisabledNote = computed(() => {
 })
 
 const rawDisabledNote = computed(() => {
+  if (mihomoProfile.value) return mihomoNote
   if (!connection.status.running) return 'Connect a profile to edit its raw config.'
   return ''
 })

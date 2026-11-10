@@ -132,6 +132,7 @@ export const backend = {
   openURL: (raw: string) => Promise.resolve(App.OpenURL(raw)),
   coreVersion: () => Promise.resolve(App.CoreVersion()),
   xrayVersion: () => Promise.resolve(App.XrayVersion()),
+  mihomoVersion: () => Promise.resolve(App.MihomoVersion()),
   runtimeInfo: () => Promise.resolve(App.RuntimeInfo()) as Promise<Record<string, string>>,
   openConfigFolder: () => Promise.resolve(App.OpenConfigFolder()),
   detectCountry: async (id: string): Promise<Profile> => {

@@ -5,10 +5,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/apache/thrift/lib/go/thrift"
@@ -35,11 +37,12 @@ import (
 // throwaway transport that is closed on return; StopTest especially
 // must not contend with the call it is trying to cancel.
 //
-// xray has no such RPCs (upstream Xray-core speaks only its stats
-// API), so the xray legs are implemented client-side against the
-// running core's local mixed proxy — the Phase 2 real-latency probe
-// pattern. Endpoints mirror the core server where one exists
-// (ip2location for IP).
+// xray and mihomo have no such RPCs (upstream Xray-core speaks only its
+// stats API; mihomo only its Clash REST controller), so their legs are
+// implemented client-side against the running core's local mixed proxy
+// — the Phase 2 real-latency probe pattern. Both share probeState and
+// the probe bodies below. Endpoints mirror the core server where one
+// exists (ip2location for IP).
 
 // ipInfoAPI mirrors core/server/test_utils.go: the sing-box IP test
 // endpoint, reused here so the xray client-side test resolves the
@@ -364,10 +367,10 @@ func (m *SingBoxManager) StopTest() error {
 	return err
 }
 
-// --- xray client-side legs (no such RPCs upstream) ---
+// --- client-side legs (xray and mihomo expose no test RPCs) ---
 
 // proxiedGetBodyCtx GETs rawURL through the HTTP proxy at proxyAddr,
-// honouring ctx (so StopTest aborts it). Used by the xray legs.
+// honouring ctx (so StopTest aborts it). Used by the client-side legs.
 func proxiedGetBodyCtx(ctx context.Context, proxyAddr, rawURL string, timeout time.Duration) ([]byte, error) {
 	transport := &http.Transport{Proxy: http.ProxyURL(&url.URL{Scheme: "http", Host: proxyAddr})}
 	client := &http.Client{Transport: transport}
@@ -389,40 +392,81 @@ func proxiedGetBodyCtx(ctx context.Context, proxyAddr, rawURL string, timeout ti
 	return io.ReadAll(io.LimitReader(resp.Body, 64<<10))
 }
 
-// xrayTestCtx opens a cancellable scope for one client-side probe,
-// aborting any previous one (the UI runs at most one test at a time).
-func (m *XrayManager) xrayTestCtx() (context.Context, context.CancelFunc) {
-	m.testMu.Lock()
-	defer m.testMu.Unlock()
-	if m.testCancel != nil {
-		m.testCancel()
+// probeState is the Phase C state of a core whose tools run client-side
+// against its own mixed inbound: a cancel for the in-flight probe plus
+// the cached rows backing LastNetwork (the reporter equivalent). xray
+// and mihomo each own one — a probe on one core never cancels or
+// overwrites the other's.
+type probeState struct {
+	mu     sync.Mutex
+	cancel context.CancelFunc
+	ip     *IPTestResult
+	speed  *SpeedTestResult
+	url    *URLTestResult
+}
+
+// scope opens a cancellable probe, aborting any previous one (the UI
+// runs at most one test at a time).
+func (p *probeState) scope() (context.Context, context.CancelFunc) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.cancel != nil {
+		p.cancel()
 	}
 	ctx, cancel := context.WithCancel(context.Background())
-	m.testCancel = cancel
+	p.cancel = cancel
 	return ctx, cancel
 }
 
-// xrayProxyAddr resolves the running core's mixed proxy address.
-func (m *XrayManager) xrayProxyAddr() (string, error) {
-	m.mu.Lock()
-	running, mixedPort := m.running, m.mixedPort
-	m.mu.Unlock()
-	if !running {
-		return "", fmt.Errorf("xray not running")
+// stop aborts the in-flight probe, if any.
+func (p *probeState) stop() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.cancel != nil {
+		p.cancel()
+		p.cancel = nil
 	}
-	return fmt.Sprintf("127.0.0.1:%d", effectiveMixedPort(mixedPort)), nil
 }
 
-// IPTest resolves the egress IP through the running xray's proxy,
-// hitting the same ip2location endpoint the sing-box RPC uses.
-func (m *XrayManager) IPTest() (*IPTestResult, error) {
-	proxy, err := m.xrayProxyAddr()
-	if err != nil {
-		return nil, err
-	}
-	ctx, cancel := m.xrayTestCtx()
-	defer cancel()
-	body, err := proxiedGetBodyCtx(ctx, proxy, ipInfoAPI, 15*time.Second)
+func (p *probeState) recordIP(r *IPTestResult) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.ip = r
+}
+
+func (p *probeState) recordSpeed(r *SpeedTestResult) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.speed = r
+}
+
+// recordURL turns a latency probe into the card's row and caches it.
+func (p *probeState) recordURL(rawURL string, r *TestResult) *URLTestResult {
+	out := &URLTestResult{URL: rawURL, LatencyMs: int(r.LatencyMs), OK: r.Error == "", Error: r.Error}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.url = out
+	return out
+}
+
+// snapshot returns the cached rows without running anything; nil = never run.
+func (p *probeState) snapshot() (*IPTestResult, *SpeedTestResult, *URLTestResult) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.ip, p.speed, p.url
+}
+
+// mixedProxyAddr renders the loopback address of a mixed inbound. Both
+// cores bind loopback or the wildcard, so 127.0.0.1 always reaches it.
+func mixedProxyAddr(port int) string {
+	return net.JoinHostPort("127.0.0.1", strconv.Itoa(effectiveMixedPort(port)))
+}
+
+// probeEgressIP resolves the egress IP through proxyAddr, hitting the
+// same ip2location endpoint the sing-box RPC uses. The caller caches the
+// row (probeState.recordIP) so a failed probe keeps the last good one.
+func probeEgressIP(ctx context.Context, proxyAddr string) (*IPTestResult, error) {
+	body, err := proxiedGetBodyCtx(ctx, proxyAddr, ipInfoAPI, 15*time.Second)
 	if err != nil {
 		return nil, err
 	}
@@ -436,28 +480,18 @@ func (m *XrayManager) IPTest() (*IPTestResult, error) {
 	if info.IP == "" {
 		return nil, fmt.Errorf("empty IP response")
 	}
-	out := &IPTestResult{
+	return &IPTestResult{
 		OutboundTag: "proxy",
 		IP:          strings.TrimSpace(info.IP),
 		CC:          strings.ToUpper(strings.TrimSpace(info.CountryCode)),
-	}
-	m.testMu.Lock()
-	m.lastIP = out
-	m.testMu.Unlock()
-	return out, nil
+	}, nil
 }
 
-// SpeedTest measures a download through the running xray's proxy plus
-// a latency companion probe. Upload has no client-side mirror and is
+// probeDownloadSpeed measures a download through proxyAddr plus a
+// latency companion probe. Upload has no client-side mirror and is
 // omitted (omitempty).
-func (m *XrayManager) SpeedTest() (*SpeedTestResult, error) {
-	proxy, err := m.xrayProxyAddr()
-	if err != nil {
-		return nil, err
-	}
-	ctx, cancel := m.xrayTestCtx()
-	defer cancel()
-	transport := &http.Transport{Proxy: http.ProxyURL(&url.URL{Scheme: "http", Host: proxy})}
+func probeDownloadSpeed(ctx context.Context, proxyAddr string) (*SpeedTestResult, error) {
+	transport := &http.Transport{Proxy: http.ProxyURL(&url.URL{Scheme: "http", Host: proxyAddr})}
 	client := &http.Client{Transport: transport}
 	defer client.CloseIdleConnections()
 	dlCtx, dlCancel := context.WithTimeout(ctx, 60*time.Second)
@@ -487,31 +521,113 @@ func (m *XrayManager) SpeedTest() (*SpeedTestResult, error) {
 	latMs := 0
 	// BUG-031: the latency leg runs under the probe ctx, so StopTest
 	// aborts it instead of blocking up to 10s past the cancel.
-	if d, err := proxiedHeadOrGetCtx(ctx, proxy, defaultTestURL, 10*time.Second); err == nil {
+	if d, err := proxiedHeadOrGetCtx(ctx, proxyAddr, defaultTestURL, 10*time.Second); err == nil {
 		latMs = int(d.Milliseconds())
 	} else if ctx.Err() != nil {
 		return nil, ctx.Err()
 	}
-	out := &SpeedTestResult{
+	return &SpeedTestResult{
 		DownloadMbps: mbps,
 		LatencyMs:    latMs,
 		ServerName:   "Cloudflare",
 		OutboundTag:  "proxy",
+	}, nil
+}
+
+// xrayProxyAddr resolves the running core's mixed proxy address.
+func (m *XrayManager) xrayProxyAddr() (string, error) {
+	m.mu.Lock()
+	running, mixedPort := m.running, m.mixedPort
+	m.mu.Unlock()
+	if !running {
+		return "", fmt.Errorf("xray not running")
 	}
-	m.testMu.Lock()
-	m.lastSpeed = out
-	m.testMu.Unlock()
+	return mixedProxyAddr(mixedPort), nil
+}
+
+// IPTest resolves the egress IP through the running xray's proxy.
+func (m *XrayManager) IPTest() (*IPTestResult, error) {
+	proxy, err := m.xrayProxyAddr()
+	if err != nil {
+		return nil, err
+	}
+	ctx, cancel := m.probes.scope()
+	defer cancel()
+	out, err := probeEgressIP(ctx, proxy)
+	if err != nil {
+		return nil, err
+	}
+	m.probes.recordIP(out)
+	return out, nil
+}
+
+// SpeedTest measures a download through the running xray's proxy.
+func (m *XrayManager) SpeedTest() (*SpeedTestResult, error) {
+	proxy, err := m.xrayProxyAddr()
+	if err != nil {
+		return nil, err
+	}
+	ctx, cancel := m.probes.scope()
+	defer cancel()
+	out, err := probeDownloadSpeed(ctx, proxy)
+	if err != nil {
+		return nil, err
+	}
+	m.probes.recordSpeed(out)
 	return out, nil
 }
 
 // StopTest aborts the in-flight client-side probe, if any.
 func (m *XrayManager) StopTest() {
-	m.testMu.Lock()
-	defer m.testMu.Unlock()
-	if m.testCancel != nil {
-		m.testCancel()
-		m.testCancel = nil
+	m.probes.stop()
+}
+
+// mihomoProxyAddr resolves the running core's single mixed inbound.
+func (m *MihomoManager) mihomoProxyAddr() (string, error) {
+	m.mu.Lock()
+	running, mixedPort := m.running, m.mixedPort
+	m.mu.Unlock()
+	if !running {
+		return "", fmt.Errorf("mihomo not running")
 	}
+	return mixedProxyAddr(mixedPort), nil
+}
+
+// IPTest resolves the egress IP through the running mihomo's proxy.
+func (m *MihomoManager) IPTest() (*IPTestResult, error) {
+	proxy, err := m.mihomoProxyAddr()
+	if err != nil {
+		return nil, err
+	}
+	ctx, cancel := m.probes.scope()
+	defer cancel()
+	out, err := probeEgressIP(ctx, proxy)
+	if err != nil {
+		return nil, err
+	}
+	m.probes.recordIP(out)
+	return out, nil
+}
+
+// SpeedTest measures a download through the running mihomo's proxy.
+func (m *MihomoManager) SpeedTest() (*SpeedTestResult, error) {
+	proxy, err := m.mihomoProxyAddr()
+	if err != nil {
+		return nil, err
+	}
+	ctx, cancel := m.probes.scope()
+	defer cancel()
+	out, err := probeDownloadSpeed(ctx, proxy)
+	if err != nil {
+		return nil, err
+	}
+	m.probes.recordSpeed(out)
+	return out, nil
+}
+
+// StopTest aborts the in-flight client-side probe, if any.
+func (m *MihomoManager) StopTest() {
+	m.probes.stop()
 }
 
 // --- CoreManager routing ---
@@ -535,11 +651,31 @@ func (m *CoreManager) netManagers() (*SingBoxManager, *XrayManager, error) {
 	return m.singboxMgr, m.xrayMgr, nil
 }
 
+// netMihomo snapshots the mihomo manager. Its tools take the client-side
+// legs (no test RPCs), so they must not fall through to the sing-box
+// Thrift path — that would dial a core which is not running.
+func (m *CoreManager) netMihomo() (*MihomoManager, error) {
+	m.mu.RLock()
+	mh := m.mihomoMgr
+	m.mu.RUnlock()
+	if mh == nil {
+		return nil, fmt.Errorf("mihomo manager is nil")
+	}
+	return mh, nil
+}
+
 // IPTest probes the egress IP via the active core.
 func (m *CoreManager) IPTest(profile *Profile, settings Settings) (*IPTestResult, error) {
 	core, err := m.netTarget()
 	if err != nil {
 		return nil, err
+	}
+	if core == CoreMihomo {
+		mh, err := m.netMihomo()
+		if err != nil {
+			return nil, err
+		}
+		return mh.IPTest()
 	}
 	sb, xr, err := m.netManagers()
 	if err != nil {
@@ -560,6 +696,13 @@ func (m *CoreManager) SpeedTest() (*SpeedTestResult, error) {
 	if err != nil {
 		return nil, err
 	}
+	if core == CoreMihomo {
+		mh, err := m.netMihomo()
+		if err != nil {
+			return nil, err
+		}
+		return mh.SpeedTest()
+	}
 	sb, xr, err := m.netManagers()
 	if err != nil {
 		return nil, err
@@ -576,26 +719,33 @@ func (m *CoreManager) URLTest(url string, timeoutMs int) (*URLTestResult, error)
 	if err != nil {
 		return nil, err
 	}
-	sb, xr, err := m.netManagers()
-	if err != nil {
-		return nil, err
-	}
 	if url == "" {
 		url = defaultTestURL
 	}
 	if timeoutMs <= 0 {
 		timeoutMs = 10000
 	}
+	if core == CoreMihomo {
+		mh, err := m.netMihomo()
+		if err != nil {
+			return nil, err
+		}
+		r, err := mh.URLTest(url, int32(timeoutMs))
+		if err != nil {
+			return nil, err
+		}
+		return mh.probes.recordURL(url, r), nil
+	}
+	sb, xr, err := m.netManagers()
+	if err != nil {
+		return nil, err
+	}
 	if core == CoreXray {
 		r, err := xr.URLTest(url, int32(timeoutMs))
 		if err != nil {
 			return nil, err
 		}
-		out := &URLTestResult{URL: url, LatencyMs: int(r.LatencyMs), OK: r.Error == "", Error: r.Error}
-		xr.testMu.Lock()
-		xr.lastURL = out
-		xr.testMu.Unlock()
-		return out, nil
+		return xr.probes.recordURL(url, r), nil
 	}
 	r, err := sb.ProbeURL(url, int32(timeoutMs))
 	if err != nil {
@@ -605,11 +755,19 @@ func (m *CoreManager) URLTest(url string, timeoutMs int) (*URLTestResult, error)
 }
 
 // StopTest cancels the in-flight probe (server testCtx for sing-box,
-// local probe ctx for xray).
+// local probe ctx for xray and mihomo).
 func (m *CoreManager) StopTest() error {
 	core, err := m.netTarget()
 	if err != nil {
 		return err
+	}
+	if core == CoreMihomo {
+		mh, err := m.netMihomo()
+		if err != nil {
+			return err
+		}
+		mh.StopTest()
+		return nil
 	}
 	sb, xr, err := m.netManagers()
 	if err != nil {
@@ -624,7 +782,8 @@ func (m *CoreManager) StopTest() error {
 
 // LastNetwork returns the last-known tool results without running
 // anything: sing-box reporter reads (IP/URL/country drain on read;
-// speed does not) or the xray in-memory cache. Nil sections = no data.
+// speed does not) or the xray/mihomo in-memory cache. Nil sections = no
+// data.
 //
 // HOTFIX: this is a best-effort seeding call made by the Console Network
 // tab on mount, so it must never panic and never return nil: idle (or a
@@ -638,7 +797,7 @@ func (m *CoreManager) LastNetwork() (*LastNetworkResults, error) {
 	}
 	m.mu.RLock()
 	running := m.running
-	sb, xr := m.singboxMgr, m.xrayMgr
+	sb, xr, mh := m.singboxMgr, m.xrayMgr, m.mihomoMgr
 	m.mu.RUnlock()
 	if !running {
 		return &LastNetworkResults{}, nil
@@ -652,10 +811,15 @@ func (m *CoreManager) LastNetwork() (*LastNetworkResults, error) {
 		return &LastNetworkResults{}, nil
 	}
 	out := &LastNetworkResults{}
+	if core == CoreMihomo {
+		if mh == nil {
+			return out, fmt.Errorf("mihomo manager is nil")
+		}
+		out.IP, out.Speed, out.URL = mh.probes.snapshot()
+		return out, nil
+	}
 	if core == CoreXray {
-		xr.testMu.Lock()
-		defer xr.testMu.Unlock()
-		out.IP, out.Speed, out.URL = xr.lastIP, xr.lastSpeed, xr.lastURL
+		out.IP, out.Speed, out.URL = xr.probes.snapshot()
 		return out, nil
 	}
 	if rows, err := sb.QueryIPTest(); err == nil && len(rows) > 0 {

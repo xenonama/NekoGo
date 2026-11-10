@@ -272,7 +272,11 @@ func TestChainPsiphonDirs(t *testing.T) {
 		t.Fatalf("two chain runs share a dir: %s", d1)
 	}
 	for _, d := range []string{d1, d2} {
-		if filepath.Dir(d) != base {
+		// Both sides normalized: with a forward-slash TMPDIR (a POSIX shell,
+		// or GOTMPDIR set that way), t.TempDir() keeps "/" where MkdirTemp
+		// hands back "\", and the raw compare then reports a chain dir as
+		// outside the work dir it was just created in.
+		if filepath.Dir(filepath.Clean(d)) != filepath.Clean(base) {
 			t.Fatalf("chain dir %s is not under the work dir %s", d, base)
 		}
 		if info, err := os.Stat(d); err != nil || !info.IsDir() {

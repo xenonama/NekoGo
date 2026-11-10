@@ -4,7 +4,7 @@
      switches through the exposed isDirty() (JsonEditorModal pattern). -->
 <template>
   <div class="nb-ccfg">
-    <p class="muted">{{ description }}</p>
+    <p v-if="description" class="muted">{{ description }}</p>
     <!-- Phase G: one-time warning when per-section overrides exist —
          saving raw replaces them. The checkbox persists the ack in
          Settings (not CoreOverrides). -->
@@ -68,7 +68,8 @@ import { useSettingsStore } from '../stores/settings'
 const props = withDefaults(
   defineProps<{
     section: string
-    description: string
+    /** Optional lead-in line; the card head usually already says this. */
+    description?: string
     disabled: boolean
     disabledNote: string
     /** Phase G full-config variant: load/save go through the raw
@@ -77,7 +78,7 @@ const props = withDefaults(
     /** One-time Phase G warning shown above the editor when set. */
     notice?: string
   }>(),
-  { mode: 'section', notice: '' },
+  { mode: 'section', notice: '', description: '' },
 )
 
 const connection = useConnectionStore()
@@ -241,9 +242,11 @@ async function save() {
       return
     }
     await connection.disconnect()
-    await connection.connect(id)
-    if (connection.error) toast.value = 'Reload failed: ' + connection.error
-    else toast.value = 'Core reloaded with the new config.'
+    if (!(await connection.connect(id))) {
+      toast.value = 'Reload failed: ' + (connection.error || 'another connect is in progress')
+    } else {
+      toast.value = 'Core reloaded with the new config.'
+    }
   } catch (e) {
     error.value = String(e)
   } finally {

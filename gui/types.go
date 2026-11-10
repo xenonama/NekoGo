@@ -17,6 +17,12 @@ const (
 	// sing-box transports raw TLS to sni-spoof.exe, which injects
 	// fake ClientHello via WinDivert. MODE is always "SNI Only".
 	CoreSpoof
+	// CoreMihomo runs the profile with mihomo.exe (Clash Meta). The
+	// profile renders as one mihomo proxy behind a single-member select
+	// group matched by a MATCH rule, so every connection takes it;
+	// stats, the connection table and latency probes read mihomo's own
+	// external controller (the Clash REST API).
+	CoreMihomo
 )
 
 // String returns a human readable core name.
@@ -26,6 +32,8 @@ func (c CoreType) String() string {
 		return "xray"
 	case CoreSpoof:
 		return "spoof"
+	case CoreMihomo:
+		return "mihomo"
 	default:
 		return "sing-box"
 	}
@@ -37,10 +45,14 @@ func (c CoreType) IsXray() bool { return c == CoreXray }
 // IsSpoof reports whether the core is the SNI-spoof engine.
 func (c CoreType) IsSpoof() bool { return c == CoreSpoof }
 
+// IsMihomo reports whether the core is the mihomo (Clash Meta) engine.
+func (c CoreType) IsMihomo() bool { return c == CoreMihomo }
+
 // Profile is the GUI-side canonical profile format. It is deliberately a
 // superset: sing-box profiles are translated to a sing-box outbound JSON
 // snippet, Xray profiles are translated to an Xray config.json by
-// xray_manager.go.
+// xray_manager.go, and mihomo profiles to a Clash Meta document by
+// mihomo_manager.go.
 type Profile struct {
 	ID       string   `json:"id"`
 	Name     string   `json:"name"`
@@ -287,6 +299,11 @@ type Settings struct {
 	// other's file.
 	UpstreamCorePath string `json:"upstreamCorePath,omitempty"`
 	XrayPath         string `json:"xrayPath"` // xray.exe override
+	// MihomoPath is the dedicated override for mihomo.exe (Clash Meta).
+	// Like UpstreamCorePath it is never shared with another engine's
+	// override: the binaries are separate and must not resolve to each
+	// other's file.
+	MihomoPath string `json:"mihomoPath,omitempty"`
 	// CoreEngine selects which sing-box binary runs sing-box profiles and
 	// every sing-box transport (plain, SNI spoof, Aether).
 	// "custom" = nekobox_core.exe (NekoBox fork with Thrift RPC).
@@ -348,6 +365,10 @@ type Settings struct {
 	// folded the way the user left it. Names are group labels; stale
 	// entries for groups that no longer exist are harmless.
 	CollapsedProxyGroups []string `json:"collapsedProxyGroups,omitempty"`
+	// ProxyGroups lists user-created Proxies-tab remark groups. Feed groups
+	// are implicit from Profile.Group; this keeps a manually named group in
+	// the list before (or without) any profile being moved into it.
+	ProxyGroups []string `json:"proxyGroups,omitempty"`
 	// AdvancedPeekSimple shows the Simple shell while Advanced Mode
 	// stays ON (peek mode). Reset when Advanced Mode is disabled.
 	AdvancedPeekSimple bool `json:"advancedPeekSimple,omitempty"`
@@ -361,6 +382,12 @@ type Settings struct {
 	// route; only the transport core changes. The SNI spoof + Psiphon
 	// chain is exempt: its TUN inbound exists only on sing-box.
 	SpoofXray bool `json:"spoofXray,omitempty"`
+	// SpoofEnabled gates the SNI spoof engine at runtime. Absent means
+	// enabled (configs predate the toggle); false makes CoreSpoof
+	// profiles dial their own address with the normal transport instead
+	// of through the engine — e.g. a local 127.0.0.1 tunnel the user
+	// runs themselves.
+	SpoofEnabled *bool `json:"spoofEnabled,omitempty"`
 	// AetherPsiphon runs Psiphon on top of an Aether connect through the
 	// Aether core's own chain mode: Psiphon's servers are dialled
 	// through the tunnel, and the app keeps dialling the Psiphon
@@ -405,6 +432,12 @@ type SNIConfig struct {
 	FakeDelay        float64 `json:"fakeDelay,omitempty"`
 	SeqOverlap       int     `json:"seqOverlap,omitempty"`
 	PaddingSize      int     `json:"paddingSize,omitempty"`
+	// Plan picks where the engine gets its connect endpoint:
+	// "" or "B" = Plan B, the curated IP list is the endpoint pool
+	// (the historical behaviour); "A" = Plan A, the engine resolves
+	// each fake SNI itself (DoH) and dials that, so the IP list
+	// becomes a read-out of what Plan A derived.
+	Plan string `json:"plan,omitempty"`
 }
 
 // SNIIP is one Cloudflare endpoint candidate in the SNI tab list.
@@ -425,12 +458,16 @@ func (e SNIIP) IsSelected() bool { return e.Selected == nil || *e.Selected }
 
 // SNISNI is one decoy-SNI candidate in the SNI tab list.
 type SNISNI struct {
-	Host     string `json:"host"`
-	Source   string `json:"source,omitempty"`
-	LastOK   bool   `json:"lastOk,omitempty"`
-	LastMs   int    `json:"lastMs,omitempty"`
-	LastAt   string `json:"lastAt,omitempty"`
-	LastTLS  string `json:"lastTls,omitempty"`
+	Host    string `json:"host"`
+	Source  string `json:"source,omitempty"`
+	LastOK  bool   `json:"lastOk,omitempty"`
+	LastMs  int    `json:"lastMs,omitempty"`
+	LastAt  string `json:"lastAt,omitempty"`
+	LastTLS string `json:"lastTls,omitempty"`
+	// LastIP is Plan A's read-out: the address the last resolve of
+	// this host returned (empty until a Plan A scan runs). Plan B
+	// never writes it — its endpoints come from the IP list.
+	LastIP   string `json:"lastIp,omitempty"`
 	Selected *bool  `json:"selected,omitempty"`
 }
 
@@ -460,9 +497,19 @@ type SpoofRanked struct {
 	Ok   uint32  `json:"ok"`
 	Fail uint32  `json:"fail"`
 	Rate float64 `json:"rate"`
+	// LatencyMs is the engine's EWMA time for this method; nil until the row
+	// has been timed at all, which is why a 100% row can still look idle.
+	LatencyMs *float64 `json:"latency_ms"`
+	// Score is what auto ordered the rows on (success rate minus latency
+	// drag) — without it the tab shows a rate and cannot explain the ranking.
+	Score float64 `json:"score"`
 }
 
 // DefaultSettings returns sane first-run defaults.
+// boolPtr returns a pointer to v, for Settings fields whose unset (nil)
+// state must differ from an explicit false.
+func boolPtr(v bool) *bool { return &v }
+
 func DefaultSettings() Settings {
 	return Settings{
 		Theme:          "light",
@@ -471,8 +518,7 @@ func DefaultSettings() Settings {
 		TunStack:       tunStackDefault,
 		SystemProxy:    true,
 		XrayAPIAddress: "127.0.0.1:10085",
-		SingBoxRPCAddr: "127.0.0.1",
-		// CPU audit #2: "info" emits a line per connection open/close;
+		SingBoxRPCAddr: "127.0.0.1", // CPU audit #2: "info" emits a line per connection open/close;
 		// "warn" keeps that churn off the default path. debug/info stay
 		// valid values in config.json for troubleshooting.
 		LogLevel:         defaultLogLevel,
@@ -497,6 +543,9 @@ func DefaultSettings() Settings {
 		SNIIPs:         DefaultSNIIPs(),
 		SNISNIs:        DefaultSNISNIs(),
 		CoreEngine:     "custom",
+		// SNI spoofing defaults to enabled; the toggle turns the engine
+		// off so SNI Spoofing profiles dial their own address.
+		SpoofEnabled: boolPtr(true),
 	}
 }
 

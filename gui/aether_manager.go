@@ -722,24 +722,6 @@ func aetherLinePriority(line string) (level, msg string) {
 	return "info", line
 }
 
-// answersSocks probes a SOCKS server on loopback [port] the way PattNG
-// does: the greeting is taken and answered with the SOCKS version byte.
-// Retries every poll interval up to [timeout].
-func answersSocks(port int, timeout time.Duration) bool {
-	greeting := []byte{5, 1, 0}
-	deadline := time.Now().Add(timeout)
-	for {
-		ok := probeSocksOnce(port, greeting)
-		if ok {
-			return true
-		}
-		if time.Now().After(deadline) {
-			return false
-		}
-		time.Sleep(500 * time.Millisecond)
-	}
-}
-
 // answersSocksOnce is the single-shot probe (PattNG answersSocks).
 func answersSocksOnce(port int) bool {
 	return probeSocksOnce(port, []byte{5, 1, 0})
@@ -761,17 +743,4 @@ func probeSocksOnce(port int, greeting []byte) bool {
 		return false
 	}
 	return buf[0] == 5
-}
-
-// aetherPortFree reports whether loopback [port] might still be bound
-// by nothing — a stale engine check used at start (PattNG reaps stale
-// processes; on Windows we read what a fresh bind would find instead).
-func aetherPortFree(port int) bool {
-	c, err := net.DialTimeout("tcp", fmt.Sprintf("%s:%d", aetherLoopback, port), 300*time.Millisecond)
-	if err != nil {
-		return true
-	}
-	_ = c.Close()
-	// Something answered: bound.
-	return false
 }

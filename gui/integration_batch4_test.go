@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"runtime"
 	"sync"
 	"testing"
 	"time"
@@ -255,13 +256,17 @@ func TestCancelRefreshCountries(t *testing.T) {
 }
 
 // TestGetSystemProxyStateSmoke — BUG-010: the OS query answers without
-// error on Windows (HKCU Internet Settings is always present).
+// error on Windows (a missing ProxyEnable is "off", not a failure), and
+// the bound method reports through the same read.
 func TestGetSystemProxyStateSmoke(t *testing.T) {
-	on, err := osProxyEnabled()
-	if err != nil {
-		t.Fatalf("osProxyEnabled = %v, want nil error", err)
+	if runtime.GOOS != "windows" {
+		t.Skip("HKCU Internet Settings only exists on Windows")
 	}
-	t.Logf("OS proxy enabled = %v", on)
+	on, server, err := osSystemProxy()
+	if err != nil {
+		t.Fatalf("osSystemProxy = %v, want nil error", err)
+	}
+	t.Logf("OS proxy enabled = %v server = %q", on, server)
 	a := newGeoTestApp(t)
 	if _, err := a.GetSystemProxyState(); err != nil {
 		t.Fatalf("GetSystemProxyState = %v, want nil error", err)

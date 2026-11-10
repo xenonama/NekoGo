@@ -256,7 +256,9 @@ fn is_admin_inner() -> bool {
 fn config_to_json(cfg: &Config) -> serde_json::Value {
     // FIX(D3): saves normalize to this canonical schema by design — unknown
     // extra keys from hand-edited files are dropped rather than preserved.
-    serde_json::json!({
+    // The two Plan A keys are the documented exception: they are re-emitted
+    // below, but only when set, so a Plan B save keeps today's exact schema.
+    let mut val = serde_json::json!({
         "LISTEN_HOST": cfg.listen_host,
         "LISTEN_PORT": cfg.listen_port,
         "ENDPOINTS": cfg.endpoints.iter().map(|e| serde_json::json!({"ip": e.ip, "port": e.port})).collect::<Vec<_>>(),
@@ -281,15 +283,35 @@ fn config_to_json(cfg: &Config) -> serde_json::Value {
         // them; they only feed validation (collision checks).
         "SOCKS5_PORT": cfg.socks5_port,
         "HTTP_PORT": cfg.http_port,
-    })
+    });
+    // Plan A keys, omitted when default (see the FIX(D3) note above).
+    if let Some(obj) = val.as_object_mut() {
+        if cfg.resolve_sni {
+            obj.insert("RESOLVE_SNI".into(), serde_json::json!(true));
+        }
+        if !cfg.connect_override.is_empty() {
+            obj.insert(
+                "CONNECT_OVERRIDE".into(),
+                serde_json::json!(cfg.connect_override.clone()),
+            );
+        }
+    }
+    val
 }
 
 fn parse_and_validate(cfg_json: &str) -> Result<Config, String> {
     let val: serde_json::Value =
         serde_json::from_str(cfg_json).map_err(|e| format!("invalid config JSON: {}", e))?;
-    config::migrate(val)
+    let mut cfg = config::migrate(val)
         .and_then(|c| config::validate(&c).map(|_| c))
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+    // Plan A: derive the endpoints after validation (an empty ENDPOINTS list
+    // is legal only under RESOLVE_SNI, and CONNECT_OVERRIDE is already checked
+    // as an IPv4 by validate()). Plan B returns from this call immediately and
+    // without a network hit, so Start/Save behave exactly as before. Errors
+    // carry `ConfigError::Validation`'s text, the same string the CLI prints.
+    config::apply_plan_a(&mut cfg).map_err(|e| e.to_string())?;
+    Ok(cfg)
 }
 
 fn probe_to_json(r: &probe::ProbeResult) -> serde_json::Value {

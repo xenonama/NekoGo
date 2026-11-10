@@ -3,7 +3,9 @@
 package main
 
 import (
+	"errors"
 	"fmt"
+	"syscall"
 
 	"golang.org/x/sys/windows"
 	"golang.org/x/sys/windows/registry"
@@ -21,20 +23,13 @@ func isGuiElevated() (bool, error) {
 	return token.IsElevated(), nil
 }
 
-// osProxyEnabled reads the ACTUAL OS proxy switch (integration
-// BUG-010): HKCU Internet Settings ProxyEnable. This is ground truth
-// independent of our toggle state — it catches a crash that left the
-// proxy installed, an external OS change, or a plain restart. It says
-// only ON/OFF, not whether the proxy points at our core (use
-// osSystemProxy for the server comparison).
-func osProxyEnabled() (bool, error) {
-	on, _, err := osSystemProxy()
-	return on, err
-}
-
 // osSystemProxy reads the ACTUAL OS proxy switch plus the configured
 // ProxyServer string, so callers can tell "off" apart from "on but
-// pointing elsewhere" (Connect repairs both onto our ports).
+// pointing elsewhere" (Connect repairs both onto our ports), and so a
+// toggle can tell its own proxy from a corporate one.
+// A profile that never touched the proxy panel has no ProxyEnable value
+// at all: that is "off", not a read failure — reporting it as an error
+// left callers stuck on their settings fallback instead of the truth.
 func osSystemProxy() (bool, string, error) {
 	key, err := registry.OpenKey(registry.CURRENT_USER,
 		`Software\Microsoft\Windows\CurrentVersion\Internet Settings`,
@@ -44,6 +39,9 @@ func osSystemProxy() (bool, string, error) {
 	}
 	defer key.Close()
 	v, _, err := key.GetIntegerValue("ProxyEnable")
+	if errors.Is(err, registry.ErrNotExist) || errors.Is(err, syscall.ERROR_FILE_NOT_FOUND) {
+		return false, "", nil
+	}
 	if err != nil {
 		return false, "", fmt.Errorf("read ProxyEnable: %w", err)
 	}

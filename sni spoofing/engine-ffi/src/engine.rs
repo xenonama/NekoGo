@@ -17,12 +17,12 @@ use parking_lot::Mutex as ParkMutex;
 use sni_core::{
     config::Config,
     fake_tcp::{
-        plan_delayed_retry_second, plan_fake, BypassMethod, FakeParams, HandshakeState,
-        InboundAction, OutboundAction,
+        plan_fake, split_hello, BypassMethod, FakeParams, HandshakeState, InboundAction,
+        OutboundAction, Strategy,
     },
     picker::pick_sni,
     stats::Stats,
-    tcp::{build_fake_tcp, parse_ip_tcp, tcp_info},
+    tcp::{build_fake_tcp, parse_ip_tcp, tcp_info, tcp_payload},
     tls::{build_fake_client_hello, TlsProfile},
 };
 use sni_windivert::{Packet, WindivertHandle};
@@ -41,6 +41,36 @@ use tokio::{net::TcpListener, runtime::Handle};
 type DpiKey = (String, u16, String, u16);
 
 type DpiMap = Arc<ParkMutex<HashMap<DpiKey, HandshakeState>>>;
+
+/// v3: a decoy burst that must leave later than the packet that triggered it
+/// (`FAKE_DELAY`). One feeder thread drains these, so the capture thread never
+/// sleeps and never delays unrelated connections.
+pub(crate) struct DelayedBurst {
+    at: std::time::Instant,
+    packets: Vec<Packet>,
+}
+
+pub(crate) type DelayTx = std::sync::mpsc::SyncSender<DelayedBurst>;
+
+/// Send queued bursts when they are due. Exits when every sender is gone,
+/// which happens once the capture thread has returned.
+fn run_delay_feeder(rx: std::sync::mpsc::Receiver<DelayedBurst>, handle: WindivertHandle) {
+    loop {
+        let burst = match rx.recv_timeout(Duration::from_millis(250)) {
+            Ok(b) => b,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+        };
+        if let Some(wait) = burst.at.checked_duration_since(std::time::Instant::now()) {
+            std::thread::sleep(wait);
+        }
+        for p in &burst.packets {
+            if let Err(e) = handle.send(p) {
+                throttled_error(&FAKE_SEND_THROTTLE, "delayed fake send", format!("{}", e));
+            }
+        }
+    }
+}
 
 // Rate-limited [ERROR] promotion for the hot capture path (Q9 items 5-6):
 // at most one line per tag per second; drops in between are counted and
@@ -61,11 +91,16 @@ static FAKE_SEND_THROTTLE: ParkMutex<ErrThrottle> = ParkMutex::new(ErrThrottle {
 });
 
 fn throttled_error(throttle: &ParkMutex<ErrThrottle>, tag: &str, msg: String) {
+    note_error(throttle, tag, msg, std::time::Instant::now())
+}
+
+/// `throttled_error` with the clock handed in, so the tests can move the
+/// window instead of sleeping across it.
+fn note_error(throttle: &ParkMutex<ErrThrottle>, tag: &str, msg: String, now: std::time::Instant) {
     let mut t = throttle.lock();
-    let now = std::time::Instant::now();
     let window_elapsed = t
         .last
-        .map(|l| now.duration_since(l).as_secs_f64() >= 1.0)
+        .map(|l| now.saturating_duration_since(l).as_secs_f64() >= 1.0)
         .unwrap_or(true);
     if !window_elapsed {
         t.dropped += 1;
@@ -180,6 +215,25 @@ impl EngineHandle {
         let alive = Arc::new(AtomicBool::new(true));
         let mut threads = Vec::new();
 
+        // ---- v3: FAKE_DELAY feeder thread ----
+        // Bounded so a stalled driver cannot make memory grow without limit;
+        // when the queue is full the capture thread sends the burst itself
+        // rather than dropping the decoy.
+        let (delay_tx, delay_rx) = std::sync::mpsc::sync_channel::<DelayedBurst>(64);
+        if wcfg.fake_delay > 0.0 {
+            let fh = tcp.clone();
+            threads.push(
+                std::thread::Builder::new()
+                    .name("sni-fake-delay".into())
+                    .spawn(move || run_delay_feeder(delay_rx, fh))
+                    .map_err(|e| format!("cannot spawn fake-delay thread: {}", e))?,
+            );
+        } else {
+            // Nothing consumes the queue when the knob is off; drop the
+            // receiver so a stray try_send fails fast instead of buffering.
+            drop(delay_rx);
+        }
+
         // ---- TCP capture thread (blocking Recv + DPI dispatch) ----
         {
             let h = tcp.clone();
@@ -192,6 +246,7 @@ impl EngineHandle {
             let snis = wcfg.fake_snis.clone();
             let iface = worker.interface_ipv4.clone();
             let fake_delay = wcfg.fake_delay;
+            let delay = delay_tx.clone();
             threads.push(
                 std::thread::Builder::new()
                     .name("windivert-tcp".into())
@@ -199,7 +254,7 @@ impl EngineHandle {
                         h.run(|pkt| {
                             dispatch_tcp_packet(
                                 &h, &pkt, &w, &rt_h, &dpi, method, &params, profile, &snis, &iface,
-                                fake_delay,
+                                fake_delay, &delay,
                             );
                         });
                     })
@@ -341,6 +396,7 @@ fn dispatch_tcp_packet(
     snis: &[String],
     iface: &str,
     fake_delay: f64,
+    delay_tx: &DelayTx,
 ) {
     let raw = pkt.bytes();
     let reinject = || {
@@ -353,7 +409,7 @@ fn dispatch_tcp_packet(
         }
     };
 
-    let (ip, _, ip_hlen, _) = match parse_ip_tcp(raw) {
+    let (ip, _, ip_hlen, tcp_hlen) = match parse_ip_tcp(raw) {
         Some(v) => v,
         None => {
             reinject();
@@ -467,15 +523,14 @@ fn dispatch_tcp_packet(
     if outbound {
         enum Next {
             Forward,
-            FakeBurst(Vec<Vec<u8>>, Option<RetryCtx>),
+            /// Decoy burst, sent after (or, when delayed, instead of) the
+            /// original. The original still goes out: decoys live in old-seq
+            /// space and the real handshake must continue.
+            FakeBurst(Vec<Vec<u8>>, bool),
+            /// v3: the client's REAL ClientHello, segmented. The original is
+            /// suppressed — reinjecting it would hand DPI the whole hostname.
+            Split(Vec<Vec<u8>>),
             Fail,
-        }
-        struct RetryCtx {
-            syn: u32,
-            hello: Vec<u8>,
-            ident_base: u16,
-            ttl: u8,
-            template: Vec<u8>,
         }
         // FIX P4: narrow DPI lock scope — only touch state under lock,
         // build fake bytes outside so other connections don't head-of-line
@@ -485,26 +540,33 @@ fn dispatch_tcp_packet(
         enum OutNext {
             Forward,
             Fail,
-            NeedFake(u32, BypassMethod),
+            NeedFake(u32, Strategy),
+            /// Payload the splitter must take apart, plus the seq it carries.
+            NeedSplit(Vec<u8>, u32, Strategy),
         }
         let out_next: OutNext = {
             let mut map = dpi.lock();
             if map.len() > 4096 {
                 map.clear();
             }
-            // FIX(#7): ask the Worker for the sticky method when config is
-            // "auto". For a concrete config this returns the same method
+            // FIX(#7): ask the Worker for the sticky strategy when config is
+            // "auto". For a concrete config this returns the same strategy
             // every time, so behaviour is unchanged.
-            let conn_method = worker.resolve_method_for_connection(method);
+            let conn_strategy = worker.resolve_strategy_for_connection(method);
             let st = map
                 .entry(key.clone())
-                .or_insert_with(|| HandshakeState::new(conn_method));
+                .or_insert_with(|| HandshakeState::new(conn_strategy));
             match st.on_outbound(info) {
                 OutboundAction::Reinject => OutNext::Forward,
                 OutboundAction::TriggerFake => {
                     let syn = st.syn_seq.unwrap_or_else(|| info.seq.wrapping_sub(1));
-                    let m = st.method;
-                    OutNext::NeedFake(syn, m)
+                    let s = st.strategy;
+                    OutNext::NeedFake(syn, s)
+                }
+                OutboundAction::MaybeSplitHello => {
+                    let start = (ip_hlen + tcp_hlen).min(raw.len());
+                    let payload = raw[start..].to_vec();
+                    OutNext::NeedSplit(payload, info.seq, st.strategy)
                 }
                 OutboundAction::Unexpected(msg) => {
                     // Post-fake data (e.g. relay bytes on the same 4-tuple)
@@ -524,8 +586,52 @@ fn dispatch_tcp_packet(
         let next = match out_next {
             OutNext::Forward => Next::Forward,
             OutNext::Fail => Next::Fail,
-            OutNext::NeedFake(syn, m) => {
-                // Fake ClientHello with a random SNI from the pool.
+            OutNext::NeedSplit(payload, seq, strategy) => {
+                let segs = match split_hello(seq, &payload) {
+                    Some(s) => s,
+                    // Not a handshake record (HTTP, app data) — forward it.
+                    None => return reinject(),
+                };
+                let ident = u16::from_be_bytes([raw[4], raw[5]]);
+                let mut built = Vec::with_capacity(segs.len());
+                for s in &segs {
+                    if let Some(bytes) = build_fake_tcp(
+                        raw,
+                        s.seq,
+                        &s.payload,
+                        s.psh,
+                        ident.wrapping_add(s.ident_plus),
+                        None,
+                    ) {
+                        built.push(bytes);
+                    }
+                }
+                if built.len() < segs.len() {
+                    // A segment failed to build: sending a partial hello would
+                    // hang the handshake. Prefer correctness over evasion.
+                    tracing::debug!(
+                        "hello split build incomplete ({}/{}), forwarding original",
+                        built.len(),
+                        segs.len()
+                    );
+                    Next::Forward
+                } else {
+                    tracing::debug!(
+                        "DPI: real ClientHello split into {} segment(s), strategy={}",
+                        built.len(),
+                        strategy.board_key()
+                    );
+                    worker.record_resolved_strategy(
+                        &(key.0.clone(), key.1, key.2.clone(), key.3),
+                        &strategy.board_key(),
+                    );
+                    Next::Split(built)
+                }
+            }
+            OutNext::NeedFake(syn, strategy) => {
+                // Decoy ClientHello with a random SNI from the pool. Strategies
+                // that carry no decoy (`hello_split`) skip this and rely on
+                // segmenting the real hello below.
                 let sni = pick_sni(snis).unwrap_or_else(|| "example.com".to_string());
                 let hello = build_fake_client_hello(sni.as_bytes(), profile);
                 // FIX P2: empty hello (SNI too long) must not emit a bare ACK;
@@ -534,13 +640,13 @@ fn dispatch_tcp_packet(
                     tracing::debug!("empty fake hello (SNI too long), forwarding");
                     Next::Forward
                 } else {
-                    let segs = plan_fake(m, syn, &hello, params, Some(key.2.as_str()));
-                    // FIX(#6): tell the worker which actual method the DPI committed
-                    // to. When config is "auto", the DPI resolved it to `m` (a real
-                    // method). Stats will rank this real method, not "auto".
+                    let segs = plan_fake(strategy.decoy, syn, &hello, params);
+                    // FIX(#6): tell the worker which strategy the DPI committed
+                    // to. Stats rank the strategy that went on the wire, not
+                    // the useless "auto" config string.
                     {
                         let conn: ConnId = (key.0.clone(), key.1, key.2.clone(), key.3);
-                        worker.record_resolved_method(&conn, m.as_str());
+                        worker.record_resolved_strategy(&conn, &strategy.board_key());
                     }
                     let ident = u16::from_be_bytes([raw[4], raw[5]]);
                     let ttl = raw[8];
@@ -574,110 +680,90 @@ fn dispatch_tcp_packet(
                         }
                     }
                     if built.is_empty() {
-                        // Hardening: every segment failed to build (malformed
-                        // template/packet). Forwarding without ANY fake means
-                        // the bypass is off for this connection — say so.
-                        tracing::warn!(
-                        "fake burst build failed for key={:?} (forwarding original, bypass off)",
-                        key
-                    );
+                        if !strategy.decoy.plan_decoy() {
+                            // hello_split deliberately sends no decoy burst; the
+                            // real hello gets segmented on the next packet.
+                            tracing::debug!(
+                                "no decoy for strategy={} (real-hello split will follow)",
+                                strategy.board_key()
+                            );
+                        } else {
+                            // Hardening: every segment failed to build (malformed
+                            // template/packet). Forwarding without ANY fake means
+                            // the bypass is off for this connection — say so.
+                            tracing::warn!(
+                                "fake burst build failed for key={:?} (forwarding original, bypass off)",
+                                key
+                            );
+                        }
                         Next::Forward
                     } else {
-                        // FIX P1: retain retry context so delayed_retry can emit
-                        // its split_seq second burst after 1.5s (previously the
-                        // planner existed but was never called -> == wrong_seq).
-                        let retry = if m == BypassMethod::DelayedRetry {
-                            Some(RetryCtx {
-                                syn,
-                                hello: hello.clone(),
-                                ident_base: ident,
-                                ttl,
-                                template: raw.to_vec(),
-                            })
-                        } else {
-                            None
-                        };
-                        Next::FakeBurst(built, retry)
+                        Next::FakeBurst(built, strategy.split_real)
                     }
                 }
             }
         };
         match next {
             Next::Forward => reinject(),
-            Next::FakeBurst(blobs, retry) => {
-                // FIX 4: honor cfg.fake_delay (Python sleeps fake_delay secs
-                // before sending fake segments); blocking capture thread so
-                // std::thread::sleep is correct. No sleep when 0.0.
-                if fake_delay > 0.0 {
-                    std::thread::sleep(std::time::Duration::from_secs_f64(
-                        fake_delay.clamp(0.0, 5.0),
-                    ));
-                }
-                // FIX(diag): fake burst size/method visibility.
-                // FIX(perf): demoted to debug to avoid per-handshake info spam.
-                tracing::debug!(
-                    "DPI: sending {} fake segment(s) method={}",
-                    blobs.len(),
-                    method.as_str()
-                );
+            Next::Split(blobs) => {
+                // The original is NOT reinjected: these segments are it, same
+                // bytes, same sequence space, just in more packets.
                 for b in &blobs {
                     let fp = pkt.with_raw(b.clone());
                     if let Err(e) = handle.send(&fp) {
                         throttled_error(
                             &FAKE_SEND_THROTTLE,
-                            "fake send",
-                            format!("fake send failed: {}", e),
+                            "split send",
+                            format!("hello split send failed: {}", e),
                         );
+                        // A segment failed: send the intact original so the
+                        // handshake still completes. Re-transmitting bytes the
+                        // server already has is harmless (in-window overlap is
+                        // dropped), whereas a missing tail hangs the client.
+                        reinject();
+                        return;
                     }
                 }
-                // FIX P1: delayed_retry second burst (split_seq after 1.5s).
-                // Off the capture thread so other connections don't stall.
-                if let Some(ctx) = retry {
-                    let h2 = handle.clone();
-                    let pkt2 = pkt.clone();
-                    let dpi2 = Arc::clone(dpi);
-                    let key2 = key.clone();
-                    let params2 = *params;
-                    // Hardening: spawn failure degrades delayed_retry to
-                    // wrong_seq silently — say so (rare, resource exhaustion).
-                    if let Err(e) = std::thread::Builder::new()
-                        .name("delayed-retry".into())
-                        .spawn(move || {
-                            std::thread::sleep(std::time::Duration::from_millis(1500));
-                            let still_monitored = {
-                                let map = dpi2.lock();
-                                matches!(map.get(&key2), Some(st) if st.fake_sent && st.monitor)
-                            };
-                            if !still_monitored {
-                                return;
-                            }
-                            let segs = plan_delayed_retry_second(ctx.syn, &ctx.hello, true);
-                            for s in &segs {
-                                if let Some(bytes) = build_fake_tcp(
-                                    &ctx.template,
-                                    s.seq,
-                                    &s.payload,
-                                    s.psh,
-                                    ctx.ident_base.wrapping_add(s.ident_plus).wrapping_add(10),
-                                    None,
-                                ) {
-                                    let fp = pkt2.with_raw(bytes);
-                                    if let Err(e) = h2.send(&fp) {
-                                        throttled_error(
-                                            &FAKE_SEND_THROTTLE,
-                                            "fake send",
-                                            format!("delayed retry send failed: {}", e),
-                                        );
-                                    }
-                                }
-                            }
-                            let _ = (params2, ctx.ttl);
-                        })
-                    {
-                        tracing::warn!(
-                            "delayed-retry thread spawn failed: {} (degraded to wrong_seq)",
-                            e
-                        );
+                std::thread::yield_now();
+            }
+            Next::FakeBurst(blobs, split_real) => {
+                // FIX(diag): fake burst size/method visibility.
+                // FIX(perf): demoted to debug to avoid per-handshake info spam.
+                tracing::debug!(
+                    "DPI: sending {} fake segment(s) method={} split_real={}",
+                    blobs.len(),
+                    method.as_str(),
+                    split_real
+                );
+                // v3: FAKE_DELAY is served by the feeder thread, never by a
+                // sleep here — a stall on the capture thread held every other
+                // connection's packets, which is what made a working config
+                // feel like a 900 ms one.
+                let mut send_now = fake_delay <= 0.0;
+                if !send_now {
+                    let packets: Vec<Packet> =
+                        blobs.iter().map(|b| pkt.with_raw(b.clone())).collect();
+                    let burst = DelayedBurst {
+                        at: std::time::Instant::now()
+                            + Duration::from_secs_f64(fake_delay.clamp(0.0, 5.0)),
+                        packets,
+                    };
+                    // Queue full or shutting down: losing the delay is better
+                    // than losing the decoy, so send it now instead.
+                    if delay_tx.try_send(burst).is_err() {
+                        send_now = true;
+                    }
+                }
+                if send_now {
+                    for b in &blobs {
+                        let fp = pkt.with_raw(b.clone());
+                        if let Err(e) = handle.send(&fp) {
+                            throttled_error(
+                                &FAKE_SEND_THROTTLE,
+                                "fake send",
+                                format!("fake send failed: {}", e),
+                            );
+                        }
                     }
                 }
                 reinject(); // original follows the fakes (wrong_seq primitive)
@@ -701,23 +787,37 @@ fn dispatch_tcp_packet(
             Forward,
             Succeed,
             Fail,
+            /// The interceptor answered in plaintext. Same wake-up as `Fail`,
+            /// plus the flag the relay verdict reads, because by then the
+            /// `ConnEntry` this thread could signal is already evicted.
+            Intercept,
         }
         let next = {
             let mut map = dpi.lock();
-            // FIX(#7): ask the Worker for the sticky method when config is
-            // "auto". For a concrete config this returns the same method
+            // FIX(#7): ask the Worker for the sticky strategy when config is
+            // "auto". For a concrete config this returns the same strategy
             // every time, so behaviour is unchanged.
-            let conn_method = worker.resolve_method_for_connection(method);
+            let conn_strategy = worker.resolve_strategy_for_connection(method);
             let st = map
                 .entry(key.clone())
-                .or_insert_with(|| HandshakeState::new(conn_method));
-            match st.on_inbound(info) {
+                .or_insert_with(|| HandshakeState::new(conn_strategy));
+            // The payload is what separates "a TLS endpoint answered" from
+            // "the interceptor served its kill page on 443"; TcpInfo alone
+            // cannot, and scoring the kill page as a success kept dead
+            // strategies in the pool.
+            let inbound_payload = tcp_payload(raw).unwrap_or(&[]);
+            match st.on_inbound(info, inbound_payload) {
                 InboundAction::Reinject => NextIn::Forward,
                 InboundAction::Success => {
                     // FIX(diag): visible success path (pure ACK vs ServerHello payload).
                     tracing::info!("DPI: inbound SUCCESS key={:?}", key);
                     map.remove(&key);
                     NextIn::Succeed
+                }
+                InboundAction::Intercept(msg) => {
+                    tracing::info!("DPI: inbound INTERCEPT key={:?}: {}", key, msg);
+                    map.remove(&key);
+                    NextIn::Intercept
                 }
                 InboundAction::Unexpected(msg) => {
                     if st.fake_sent {
@@ -768,6 +868,17 @@ fn dispatch_tcp_packet(
                     w.complete_handshake(&conn, true).await;
                 });
             }
+            NextIn::Intercept => {
+                let conn: ConnId = (key.0.clone(), key.1, key.2.clone(), key.3);
+                // Marking is a sync parking_lot insert, safe on the capture
+                // thread; only the handshake wake-up needs the runtime.
+                worker.mark_intercepted(&conn);
+                let w = Arc::clone(worker);
+                rt.spawn(async move {
+                    w.complete_handshake(&conn, false).await;
+                });
+                reinject();
+            }
             NextIn::Fail => {
                 let conn: ConnId = (key.0.clone(), key.1, key.2.clone(), key.3);
                 // FIX(perf): spawn instead of block_on — the capture thread
@@ -784,41 +895,70 @@ fn dispatch_tcp_packet(
 
 #[cfg(test)]
 mod throttle_tests {
-    use super::{throttled_error, ErrThrottle, FAKE_SEND_THROTTLE, REINJECT_THROTTLE};
+    use super::{note_error, ErrThrottle};
     use parking_lot::Mutex as ParkMutex;
+    use std::time::{Duration, Instant};
 
-    // NOTE: each test uses its OWN static: test threads in one binary run
-    // in parallel, so sharing one throttle would race.
-    fn reset(throttle: &ParkMutex<ErrThrottle>) {
-        let mut t = throttle.lock();
-        t.last = None;
-        t.dropped = 0;
+    // A local throttle plus a handed-in clock: the old version slept 1.1 s and
+    // asserted against wall time, which failed whenever a loaded machine
+    // stretched the gap between the two calls past the 1 s window.
+    fn fresh() -> ParkMutex<ErrThrottle> {
+        ParkMutex::new(ErrThrottle {
+            last: None,
+            dropped: 0,
+        })
+    }
+
+    #[test]
+    fn first_error_arms_the_window_and_suppresses_nothing() {
+        let th = fresh();
+        let t0 = Instant::now();
+        note_error(&th, "reinject", "one".to_string(), t0);
+        let g = th.lock();
+        assert_eq!(g.dropped, 0);
+        assert_eq!(g.last, Some(t0));
     }
 
     #[test]
     fn second_error_inside_window_is_counted() {
-        reset(&REINJECT_THROTTLE);
-        throttled_error(&REINJECT_THROTTLE, "reinject", "one".to_string());
-        throttled_error(&REINJECT_THROTTLE, "reinject", "two".to_string());
-        {
-            let t = REINJECT_THROTTLE.lock();
-            assert_eq!(t.dropped, 1);
-            assert!(t.last.is_some());
-        }
-        reset(&REINJECT_THROTTLE);
+        let th = fresh();
+        let t0 = Instant::now();
+        note_error(&th, "reinject", "one".to_string(), t0);
+        note_error(
+            &th,
+            "reinject",
+            "two".to_string(),
+            t0 + Duration::from_millis(900),
+        );
+        let g = th.lock();
+        assert_eq!(g.dropped, 1);
+        // The suppressed error must not move the window start.
+        assert_eq!(g.last, Some(t0));
     }
 
     #[test]
     fn window_elapse_resets_drop_counter() {
-        reset(&FAKE_SEND_THROTTLE);
-        throttled_error(&FAKE_SEND_THROTTLE, "fake send", "one".to_string());
-        throttled_error(&FAKE_SEND_THROTTLE, "fake send", "two".to_string());
-        std::thread::sleep(std::time::Duration::from_millis(1100));
-        throttled_error(&FAKE_SEND_THROTTLE, "fake send", "three".to_string());
-        {
-            let t = FAKE_SEND_THROTTLE.lock();
-            assert_eq!(t.dropped, 0);
+        let th = fresh();
+        let t0 = Instant::now();
+        note_error(&th, "fake send", "one".to_string(), t0);
+        for i in 0..5 {
+            note_error(
+                &th,
+                "fake send",
+                format!("suppressed {}", i),
+                t0 + Duration::from_millis(100 + i * 100),
+            );
         }
-        reset(&FAKE_SEND_THROTTLE);
+        assert_eq!(th.lock().dropped, 5);
+        // Past the window the next error prints and the counter is cleared.
+        note_error(
+            &th,
+            "fake send",
+            "three".to_string(),
+            t0 + Duration::from_millis(1100),
+        );
+        let g = th.lock();
+        assert_eq!(g.dropped, 0);
+        assert_eq!(g.last, Some(t0 + Duration::from_millis(1100)));
     }
 }

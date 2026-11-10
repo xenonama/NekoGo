@@ -8,11 +8,16 @@ package main
 // a closed port. No internet, no Cloudflare, no admin needed.
 
 import (
+	"bytes"
+	"context"
+	"crypto/tls"
 	"crypto/x509"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
+	"time"
 )
 
 func scanTestApp(t *testing.T) *App {
@@ -175,5 +180,90 @@ func TestCancelSNIScanKeepsTheScanRunning(t *testing.T) {
 	}
 	if _, err := a.ScanSNIPairs([]string{"127.0.0.1"}, []string{"example.com"}); err == nil {
 		t.Fatal("second scan accepted while the first still drains")
+	}
+}
+
+// The scan's handshake must really go out split, and the split must be
+// lossless — otherwise the scanner would be measuring something the engine
+// never sends. This captures a real Go ClientHello on its way to a local TLS
+// server and asserts on the pieces it was cut into.
+func TestSplitHelloConnCutsARealClientHello(t *testing.T) {
+	ts := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	defer ts.Close()
+	withLocalTLS(t, ts)
+
+	raw, err := net.Dial("tcp", ts.Listener.Addr().String())
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer raw.Close()
+	sc := &splitHelloConn{Conn: raw}
+	pool := x509.NewCertPool()
+	pool.AddCert(ts.Certificate())
+	conn := tls.Client(sc, &tls.Config{ServerName: "example.com", RootCAs: pool, MinVersion: tls.VersionTLS12})
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := conn.HandshakeContext(ctx); err != nil {
+		t.Fatalf("handshake through the splitter: %v", err)
+	}
+	_ = conn.Close()
+
+	if sc.hello == nil {
+		t.Fatal("no ClientHello was captured")
+	}
+	pieces := splitClientHello(sc.hello)
+	if len(pieces) < 2 {
+		t.Fatalf("the hello went out as %d piece(s), want it split", len(pieces))
+	}
+	var joined []byte
+	for _, p := range pieces {
+		joined = append(joined, p...)
+	}
+	if !bytes.Equal(joined, sc.hello) {
+		t.Fatal("the pieces do not reassemble into the original hello")
+	}
+	off, n, ok := sniHostSpan(sc.hello)
+	if !ok {
+		t.Fatal("the captured hello has no SNI extension")
+	}
+	host := string(sc.hello[off : off+n])
+	if host != "example.com" {
+		t.Fatalf("captured SNI = %q, want example.com", host)
+	}
+	for _, label := range strings.Split(host, ".") {
+		if len(label) < minSplitLabel {
+			continue
+		}
+		for i, p := range pieces {
+			if bytes.Contains(p, []byte(label)) {
+				t.Fatalf("piece %d still holds the whole label %q", i, label)
+			}
+		}
+	}
+}
+
+// Nothing that is not a ClientHello may be touched: application data and
+// every write after the hello go through as one piece.
+func TestSplitClientHelloOnlyCutsTheHello(t *testing.T) {
+	appData := []byte{0x17, 0x03, 0x03, 0x00, 0x04, 1, 2, 3, 4}
+	if isTLSClientHello(appData) {
+		t.Fatal("application data classified as a ClientHello")
+	}
+	if got := splitClientHello(appData); len(got) != 1 || !bytes.Equal(got[0], appData) {
+		t.Fatalf("application data was altered: %v", got)
+	}
+	// A hello with no SNI extension has nothing to hide and stays whole.
+	noSNI := make([]byte, 80)
+	noSNI[0], noSNI[1], noSNI[5] = 0x16, 0x03, 0x01
+	for i := range noSNI {
+		if i > 5 {
+			noSNI[i] = 0xAB
+		}
+	}
+	if _, _, ok := sniHostSpan(noSNI); ok {
+		t.Fatal("found an SNI extension in filler bytes")
+	}
+	if got := splitClientHello(noSNI); len(got) != 1 {
+		t.Fatalf("a hello with no hostname was split into %d pieces", len(got))
 	}
 }

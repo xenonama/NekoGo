@@ -2,12 +2,19 @@
 //!
 //! CLI surface (exact, no other flags):
 //!   sni-spoof.exe version        -> version on stdout, exit 0
-//!   sni-spoof.exe run -c <file>  -> load config, start engine, stdout logs, run until signal
+//!   sni-spoof.exe run -c <file>  -> load config, start engine, stdout logs, run until stopped
+//!                                 (a `stop` line on stdin, or an OS signal)
+//!   sni-spoof.exe probe --host=<sni> [--ip=<ipv4>] [--port=443]
+//!                                 [--vector=whole,split,split_paced,lead5] [--reps=5]
+//!                                 [--profile=legacy|chrome|firefox] [--delay=20] [--timeout=3000]
+//!                                -> [PROBE]/[SUMMARY] JSON lines, exit 0 if a shape traversed
 //!   sni-spoof.exe help           -> usage on stdout, exit 0
 //!
 //! Logging: plain text to stdout, `[INFO]/[WARN]/[ERROR]/[STATS]` prefixes.
 //! Stats: `[STATS] {snapshot JSON}` every 5s from the shared `Stats`.
-//! Shutdown: SIGINT/SIGTERM (Windows: Ctrl+C/Close/Shutdown/Break) -> `EngineHandle::shutdown`.
+//! Shutdown: the host's `stop` line on stdin (the channel a Windows Go
+//! parent actually has), or SIGINT/SIGTERM (Windows: Ctrl+C/Close/Shutdown/
+//! Break for a human at a terminal) -> `EngineHandle::shutdown`.
 //!
 //! FIX(nested-runtime): this binary owns NO async runtime on purpose.
 //! EngineHandle::start builds + block_ons its own runtime internally, so an
@@ -23,6 +30,8 @@ use std::sync::{
     Arc,
 };
 use std::time::Duration;
+
+mod probe;
 
 // ---------------------------------------------------------------------------
 // tracing -> stdout layer (stable prefixes for the host line reader)
@@ -106,20 +115,28 @@ fn out_line(tag: &str, msg: &str) {
     let _ = out.flush();
 }
 
+const USAGE: &[&str] = &[
+    "usage:",
+    "  sni-spoof.exe version",
+    "  sni-spoof.exe run -c <config.json>",
+    "  sni-spoof.exe probe --host=<sni> [--ip=<public ipv4>] [--port=443]",
+    "                      [--vector=whole,split,split_paced,lead5] [--reps=5]",
+    "                      [--profile=legacy|chrome|firefox] [--delay=20] [--timeout=3000]",
+    "  sni-spoof.exe help",
+];
+
 fn usage_stdout() {
     let mut out = std::io::stdout().lock();
-    let _ = writeln!(out, "usage:");
-    let _ = writeln!(out, "  sni-spoof.exe version");
-    let _ = writeln!(out, "  sni-spoof.exe run -c <config.json>");
-    let _ = writeln!(out, "  sni-spoof.exe help");
+    for line in USAGE {
+        let _ = writeln!(out, "{line}");
+    }
     let _ = out.flush();
 }
 
 fn usage_stderr() {
-    eprintln!("usage:");
-    eprintln!("  sni-spoof.exe version");
-    eprintln!("  sni-spoof.exe run -c <config.json>");
-    eprintln!("  sni-spoof.exe help");
+    for line in USAGE {
+        eprintln!("{line}");
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -131,6 +148,40 @@ fn usage_stderr() {
 /// Process-wide stop flag. Set by the OS signal/console handler, polled by
 /// `run()` and the stats thread. Plain static: one run per process.
 static STOP: AtomicBool = AtomicBool::new(false);
+
+/// The one word the host may write on our stdin to ask for a clean exit.
+/// Case- and whitespace-insensitive; anything else is ignored, because a
+/// stray byte must not tear down a working tunnel.
+fn is_stop_request(line: &str) -> bool {
+    line.trim().eq_ignore_ascii_case("stop")
+}
+
+/// Read the stop request off stdin on its own thread.
+///
+/// This exists because NekoGo cannot signal us: Go's `os.Process.signal` on
+/// Windows answers EWINDOWS for every signal except Kill, so the console
+/// handler below only ever fires for a human at a terminal, and a parent
+/// `proc.Kill()` was the only stop the engine ever saw — with
+/// `EngineHandle::shutdown` and the "[WARN] engine stopped" line never
+/// running. EOF and read errors are ignored on purpose: an unclaimed stdin
+/// must never look like a shutdown order.
+fn spawn_stop_listener() {
+    let _ = std::thread::Builder::new()
+        .name("stop-listener".into())
+        .spawn(|| {
+            for line in std::io::stdin().lines() {
+                match line {
+                    Ok(l) => {
+                        if is_stop_request(&l) {
+                            STOP.store(true, Ordering::Relaxed);
+                            return;
+                        }
+                    }
+                    Err(_) => return,
+                }
+            }
+        });
+}
 
 /// Returns true when at least one shutdown path is armed. A false return
 /// means signals would be missed entirely (flag never flips, run() parks
@@ -220,6 +271,20 @@ fn main() {
         [cmd, flag, file] if cmd == "run" && flag == "-c" && !file.trim().is_empty() => {
             run(file);
         }
+        // Driverless measurement: no config, no driver, no Admin. The exit
+        // code is the answer (0 = a shape traversed), the [SUMMARY] lines are
+        // the detail.
+        [cmd, tail @ ..] if cmd == "probe" => {
+            let code = match probe::parse_args(tail) {
+                Ok(args) => probe::run(&args),
+                Err(e) => {
+                    eprintln!("probe: {e}");
+                    usage_stderr();
+                    2
+                }
+            };
+            std::process::exit(code);
+        }
         _ => {
             usage_stderr();
             std::process::exit(2);
@@ -256,6 +321,9 @@ fn run(config_path: &str) {
         }
     };
     out_line("[INFO]", "engine RUNNING");
+    // Armed only after the engine is live, so a stdin that is already at EOF
+    // when the process is exec'd can never cut a startup short.
+    spawn_stop_listener();
 
     // Stats line for the host (no RPC): `[STATS] {...}` every 5s.
     // Sleeps in 100ms slices so shutdown stays snappy (<100ms late).
@@ -300,4 +368,23 @@ fn run(config_path: &str) {
     let _ = ticker.join();
     handle.shutdown();
     out_line("[WARN]", "engine stopped");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_stop_request;
+
+    #[test]
+    fn stop_request_accepts_the_hosts_word_only() {
+        // The host writes exactly "stop\n"; CRLF from a Windows pipe and any
+        // casing still count as the order.
+        for ok in ["stop", "stop\n", "stop\r\n", "  STOP  ", "Stop"] {
+            assert!(is_stop_request(ok), "{ok:?} must be a stop request");
+        }
+        // Anything else must not tear down a working tunnel — a blank line,
+        // and words that merely contain the order.
+        for no in ["", "\n", "stats", "stopp", "stop it", "unstop"] {
+            assert!(!is_stop_request(no), "{no:?} must not be a stop request");
+        }
+    }
 }

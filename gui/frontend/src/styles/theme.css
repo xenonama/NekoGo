@@ -219,6 +219,7 @@ button,
 .nb-qa .ico { width: 40px; height: 40px; border-radius: 12px; display: flex; align-items: center; justify-content: center; }
 .nb-qa .t { font-weight: 600; font-size: 13.5px; }
 .nb-qa .s { color: var(--muted); font-size: 12px; }
+.nb-qa .s.err { color: var(--danger); }
 .ico-blue { background: var(--qa-blue-bg); color: var(--qa-blue-fg); }
 .ico-green { background: var(--qa-green-bg); color: var(--qa-green-fg); }
 .ico-purple { background: var(--qa-purple-bg); color: var(--qa-purple-fg); }
@@ -673,6 +674,9 @@ input.nb-field:not([type="checkbox"]):not([type="radio"]):focus {
   border-bottom: 1px solid var(--border);
   border-left: 3px solid transparent;
   transition: background 120ms ease, border-color 120ms ease;
+  /* A row is a selectable list item: click/double-click must never
+     highlight its name as text (that made the click feel broken). */
+  user-select: none; -webkit-user-select: none;
 }
 .nb-px-row:hover { background: var(--hover); }
 .nb-px-row:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
@@ -687,7 +691,7 @@ input.nb-field:not([type="checkbox"]):not([type="radio"]):focus {
    the row itself keeps full contrast (no dimming). */
 /* The open row menu must paint above neighboring rows. */
 .nb-px-row.is-menu-open { position: relative; z-index: 50; }
-.nb-px-row .nb-px-name, .nb-px-row .nb-px-sub { user-select: text; -webkit-user-select: text; }
+.nb-px-row .nb-px-name, .nb-px-row .nb-px-sub { user-select: none; -webkit-user-select: none; }
 .nb-px-remarks { display: flex; align-items: center; gap: 6px; min-width: 0; }
 .nb-px-remarks .nb-px-name {
   font-size: 13px; font-weight: 600; min-width: 0;
@@ -805,7 +809,7 @@ input.nb-field:not([type="checkbox"]):not([type="radio"]):focus {
   display: flex; align-items: center; justify-content: center;
   color: var(--chip-fg);
 }
-.stg-head-text { display: flex; flex-direction: column; }
+.stg-head-text { display: flex; flex-direction: column; flex: 1; min-width: 0; }
 .stg-head-title { font-size: 16px; font-weight: 600; color: var(--fg); }
 .stg-head-sub { font-size: 12px; color: var(--muted); }
 .stg-row {
@@ -1013,6 +1017,34 @@ input.nb-field:not([type="checkbox"]):not([type="radio"]):focus {
 .nb-insp-top:hover .nb-px-name { color: var(--accent); }
 .nb-insp-meta { font-size: 12px; color: var(--muted); padding: 4px 0 4px 2px; }
 
+/* ---------- Advanced tails: one card grammar ---------- */
+/* Group label for the Advanced-only sections. Replaces the old
+   header-only cards, which held no controls, repeated the title of the
+   card under them and cost ~90px of empty card each. */
+.nb-adv-div {
+  display: flex; align-items: center; gap: 10px;
+  margin: 4px 2px -8px; padding: 0;
+  color: var(--muted); font-size: 12px; font-weight: 700;
+  letter-spacing: 0.06em; text-transform: uppercase;
+}
+.nb-adv-div::after { content: ''; flex: 1; height: 1px; background: var(--border); }
+/* One-line stand-in for a tool group that cannot run yet. */
+.nb-adv-note {
+  display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+  margin: -4px 2px 0; font-size: 13px; color: var(--muted);
+}
+/* Where a card has nothing to show until a profile is picked. */
+.nb-adv-blank {
+  display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+  padding: 12px 14px; border: 1px dashed var(--border); border-radius: 12px;
+}
+/* Toolbars inside an advanced card: the card already pads, so the old
+   inline "0 0 8px" hack becomes a rule. */
+.stg-card .toolbar { padding: 0 0 12px; flex-wrap: wrap; }
+.stg-card .toolbar--tail { padding: 12px 0 0; }
+/* Two controls sharing one row's control track (selector + action). */
+.stg-ctl--pair { gap: 8px; }
+
 /* ---------- Proxies tab polish (sticky header/footer, overflow menu) ---------- */
 .nb-px-sep-v { width: 1px; align-self: stretch; background: var(--border); margin: 2px 0; }
 .nb-px-msg { margin-bottom: 8px; }
@@ -1028,12 +1060,20 @@ input.nb-field:not([type="checkbox"]):not([type="radio"]):focus {
 }
 .nb-px-group:hover { background: var(--row-hover); }
 .nb-px-group:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+/* While a search or a filter narrows the list, folding is bypassed so no
+   match hides behind a closed group — the header then shows no fold control
+   instead of one whose click has no effect. */
+.nb-px-group--static, .nb-px-group--static:hover { cursor: default; background: transparent; }
 .nb-px-chev { color: var(--muted); width: 14px; }
+.nb-px-chev--off { opacity: 0; }
 .nb-px-group-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .nb-px-pill {
   font-size: 11px; font-weight: 600; color: var(--muted);
   background: var(--accent-soft); border-radius: 9999px; padding: 1px 9px;
 }
+/* Empty user-created group: remove action pushed to the header's right. */
+.nb-px-group-x { margin-left: auto; width: 24px; height: 24px; min-height: 24px; color: var(--muted); }
+.nb-px-group-x:hover:not(:disabled) { color: var(--danger); }
 .nb-active-pill {
   font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.05em;
   color: var(--accent2); border: 1px solid var(--accent2);
@@ -1214,6 +1254,11 @@ input.nb-field:not([type="checkbox"]):not([type="radio"]):focus {
 .sni-list .stg-row:hover { background: var(--hover); }
 .sni-list .stg-row.checked { background: var(--accent-soft); }
 .sni-list .stg-row.primary { box-shadow: inset 3px 0 0 var(--accent2); }
+/* Read-only card (Plan A's derived IPs): no checkbox track to reserve,
+   and a row that cannot be toggled must not look clickable. The hover
+   must not flash the neutral tint over the "this row is live" accent. */
+.sni-list .stg-row--ro { grid-template-columns: minmax(0, 1fr) 140px; cursor: default; }
+.sni-list .stg-row--ro:hover { background: var(--accent-soft); }
 .sni-list .stg-ctl { gap: 6px; }
 .sni-star svg polygon { fill: none; }
 .sni-star:hover:not(:disabled) svg polygon { fill: currentColor; }
@@ -1271,12 +1316,13 @@ input.nb-field:not([type="checkbox"]):not([type="radio"]):focus {
 }
 .sni-method {
   display: grid;
-  grid-template-columns: minmax(90px, 160px) minmax(60px, 1fr) 56px auto;
+  grid-template-columns: minmax(90px, 160px) minmax(60px, 1fr) 56px 54px auto;
   align-items: center; gap: 10px; padding: 6px 0;
 }
 .sni-method + .sni-method { border-top: 1px solid var(--row-sep); }
 .sni-method-name { font-size: 12px; overflow: hidden; text-overflow: ellipsis; }
 .sni-method-rate { font-size: 12px; font-weight: 600; text-align: right; }
+.sni-method-lat { font-size: 12px; color: var(--muted); text-align: right; white-space: nowrap; }
 .sni-method-counts { font-size: 12px; color: var(--muted); white-space: nowrap; }
 .sni-log {
   font-family: Consolas, "Cascadia Mono", monospace; font-size: 12px;

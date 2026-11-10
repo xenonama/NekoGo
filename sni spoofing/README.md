@@ -9,22 +9,31 @@ with a modern React + Tailwind GUI running on Wails v3.
 ## About
 
 The project relays TCP traffic to remote endpoints while spoofing the
-SNI field in the TLS handshake. Nine different bypass methods are
-supported, from simple wrong-sequence injection to advanced
-split/fragmented/host-fake techniques. The GUI provides live metrics,
-a console with filtering, and Smart Tools for probing endpoints and SNIs.
+SNI field in the TLS handshake.
+
+Since v3 the engine does not pick a single "method" any more. It
+composes two independent ideas per connection — which *decoy* ClientHello
+is injected, and whether the client's *real* ClientHello is cut into
+sub-label TCP segments — and lets a latency-aware scoreboard rank the
+resulting 15 strategies and keep the best one. The GUI provides live
+metrics, a console with filtering, and Smart Tools for probing endpoints
+and SNIs.
 
 Original project (Python): [patterniha/SNI-Spoofing](https://github.com/patterniha/SNI-Spoofing)
 
 ## Features
 
-- Nine DPI bypass methods: `wrong_seq`, `wrong_seq_ttl`, `split_seq`,
-  `fragmented`, `padding`, `delayed_retry`, `double_sni`, `hostfakesplit`,
+- 8 bypass primitives plus `auto`: `wrong_seq`, `wrong_seq_ttl`,
+  `split_seq`, `fragmented`, `padding`, `hello_split`, `hostfakesplit`,
   `fakedsplit`
-- Automatic rotation (`auto` mode) — one method per connection
-- TLS fingerprint profiles: legacy, Chrome 120/124, Firefox 122/124
+- `auto` = a 15-strategy pool (decoy shape x real-ClientHello splitting)
+  ranked by recent success **and** measured connect latency; sticky once a
+  strategy wins, rotated on 3 failures or when it turns out slow (>800 ms)
+- TLS fingerprint profiles: `legacy`, `chrome`, `firefox` — three
+  genuinely different hellos; the old versioned spellings still load
 - QUIC handling: `block`, `spoof`, `passthrough`
-- Live metrics: active / total / OK / fail, per-session traffic
+- Live metrics: active / total / OK / fail, per-session traffic, per-method
+  and per-endpoint latency
 - Console with level filter, search, auto-scroll, export
 - Smart Tools: rank endpoints, rank SNIs, pick fastest
 - Config editor with atomic save

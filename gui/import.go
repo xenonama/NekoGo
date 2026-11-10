@@ -349,6 +349,21 @@ func parseSS(link string) (*Profile, error) {
 		name = rest[i+1:]
 		rest = rest[:i]
 	}
+	// A query is not part of the endpoint: generators emit a bare
+	// "…@host:443?#name" as often as "?plugin=…", and leaving the "?" glued
+	// to the port failed the import. Base64 never carries a "?", so this
+	// cannot truncate the 2019 whole-link form.
+	if i := strings.IndexByte(rest, '?'); i >= 0 {
+		query := rest[i+1:]
+		rest = rest[:i]
+		// NekoGo has no SIP003 plugin support, and dropping the option
+		// silently would hand the user a profile that never connects.
+		if v, err := url.ParseQuery(query); err == nil {
+			if _, ok := queryLower(v)["plugin"]; ok {
+				return nil, fmt.Errorf("ss: plugin options are not supported (%s)", query)
+			}
+		}
+	}
 	var method, password, hostport string
 	if i := strings.LastIndex(rest, "@"); i >= 0 {
 		userinfo, hp := rest[:i], rest[i+1:]

@@ -78,13 +78,13 @@ func TestTrafficTotalsNeverDecrease(t *testing.T) {
 // cumulative total instead of shrinking it.
 func TestTrafficTotalsKeepVanishedTags(t *testing.T) {
 	var tt trafficTotals
-	up, _, upByTag, _ := tt.observe(map[string]int64{"proxy": 50 * mb}, nil)
+	up, _, _, _ := tt.observe(map[string]int64{"proxy": 50 * mb}, nil)
 	if up != 50*mb {
 		t.Fatalf("first read = %d, want %d", up, 50*mb)
 	}
 	// The "proxy" tag is gone from the reading (all its connections
 	// closed and were evicted).
-	up, _, upByTag, _ = tt.observe(map[string]int64{}, nil)
+	up, _, upByTag, _ := tt.observe(map[string]int64{}, nil)
 	if up != 50*mb {
 		t.Fatalf("total after the tag vanished = %d, want %d", up, 50*mb)
 	}

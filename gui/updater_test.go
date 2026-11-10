@@ -10,6 +10,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 )
 
@@ -41,7 +42,7 @@ func newUpdaterTestApp(t *testing.T) *App {
 	return NewApp(store, make(chan LogEntry, 64))
 }
 
-// TestListUpdatablesNoFiles — no DBs, no cores, no externals: 6 rows,
+// TestListUpdatablesNoFiles — no DBs, no cores, no externals: 7 rows,
 // empty Current, no panic, no network.
 func TestListUpdatablesNoFiles(t *testing.T) {
 	a := newUpdaterTestApp(t)
@@ -49,10 +50,10 @@ func TestListUpdatablesNoFiles(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ListUpdatables: %v", err)
 	}
-	if len(rows) != 6 {
-		t.Fatalf("got %d rows, want 6", len(rows))
+	if len(rows) != 7 {
+		t.Fatalf("got %d rows, want 7", len(rows))
 	}
-	want := map[string]bool{"geoip": true, "geosite": true, "singbox": true, "nekobox": true, "xray": true, "gui": true}
+	want := map[string]bool{"geoip": true, "geosite": true, "singbox": true, "nekobox": true, "xray": true, "mihomo": true, "gui": true}
 	for _, r := range rows {
 		if !want[r.ID] {
 			t.Fatalf("unexpected component %q", r.ID)
@@ -88,7 +89,7 @@ func TestUpdateComponentBlockedWhenCoreRunning(t *testing.T) {
 		a.cores.running = false
 		a.cores.mu.Unlock()
 	}()
-	for _, id := range []string{"singbox", "nekobox", "xray"} {
+	for _, id := range []string{"singbox", "nekobox", "xray", "mihomo"} {
 		if _, err := a.UpdateComponent(id); err == nil {
 			t.Fatalf("UpdateComponent(%q) succeeded with a running core", id)
 		} else if !strings.Contains(err.Error(), "disconnect") {
@@ -830,5 +831,461 @@ func TestGeoIPUpdateTargetsTheLiveCopy(t *testing.T) {
 	}
 	if got := app.geoipDest("GeoLite2-Country.mmdb"); samePath(got, db) {
 		t.Fatalf("override path was written: %q", got)
+	}
+}
+
+// --- mihomo (MetaCubeX) row ---
+
+// mihomoAssetName mirrors the archive build.bat fetches: the GOAMD64=v1
+// baseline build on amd64, the plain arch build elsewhere.
+func mihomoAssetName(tag string) string {
+	level := ""
+	if runtime.GOARCH == "amd64" {
+		level = "-v1"
+	}
+	return "mihomo-windows-" + runtime.GOARCH + level + "-v" + normTag(tag) + ".zip"
+}
+
+func setMihomoPath(t *testing.T, a *App, p string) {
+	t.Helper()
+	s := a.store.GetSettings()
+	s.MihomoPath = p
+	if err := a.store.SaveSettings(s); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// fakeMihomoServer serves MetaCubeX's stable release at /releases/latest
+// and the rolling "Prerelease-Alpha" at /releases, so a check that reads
+// the wrong endpoint reports the alpha and fails. digests carries the
+// published sha256 per asset name; a name absent from it publishes none.
+func fakeMihomoServer(t *testing.T, tag string, assets map[string][]byte, digests map[string]string) *httptest.Server {
+	t.Helper()
+	var srv *httptest.Server
+	mux := http.NewServeMux()
+	assetJSON := func() string {
+		var parts []string
+		for name, payload := range assets {
+			part := `{"name":` + strconv.Quote(name) +
+				`,"browser_download_url":` + strconv.Quote(srv.URL+"/dl/"+name) +
+				`,"size":` + strconv.Itoa(len(payload))
+			if d := digests[name]; d != "" {
+				part += `,"digest":` + strconv.Quote(d)
+			}
+			parts = append(parts, part+`}`)
+		}
+		return strings.Join(parts, ",")
+	}
+	mux.HandleFunc("/repos/MetaCubeX/mihomo/releases/latest", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"tag_name":` + strconv.Quote(tag) + `,"name":"stable","assets":[` + assetJSON() + `]}`))
+	})
+	mux.HandleFunc("/repos/MetaCubeX/mihomo/releases", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`[{"tag_name":"Prerelease-Alpha","name":"alpha","assets":[]}]`))
+	})
+	mux.HandleFunc("/dl/", func(w http.ResponseWriter, r *http.Request) {
+		name := strings.TrimPrefix(r.URL.Path, "/dl/")
+		if p, ok := assets[name]; ok {
+			_, _ = w.Write(p)
+			return
+		}
+		http.NotFound(w, r)
+	})
+	srv = httptest.NewServer(mux)
+	return srv
+}
+
+// TestMihomoAssetSelection — the real v1.19.33 release ships 31 Windows
+// archives and every amd64 one of them contains "windows-amd64":
+// -compatible (legacy CPU build), -go120..-go125 (old toolchains),
+// -v2/-v3 (instruction sets that will not start on every machine NekoGo
+// ships to) and a plain amd64 build. Only the GOAMD64=v1 baseline is
+// installable, so the name is constructed rather than substring-matched.
+func TestMihomoAssetSelection(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("the mihomo row installs Windows zips only")
+	}
+	const tag = "v1.19.33"
+	names := []string{
+		"mihomo-windows-386-go120-v1.19.33.zip",
+		"mihomo-windows-386-v1.19.33.zip",
+		"mihomo-windows-amd64-compatible-v1.19.33.zip",
+		"mihomo-windows-amd64-v1-go120-v1.19.33.zip",
+		"mihomo-windows-amd64-v1-go125-v1.19.33.zip",
+		"mihomo-windows-amd64-v1-v1.19.33.zip",
+		"mihomo-windows-amd64-v1.19.33.zip",
+		"mihomo-windows-amd64-v2-go124-v1.19.33.zip",
+		"mihomo-windows-amd64-v2-v1.19.33.zip",
+		"mihomo-windows-amd64-v3-v1.19.33.zip",
+		"mihomo-windows-arm64-v1.19.33.zip",
+		"mihomo-linux-amd64-v1.19.33.gz",
+	}
+	want := mihomoAssetName(tag)
+	var assets, traps []ghAsset
+	for _, n := range names {
+		assets = append(assets, ghAsset{Name: n})
+		if n != want {
+			traps = append(traps, ghAsset{Name: n})
+		}
+	}
+	got := mihomoAsset(assets, tag)
+	if got == nil || got.Name != want {
+		t.Fatalf("mihomoAsset = %+v, want %q", got, want)
+	}
+	if mihomoAsset(traps, tag) != nil {
+		t.Fatal("matched a compatible/go12x/v2/v3/plain-arch trap instead of requiring the exact name")
+	}
+	if got := mihomoAsset(assets, normTag(tag)); got == nil || got.Name != want {
+		t.Fatalf("an un-prefixed tag = %+v, want %q", got, want)
+	}
+	if mihomoAsset(assets, "v9.9.9") != nil {
+		t.Fatal("matched an asset from a different release")
+	}
+}
+
+// TestCheckMihomoUsesStableRelease — the row must follow /releases/latest.
+// The newest entry of /releases is the rolling "Prerelease-Alpha" tag,
+// which carries no version: comparing against it would offer the same
+// alpha forever.
+func TestCheckMihomoUsesStableRelease(t *testing.T) {
+	saveUpdateBaseURL(t)
+	if runtime.GOOS != "windows" {
+		t.Skip("the mihomo row installs Windows zips only")
+	}
+	zipBytes := makeZipBytes(t, "mihomo-windows-amd64-v1.exe", []byte("mihomo"))
+	name := mihomoAssetName("v9.9.9")
+	srv := fakeMihomoServer(t, "v9.9.9",
+		map[string][]byte{name: zipBytes},
+		map[string]string{name: "sha256:" + sha256Hex(zipBytes)})
+	defer srv.Close()
+	updateBaseURL["github-api"] = srv.URL
+
+	a := newUpdaterTestApp(t)
+	// Force "not installed" so a mihomo on this machine's PATH cannot
+	// decide the assertion.
+	setMihomoPath(t, a, filepath.Join(t.TempDir(), "absent", "mihomo.exe"))
+	rows, err := a.CheckUpdates()
+	if err != nil {
+		t.Fatalf("CheckUpdates: %v", err)
+	}
+	var got *UpdatableComponent
+	for i := range rows {
+		if rows[i].ID == "mihomo" {
+			got = &rows[i]
+		}
+	}
+	if got == nil {
+		t.Fatal("missing mihomo row")
+	}
+	if got.Latest != "v9.9.9" {
+		t.Fatalf("Latest = %q, want the stable v9.9.9 (not Prerelease-Alpha)", got.Latest)
+	}
+	if !got.UpdateAvail {
+		t.Fatalf("row = %+v, want UpdateAvail=true with nothing installed", *got)
+	}
+	if got.LastError != "" {
+		t.Fatalf("LastError = %q, want empty", got.LastError)
+	}
+	if !strings.Contains(got.Name, "Clash Meta") {
+		t.Fatalf("Name = %q, want it to identify the engine", got.Name)
+	}
+}
+
+// TestUpdateMihomoFromZip — the archive's inner binary is named after the
+// asset (mihomo-windows-amd64-v1.exe, measured in the real v1.19.33 zip),
+// so it must be found by prefix and written to the path resolveMihomo
+// reads. The published digest is checked before anything is extracted.
+func TestUpdateMihomoFromZip(t *testing.T) {
+	saveUpdateBaseURL(t)
+	if runtime.GOOS != "windows" {
+		t.Skip("the mihomo row installs Windows zips only")
+	}
+	stubExeVersion(t, "Mihomo Meta v9.9.9 windows amd64")
+	payload := []byte("mihomo-engine-bytes")
+	zipBytes := makeZipBytes(t, "mihomo-windows-amd64-v1.exe", payload)
+	name := mihomoAssetName("v9.9.9")
+	srv := fakeMihomoServer(t, "v9.9.9",
+		map[string][]byte{name: zipBytes},
+		map[string]string{name: "sha256:" + sha256Hex(zipBytes)})
+	defer srv.Close()
+	updateBaseURL["github-api"] = srv.URL
+
+	a := newUpdaterTestApp(t)
+	dest := filepath.Join(t.TempDir(), "mihomo.exe")
+	setMihomoPath(t, a, dest)
+	got, err := a.UpdateComponent("mihomo")
+	if err != nil {
+		t.Fatalf("UpdateComponent(mihomo): %v", err)
+	}
+	raw, err := os.ReadFile(dest)
+	if err != nil {
+		t.Fatalf("installed engine unreadable: %v", err)
+	}
+	if string(raw) != string(payload) {
+		t.Fatal("installed engine content mismatch (the archive's inner name was not matched)")
+	}
+	if _, err := os.Stat(dest + ".bak"); !os.IsNotExist(err) {
+		t.Fatal("stale .bak left behind after a good install")
+	}
+	if got.Latest != "v9.9.9" || got.UpdateAvail {
+		t.Fatalf("row = %+v, want Latest=v9.9.9 UpdateAvail=false", *got)
+	}
+	// Same bytes again: a quiet no-op, not an error row.
+	again, err := a.UpdateComponent("mihomo")
+	if err != nil {
+		t.Fatalf("re-installing identical bytes failed: %v", err)
+	}
+	if !strings.Contains(strings.ToLower(again.Notes), "already up to date") {
+		t.Fatalf("Notes = %q, want an up-to-date note", again.Notes)
+	}
+}
+
+// TestUpdateMihomoRefusesDigestMismatch — a download whose bytes do not
+// match the sha256 GitHub published must never reach the install path,
+// and the working binary must survive untouched.
+func TestUpdateMihomoRefusesDigestMismatch(t *testing.T) {
+	saveUpdateBaseURL(t)
+	if runtime.GOOS != "windows" {
+		t.Skip("the mihomo row installs Windows zips only")
+	}
+	stubExeVersion(t, "Mihomo Meta v9.9.9 windows amd64")
+	zipBytes := makeZipBytes(t, "mihomo-windows-amd64-v1.exe", []byte("tampered"))
+	name := mihomoAssetName("v9.9.9")
+	srv := fakeMihomoServer(t, "v9.9.9",
+		map[string][]byte{name: zipBytes},
+		map[string]string{name: "sha256:" + sha256Hex([]byte("the-real-archive"))})
+	defer srv.Close()
+	updateBaseURL["github-api"] = srv.URL
+
+	a := newUpdaterTestApp(t)
+	dest := filepath.Join(t.TempDir(), "mihomo.exe")
+	before := []byte("working-mihomo")
+	if err := os.WriteFile(dest, before, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	setMihomoPath(t, a, dest)
+	_, err := a.UpdateComponent("mihomo")
+	if err == nil || !strings.Contains(err.Error(), "sha256 mismatch") {
+		t.Fatalf("err = %v, want a sha256 mismatch refusal", err)
+	}
+	after, err := os.ReadFile(dest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(after) != string(before) {
+		t.Fatal("an unverified download replaced the working binary")
+	}
+	if _, err := os.Stat(dest + ".bak"); !os.IsNotExist(err) {
+		t.Fatal("a .bak was written before the digest was checked")
+	}
+}
+
+// TestMihomoVersionBannerOrdersAgainstItsTag measures the real staged
+// engine: -v must produce a banner the version checker can order against
+// a release tag, and the per-path cache must serve it without re-running.
+func TestMihomoVersionBannerOrdersAgainstItsTag(t *testing.T) {
+	bin := testMihomoBin(t)
+	a := newUpdaterTestApp(t)
+	setMihomoPath(t, a, bin)
+	v := a.MihomoVersion()
+	if v == "" {
+		t.Fatal("MihomoVersion() empty for the staged engine")
+	}
+	tok := versionToken(v)
+	if tok == "" {
+		t.Fatalf("banner %q carries no dotted version token", v)
+	}
+	if updateNeeded(v, "v"+tok) {
+		t.Fatalf("the installed banner %q claims an update against its own tag v%s", v, tok)
+	}
+	if !updateNeeded(v, "v999.0.0") {
+		t.Fatalf("banner %q did not offer a newer release", v)
+	}
+	if again := a.MihomoVersion(); again != v {
+		t.Fatalf("second call = %q, want the cached %q", again, v)
+	}
+	a.invalidateCoreVersion("mihomo")
+	a.mihomoVer.mu.Lock()
+	cleared := a.mihomoVer.version
+	a.mihomoVer.mu.Unlock()
+	if cleared != "" {
+		t.Fatal("invalidateCoreVersion(mihomo) left a stale version")
+	}
+	if got := a.MihomoVersion(); got != v {
+		t.Fatalf("after invalidation = %q, want a fresh %q", got, v)
+	}
+}
+
+// --- digest verification and hash-stamped rows ---
+
+// TestVerifyDigest — a published sha256 is enforced, an absent or
+// malformed one is not (the source simply publishes none, and refusing
+// every such asset would break the fork's own cores and the jsDelivr
+// GeoIP copy).
+func TestVerifyDigest(t *testing.T) {
+	a := newUpdaterTestApp(t)
+	data := []byte("asset-bytes")
+	good := "sha256:" + sha256Hex(data)
+	if err := a.verifyDigest("xray", "xray.exe", good, data); err != nil {
+		t.Fatalf("matching digest rejected: %v", err)
+	}
+	if err := a.verifyDigest("xray", "xray.exe", strings.ToUpper(good), data); err != nil {
+		t.Fatalf("case-folded digest rejected: %v", err)
+	}
+	err := a.verifyDigest("xray", "xray.exe", "sha256:"+sha256Hex([]byte("other")), data)
+	if err == nil || !strings.Contains(err.Error(), "sha256 mismatch") {
+		t.Fatalf("err = %v, want a sha256 mismatch refusal", err)
+	}
+	for _, absent := range []string{"", "sha512:abcd", "sha256:tooshort", "sha256:" + strings.Repeat("z", 64)} {
+		if err := a.verifyDigest("xray", "xray.exe", absent, data); err != nil {
+			t.Fatalf("unpublished/malformed digest %q rejected: %v", absent, err)
+		}
+	}
+}
+
+// TestCoreUpdateNeededHashStamp — an unstamped core is identified by
+// "sha:<12 hex>", which no version ordering can compare against a tag:
+// the old fallback answered "newer" forever, so the row offered an
+// update after every check even when the installed bytes were the
+// published asset. A raw binary asset's digest settles it exactly.
+func TestCoreUpdateNeededHashStamp(t *testing.T) {
+	payload := []byte("installed-core-bytes")
+	sum := sha256Hex(payload)
+	stamp := "sha:" + sum[:12]
+	raw := &ghAsset{Name: "nekobox_core.exe", Digest: "sha256:" + sum}
+	if coreUpdateNeeded(stamp, "v9.9.9", raw) {
+		t.Fatal("an installed binary whose bytes ARE the published asset still offers an update")
+	}
+	other := &ghAsset{Name: "nekobox_core.exe", Digest: "sha256:" + sha256Hex([]byte("different-bytes"))}
+	if !coreUpdateNeeded(stamp, "v9.9.9", other) {
+		t.Fatal("a changed asset was not offered")
+	}
+	// An archive's digest hashes the CONTAINER, never the exe inside it,
+	// so the exact comparison is unavailable and the fallback stands.
+	archive := &ghAsset{Name: "mihomo-windows-amd64-v1-v9.9.9.zip", Digest: "sha256:" + sum}
+	if !coreUpdateNeeded(stamp, "v9.9.9", archive) {
+		t.Fatal("an archive digest was compared against the extracted exe's hash")
+	}
+	if !coreUpdateNeeded(stamp, "v9.9.9", &ghAsset{Name: "nekobox_core.exe"}) {
+		t.Fatal("a digest-less asset stopped offering the update")
+	}
+	// Real version banners keep ordering normally, digest or not.
+	if coreUpdateNeeded("sing-box version 9.9.9", "v9.9.9", raw) {
+		t.Fatal("equal versions offered an update")
+	}
+	if !coreUpdateNeeded("sing-box version 1.0.0", "v9.9.9", raw) {
+		t.Fatal("an older version did not offer the update")
+	}
+}
+
+// TestCheckUpdatesFetchesTheForkOnce — nekobox, xray and gui all read the
+// fork's newest release. GitHub allows 60 unauthenticated calls an hour
+// and the panel's per-row Check button runs a whole pass, so one lookup
+// per repo is the budget, not one per row.
+func TestCheckUpdatesFetchesTheForkOnce(t *testing.T) {
+	saveUpdateBaseURL(t)
+	var hits int32
+	var srv *httptest.Server
+	mux := http.NewServeMux()
+	mux.HandleFunc("/repos/xenonama/NekoGo/releases", func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&hits, 1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`[{"tag_name":"v9.9.9","name":"test","assets":[` +
+			`{"name":"nekobox_core.exe","browser_download_url":"` + srv.URL + `/dl/nk","size":2},` +
+			`{"name":"xray.exe","browser_download_url":"` + srv.URL + `/dl/xr","size":2}]}]`))
+	})
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) { http.NotFound(w, r) })
+	srv = httptest.NewServer(mux)
+	defer srv.Close()
+	updateBaseURL["github-api"] = srv.URL
+	updateBaseURL["jsdelivr"] = srv.URL
+
+	a := newUpdaterTestApp(t)
+	if _, err := a.CheckUpdates(); err != nil {
+		t.Fatalf("CheckUpdates: %v", err)
+	}
+	if n := atomic.LoadInt32(&hits); n != 1 {
+		t.Fatalf("the fork release was fetched %d times in one pass, want 1", n)
+	}
+}
+
+// TestGeositeIgnoresTheChecksumAsset — the release ships geosite.dat AND
+// geosite.dat.sha256sum. GitHub orders assets by upload, not by name, so
+// a substring picker can take the checksum and install a text file as
+// the rule-set; its own published digest would even verify.
+func TestGeositeIgnoresTheChecksumAsset(t *testing.T) {
+	saveUpdateBaseURL(t)
+	dat := []byte("real-geosite-rules")
+	sum := []byte(sha256Hex(dat) + "  geosite.dat\n")
+	var srv *httptest.Server
+	mux := http.NewServeMux()
+	mux.HandleFunc("/repos/Loyalsoldier/v2ray-rules-dat/releases/latest", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"tag_name":"202611062204","assets":[` +
+			`{"name":"geosite.dat.sha256sum","browser_download_url":"` + srv.URL + `/dl/sum","size":` + strconv.Itoa(len(sum)) + `,"digest":"sha256:` + sha256Hex(sum) + `"},` +
+			`{"name":"geosite.dat","browser_download_url":"` + srv.URL + `/dl/dat","size":` + strconv.Itoa(len(dat)) + `,"digest":"sha256:` + sha256Hex(dat) + `"}]}`))
+	})
+	mux.HandleFunc("/dl/dat", func(w http.ResponseWriter, r *http.Request) { _, _ = w.Write(dat) })
+	mux.HandleFunc("/dl/sum", func(w http.ResponseWriter, r *http.Request) { _, _ = w.Write(sum) })
+	srv = httptest.NewServer(mux)
+	defer srv.Close()
+	updateBaseURL["github-api"] = srv.URL
+
+	a := newUpdaterTestApp(t)
+	got, err := a.UpdateComponent("geosite")
+	if err != nil {
+		t.Fatalf("UpdateComponent(geosite): %v", err)
+	}
+	raw, err := os.ReadFile(filepath.Join(updaterDataDir(), "geosite.dat"))
+	if err != nil {
+		t.Fatalf("installed rule-set unreadable: %v", err)
+	}
+	if string(raw) != string(dat) {
+		t.Fatalf("installed %q, want the rule-set bytes (the checksum asset was picked)", raw)
+	}
+	if got.Latest != "202611062204" {
+		t.Fatalf("Latest = %q, want the release tag", got.Latest)
+	}
+}
+
+// TestCheckGUINotesWhenTheBuildIsAhead — the fork's newest published
+// release is 1.0.0-beta.1 (measured 2026-11-07) while VERSION has since
+// moved on, so a local build is ahead of everything published. The
+// disabled Update button must say which side is newer instead of leaving
+// the row looking like a plain "up to date". checkGUI reads a lookup that
+// CheckUpdates already fetched, so the release is handed to it directly
+// and the test needs no server.
+func TestCheckGUINotesWhenTheBuildIsAhead(t *testing.T) {
+	old := appVersion
+	t.Cleanup(func() { appVersion = old })
+	a := newUpdaterTestApp(t)
+	cases := []struct {
+		build, published, notes string
+		avail                   bool
+	}{
+		{"1.0.0-beta.2", "v1.0.0-beta.1", "This build is newer than the published release", false},
+		{"1.0.0-beta.1", "v1.0.0-beta.2", "", true},
+		{"1.0.0-beta.1", "v1.0.0-beta.1", "", false},
+	}
+	for _, tc := range cases {
+		appVersion = tc.build
+		c := UpdatableComponent{ID: "gui", Name: "NekoGo GUI", Current: appVersion}
+		a.checkGUI(&c, releaseLookup{repo: forkOwnerRepo, rel: &ghRelease{
+			TagName: tc.published,
+			Assets: []ghAsset{{
+				Name:               "NekoGo-Portable-" + tc.published + ".zip",
+				BrowserDownloadURL: "https://example.invalid/nekogo.zip",
+			}},
+		}})
+		if c.UpdateAvail != tc.avail {
+			t.Errorf("build %s vs published %s: UpdateAvail = %v, want %v", tc.build, tc.published, c.UpdateAvail, tc.avail)
+		}
+		if c.Notes != tc.notes {
+			t.Errorf("build %s vs published %s: Notes = %q, want %q", tc.build, tc.published, c.Notes, tc.notes)
+		}
+		if c.LastError != "" {
+			t.Errorf("build %s vs published %s: LastError = %q, want empty", tc.build, tc.published, c.LastError)
+		}
 	}
 }

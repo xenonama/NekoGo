@@ -75,6 +75,11 @@ type CoreManager struct {
 	// Settings.CoreEngine == "upstream". CLI-only: no Thrift stats,
 	// connections, or tests.
 	upstreamMgr *UpstreamSingBoxManager
+	// mihomoMgr owns the mihomo.exe (Clash Meta) child process for
+	// CoreMihomo profiles. It is a whole core, not a transport: a mihomo
+	// connect runs it alone, and its own external controller serves the
+	// stats, connection table and latency probes.
+	mihomoMgr *MihomoManager
 	// upstreamActive records whether the active group's sing-box leg is
 	// the upstream CLI instead of the custom nekobox_core: a CoreSingBox
 	// connect, the transport of a CoreSpoof group, or the transport of an
@@ -165,6 +170,8 @@ func (m *CoreManager) engineInGroupLocked(engine string) bool {
 	case "spoof":
 		// The SNI engine is the group's front: sing-box/xray only feed it.
 		return m.activeCore == CoreSpoof
+	case "mihomo":
+		return m.activeCore == CoreMihomo
 	case "sing-box":
 		return m.aetherActive || m.activeCore == CoreSingBox ||
 			(m.activeCore == CoreSpoof && !m.spoofXray)
@@ -260,6 +267,18 @@ func (m *CoreManager) SetUpstreamSingBoxManager(mgr *UpstreamSingBoxManager) {
 	}
 }
 
+// SetMihomoManager attaches the mihomo.exe (Clash Meta) manager.
+// Called once from NewApp; a nil manager makes CoreMihomo profiles fail
+// fast instead of silently falling back to another engine.
+func (m *CoreManager) SetMihomoManager(mgr *MihomoManager) {
+	m.mu.Lock()
+	m.mihomoMgr = mgr
+	m.mu.Unlock()
+	if mgr != nil {
+		mgr.SetExitHandler(m.handleEngineExit)
+	}
+}
+
 // SetPsiphonManager attaches the Psiphon-only aether instance the SNI
 // spoof chain runs. Called once from NewApp; a nil manager makes the
 // chain fail fast.
@@ -307,11 +326,18 @@ func (m *CoreManager) Start(profile *Profile, settings Settings) error {
 	m.epoch++
 	epoch := m.epoch
 	wantXray := profile.Core.IsXray()
-	wantSpoof := profile.Core.IsSpoof()
+	wantSpoof := spoofConnectEnabled(profile, settings)
 	wantAether := aetherDriverProfile(profile)
 	wantUpstream := settings.CoreEngine == "upstream"
+	// A mihomo profile never runs a sing-box binary, so the CoreEngine
+	// choice is inert for it — exactly as it is for Xray.
+	wantMihomo := profile.Core.IsMihomo()
+	if wantMihomo {
+		wantUpstream = false
+	}
 	aetherMgr := m.aetherMgr
 	upstreamMgr := m.upstreamMgr
+	mihomoMgr := m.mihomoMgr
 	m.mu.Unlock()
 
 	var err error
@@ -347,7 +373,7 @@ func (m *CoreManager) Start(profile *Profile, settings Settings) error {
 				return err
 			}
 		}
-		if err = m.startAetherMainCore(profile, settings, wantXray); err != nil {
+		if err = m.startAetherMainCore(profile, settings, wantXray, wantMihomo); err != nil {
 			return err
 		}
 		m.mu.Lock()
@@ -366,26 +392,35 @@ func (m *CoreManager) Start(profile *Profile, settings Settings) error {
 		}
 		// Same for the transport: its death report was dropped while no
 		// group was committed, so the commit itself has to see it.
-		if !m.transportAlive(wantXray, wantUpstream) {
+		if !m.transportAlive(wantXray, wantUpstream, wantMihomo) {
 			_ = m.stopLocked()
 			err = fmt.Errorf("core exited during connect")
 			return err
 		}
-		if wantXray {
+		switch {
+		case wantMihomo:
+			m.activeCore = CoreMihomo
+		case wantXray:
 			m.activeCore = CoreXray
-		} else {
+		default:
 			m.activeCore = CoreSingBox
 		}
 		m.running = true
 		m.activeID = profile.ID
 		m.aetherActive = true
-		m.upstreamActive = !wantXray && settings.CoreEngine == "upstream"
+		m.upstreamActive = !wantXray && !wantMihomo && settings.CoreEngine == "upstream"
 		m.setTunSessionLocked(tunModeFor(profile, settings))
 		return nil
 	}
 	if wantSpoof {
 		m.activeCoreHintSpoof()
 		err = m.startSpoofLocked(profile, settings)
+	} else if wantMihomo {
+		if mihomoMgr == nil {
+			return fmt.Errorf("mihomo manager not wired")
+		}
+		m.activeCoreHintMihomo()
+		err = mihomoMgr.Start(profile, settings)
 	} else if wantXray {
 		m.activeCoreHint(true)
 		err = m.xrayMgr.Start(profile, settings)
@@ -411,7 +446,7 @@ func (m *CoreManager) Start(profile *Profile, settings Settings) error {
 		_ = m.stopLocked()
 		return fmt.Errorf("connect aborted (concurrent stop)")
 	}
-	if !m.groupMemberAlive(wantSpoof, wantXray, wantUpstream) {
+	if !m.groupMemberAlive(wantSpoof, wantXray, wantUpstream, wantMihomo) {
 		_ = m.stopLocked()
 		return fmt.Errorf("core exited during connect")
 	}
@@ -421,6 +456,9 @@ func (m *CoreManager) Start(profile *Profile, settings Settings) error {
 		// connection table and latency probes must then read the Clash API
 		// (GetStats keeps reporting the spoof engine's own counters).
 		m.upstreamActive = m.spoofUpstream
+	} else if wantMihomo {
+		m.activeCore = CoreMihomo
+		m.upstreamActive = false
 	} else if wantXray {
 		m.activeCore = CoreXray
 		m.upstreamActive = false
@@ -483,8 +521,12 @@ func (m *CoreManager) waitAetherPsiphonTunnel(port int, timeout time.Duration, e
 // transportAlive reports whether the transport a pending (or committed)
 // group chose is still running. Caller holds m.mu; the managers' locks
 // are leaves, so the nesting cannot deadlock.
-func (m *CoreManager) transportAlive(xray, upstream bool) bool {
+// transportAlive reports whether the engine a pending Start just probed
+// is still running at commit time, for the aether group's main core.
+func (m *CoreManager) transportAlive(xray, upstream, mihomo bool) bool {
 	switch {
+	case mihomo:
+		return m.mihomoMgr != nil && m.mihomoMgr.IsRunning()
 	case xray:
 		return m.xrayMgr != nil && m.xrayMgr.IsRunning()
 	case upstream:
@@ -497,7 +539,7 @@ func (m *CoreManager) transportAlive(xray, upstream bool) bool {
 // groupMemberAlive reports whether the engine a pending Start just
 // probed is still running at commit time. A manager that is nil never
 // counts as alive: its start leg would have failed earlier.
-func (m *CoreManager) groupMemberAlive(spoof, xray, upstream bool) bool {
+func (m *CoreManager) groupMemberAlive(spoof, xray, upstream, mihomo bool) bool {
 	switch {
 	case spoof:
 		if m.spoofMgr == nil || !m.spoofMgr.IsRunning() {
@@ -509,9 +551,11 @@ func (m *CoreManager) groupMemberAlive(spoof, xray, upstream bool) bool {
 			if m.psiphonMgr == nil || !m.psiphonMgr.Running() {
 				return false
 			}
-			return m.transportAlive(m.spoofXray, m.spoofUpstream)
+			return m.transportAlive(m.spoofXray, m.spoofUpstream, false)
 		}
-		return m.transportAlive(m.spoofXray, m.spoofUpstream)
+		return m.transportAlive(m.spoofXray, m.spoofUpstream, false)
+	case mihomo:
+		return m.mihomoMgr != nil && m.mihomoMgr.IsRunning()
 	case xray:
 		return m.xrayMgr != nil && m.xrayMgr.IsRunning()
 	case upstream:
@@ -522,9 +566,16 @@ func (m *CoreManager) groupMemberAlive(spoof, xray, upstream bool) bool {
 }
 
 // startAetherMainCore starts the transport that dials the running
-// engine: xray per the profile's core choice, the official sing-box CLI
-// when CoreEngine=upstream, the custom core otherwise.
-func (m *CoreManager) startAetherMainCore(profile *Profile, settings Settings, wantXray bool) error {
+// engine: mihomo or xray per the profile's core choice, the official
+// sing-box CLI when CoreEngine=upstream, the custom core otherwise.
+func (m *CoreManager) startAetherMainCore(profile *Profile, settings Settings, wantXray, wantMihomo bool) error {
+	if wantMihomo {
+		if m.mihomoMgr == nil {
+			return fmt.Errorf("mihomo manager not wired")
+		}
+		m.activeCoreHintMihomo()
+		return m.mihomoMgr.Start(profile, settings)
+	}
 	if wantXray {
 		m.activeCoreHint(true)
 		return m.xrayMgr.Start(profile, settings)
@@ -675,6 +726,14 @@ func (m *CoreManager) activeCoreHintSpoof() {
 	m.activeCore = CoreSpoof
 }
 
+// activeCoreHintMihomo records a pending mihomo Start like
+// activeCoreHint does for the other cores.
+func (m *CoreManager) activeCoreHintMihomo() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.activeCore = CoreMihomo
+}
+
 // activeCoreHint records which engine a pending Start is probing so
 // readers (GetStats routing, tray labels) see a sensible core during
 // the unlocked probe window. It never flips the committed state.
@@ -697,6 +756,7 @@ func (m *CoreManager) Stop() error {
 	m.epoch++
 	xrayMgr, singboxMgr, spoofMgr, aetherMgr, core := m.xrayMgr, m.singboxMgr, m.spoofMgr, m.aetherMgr, m.activeCore
 	upstreamMgr, upstreamActive := m.upstreamMgr, m.upstreamActive
+	mihomoMgr := m.mihomoMgr
 	psiphonMgr, spoofXray := m.psiphonMgr, m.spoofXray
 	spoofUpstream := m.spoofUpstream
 	aetherWasActive := m.aetherActive
@@ -718,10 +778,12 @@ func (m *CoreManager) Stop() error {
 		}
 	}
 	if aetherWasActive {
-		// The aether connect's transport is xray, the upstream CLI or the
-		// custom core; stop the one this group started (the others' Stop is
-		// a no-op).
+		// The aether connect's transport is mihomo, xray, the upstream CLI
+		// or the custom core; stop the one this group started (the others'
+		// Stop is a no-op).
 		switch {
+		case core == CoreMihomo && mihomoMgr != nil:
+			err = mihomoMgr.Stop()
 		case core == CoreXray && xrayMgr != nil:
 			err = xrayMgr.Stop()
 		case upstreamActive && upstreamMgr != nil:
@@ -750,6 +812,12 @@ func (m *CoreManager) Stop() error {
 			err = fmt.Errorf("xray manager is nil")
 		} else {
 			err = xrayMgr.Stop()
+		}
+	case CoreMihomo:
+		if mihomoMgr == nil {
+			err = fmt.Errorf("mihomo manager is nil")
+		} else {
+			err = mihomoMgr.Stop()
 		}
 	case CoreSpoof:
 		// Spoof connects run up to three legs; stop them in reverse
@@ -841,6 +909,12 @@ func (m *CoreManager) stopLocked() error {
 		} else {
 			err = m.xrayMgr.Stop()
 		}
+	case CoreMihomo:
+		if m.mihomoMgr == nil {
+			err = fmt.Errorf("mihomo manager is nil")
+		} else {
+			err = m.mihomoMgr.Stop()
+		}
 	case CoreSpoof:
 		// Psiphon (the exit) is already stopped above; then the
 		// transport, then the engine.
@@ -911,6 +985,7 @@ func (m *CoreManager) GetStats() (*Stats, error) {
 	xrayMgr := m.xrayMgr
 	spoofMgr := m.spoofMgr
 	upstreamMgr := m.upstreamMgr
+	mihomoMgr := m.mihomoMgr
 	m.mu.RUnlock()
 	if !running {
 		return &Stats{Running: false, Core: core.String()}, nil
@@ -920,7 +995,7 @@ func (m *CoreManager) GetStats() (*Stats, error) {
 			return st, nil
 		}
 	}
-	st, err := m.engineStats(core, upstreamActive, spoofMgr, xrayMgr, upstreamMgr, singboxMgr)
+	st, err := m.engineStats(core, upstreamActive, spoofMgr, xrayMgr, upstreamMgr, mihomoMgr, singboxMgr)
 	// A TUN session that is still on the engine fallback (the adapter is
 	// not readable yet) remembers that reading: when the adapter takes
 	// over, its ledger starts from it instead of restarting at zero.
@@ -937,7 +1012,7 @@ func (m *CoreManager) GetStats() (*Stats, error) {
 // engineStats reports the active engine's own counters: the non-TUN
 // source, and the fallback for a TUN session whose adapter cannot be
 // read (yet).
-func (m *CoreManager) engineStats(core CoreType, upstreamActive bool, spoofMgr *SpoofManager, xrayMgr *XrayManager, upstreamMgr *UpstreamSingBoxManager, singboxMgr *SingBoxManager) (*Stats, error) {
+func (m *CoreManager) engineStats(core CoreType, upstreamActive bool, spoofMgr *SpoofManager, xrayMgr *XrayManager, upstreamMgr *UpstreamSingBoxManager, mihomoMgr *MihomoManager, singboxMgr *SingBoxManager) (*Stats, error) {
 	if core == CoreSpoof {
 		if spoofMgr == nil {
 			return nil, fmt.Errorf("sni-spoof manager is nil")
@@ -952,6 +1027,12 @@ func (m *CoreManager) engineStats(core CoreType, upstreamActive bool, spoofMgr *
 			Running:  spoofMgr.IsRunning(),
 			Core:     "spoof",
 		}, nil
+	}
+	if core == CoreMihomo {
+		if mihomoMgr == nil {
+			return nil, fmt.Errorf("mihomo manager is nil")
+		}
+		return mihomoMgr.GetStats()
 	}
 	if core == CoreXray {
 		if xrayMgr == nil {
@@ -997,16 +1078,19 @@ func (m *CoreManager) tunStats(core CoreType, upstream bool, seedUp, seedDown in
 }
 
 // ListConnections returns the active connection table. The upstream CLI
-// backend has no Thrift API, so its rows come from the Clash API; the
-// custom core keeps using its ListConnections RPC. Xray exposes no
-// connection table, so a running xray/spoof core returns an empty list.
+// and mihomo backends have no Thrift API, so their rows come from the
+// Clash REST controller each one runs; the custom core keeps using its
+// ListConnections RPC. Xray exposes no connection table, so a running
+// xray/spoof-on-xray core returns an empty list.
 func (m *CoreManager) ListConnections() (*ConnectionList, error) {
 	m.mu.RLock()
 	running := m.running
+	core := m.activeCore
 	upstreamActive := m.upstreamActive
 	spoofXray := m.spoofXray
 	singboxMgr := m.singboxMgr
 	upstreamMgr := m.upstreamMgr
+	mihomoMgr := m.mihomoMgr
 	m.mu.RUnlock()
 	if !running {
 		return &ConnectionList{}, nil
@@ -1014,6 +1098,12 @@ func (m *CoreManager) ListConnections() (*ConnectionList, error) {
 	if spoofXray {
 		// A spoof connect on the Xray transport has no connection table.
 		return &ConnectionList{}, nil
+	}
+	if core == CoreMihomo {
+		if mihomoMgr == nil {
+			return &ConnectionList{}, nil
+		}
+		return mihomoMgr.ListConnections()
 	}
 	if upstreamActive {
 		if upstreamMgr == nil {
@@ -1037,12 +1127,21 @@ func (m *CoreManager) ProxiedURLTest(url string, timeoutMs int) (*TestResult, er
 	upstreamActive := m.upstreamActive
 	upstreamMgr := m.upstreamMgr
 	xrayMgr := m.xrayMgr
+	mihomoMgr := m.mihomoMgr
 	m.mu.RUnlock()
 	if !running {
 		return nil, fmt.Errorf("no active connection")
 	}
 	if url == "" {
 		url = defaultTestURL
+	}
+	if core == CoreMihomo {
+		// mihomo has no Test RPC either: measure through its own mixed
+		// inbound, the same path live traffic takes.
+		if mihomoMgr == nil {
+			return nil, fmt.Errorf("mihomo manager is nil")
+		}
+		return mihomoMgr.URLTest(url, int32(timeoutMs))
 	}
 	if upstreamActive {
 		// The official CLI has no Test RPC: measure through the Clash
@@ -1294,6 +1393,7 @@ func (m *CoreManager) EphemeralURLTest(profile *Profile, settings Settings, url 
 
 	m.mu.RLock()
 	xrayMgr, singboxMgr, spoofMgr := m.xrayMgr, m.singboxMgr, m.spoofMgr
+	mihomoMgr := m.mihomoMgr
 	m.mu.RUnlock()
 
 	// A plain spoof connect may run on either transport
@@ -1308,10 +1408,14 @@ func (m *CoreManager) EphemeralURLTest(profile *Profile, settings Settings, url 
 	// spin a temporary one for the probe; when the user is connected,
 	// reuse the live engine port. Both transports need it.
 	//
+	// Settings → SNI spoofing turns this off together with the engine
+	// itself: the probe then dials the profile's own address (e.g. a
+	// local tunnel), exactly like its connect would.
+	//
 	// sni_front.go publishes that port process-wide, so temporary
 	// engines are serialized. Ordinary probes stay concurrent.
 	var prepare func() (func(), error)
-	if profile.Core.IsSpoof() {
+	if spoofConnectEnabled(profile, settings) {
 		spoofProbeMu.Lock()
 		defer spoofProbeMu.Unlock()
 		prepare = func() (func(), error) {
@@ -1342,6 +1446,33 @@ func (m *CoreManager) EphemeralURLTest(profile *Profile, settings Settings, url 
 				_ = tmp.Stop()
 			}, nil
 		}
+	}
+
+	// A mihomo profile probes on its own throwaway engine: the profile is
+	// rendered as a Clash Meta document, so neither the sing-box nor the
+	// Xray probe path can measure it. It is never a spoof profile (that
+	// needs CoreSpoof), so no spoof engine is prepared above.
+	if profile.Core.IsMihomo() {
+		if mihomoMgr == nil {
+			return nil, fmt.Errorf("mihomo manager is nil")
+		}
+		probe := NewMihomoManager(mihomoMgr.logCh)
+		m.ephProbeAddStop(gen, probe.StopEphemeral)
+		defer probe.StopEphemeral()
+		port, teardown, err := startEphemeralProbe(ctx, prepare, func(mixedPort int) (int, error) {
+			return probe.EphemeralRun(probeProfile, settings, mixedPort)
+		})
+		if teardown != nil {
+			defer teardown()
+		}
+		if err != nil {
+			return nil, err
+		}
+		d, err := proxiedHeadOrGetCtx(ctx, "127.0.0.1:"+strconv.Itoa(port), url, timeout)
+		if err != nil {
+			return nil, err
+		}
+		return &TestResult{OutboundTag: mihomoProxyName, LatencyMs: int32(d.Milliseconds())}, nil
 	}
 
 	if useXray {
@@ -1405,10 +1536,11 @@ func (m *CoreManager) effectiveCoreLocked() CoreType {
 }
 
 // ActiveCore reports the committed-or-probing core name:
-// "singbox" | "xray" | "spoof" | "". Used by the GUI-side system-proxy
-// path, which needs the xray label for a spoof connect on the Xray
-// transport too (it exposes split HTTP/SOCKS inbounds, not one mixed
-// port).
+// "singbox" | "xray" | "spoof" | "mihomo" | "". Used by the GUI-side
+// system-proxy path, which needs the xray label for a spoof connect on
+// the Xray transport too (it exposes split HTTP/SOCKS inbounds, not one
+// mixed port). mihomo falls in the mixed-port default: one port serves
+// HTTP and SOCKS, like sing-box.
 func (m *CoreManager) ActiveCore() string {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
@@ -1417,6 +1549,8 @@ func (m *CoreManager) ActiveCore() string {
 		return "xray"
 	case CoreSpoof:
 		return "spoof"
+	case CoreMihomo:
+		return "mihomo"
 	case CoreSingBox:
 		return "singbox"
 	default:

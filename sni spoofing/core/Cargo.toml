@@ -16,3 +16,4 @@ tokio = { workspace = true }
 rand = { workspace = true }
 md5 = { workspace = true }
 parking_lot = { workspace = true }
+ureq = { workspace = true }

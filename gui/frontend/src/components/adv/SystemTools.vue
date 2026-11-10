@@ -45,7 +45,7 @@
           <span class="stg-head-sub">Apply or restore the core's local DNS</span>
         </span>
       </div>
-      <div class="toolbar" style="padding: 0 0 8px">
+      <div class="toolbar">
         <button class="nb-act nb-act--primary" :disabled="!canUseSys || dnsBusy" @click="applyDNS">
           <Icon name="check" :size="14" />Apply
         </button>
@@ -66,7 +66,7 @@
           <span class="stg-head-sub">Elevation of the running process</span>
         </span>
       </div>
-      <div class="toolbar" style="padding: 0 0 8px">
+      <div class="toolbar">
         <span v-if="privState === null" class="muted">Unknown — press Refresh.</span>
         <span v-else :class="privState ? 'nb-json-valid' : 'muted'">{{ privState ? 'Administrator' : 'Standard user' }}</span>
         <button class="nb-act" :disabled="privBusy" @click="refreshPrivileges">
@@ -84,7 +84,7 @@
           <span class="stg-head-sub">Generate a fresh keypair</span>
         </span>
       </div>
-      <div class="toolbar" style="padding: 0 0 8px">
+      <div class="toolbar">
         <button class="nb-act nb-act--primary" :disabled="wgBusy" @click="genKeys">
           <Icon name="bolt" :size="14" />Generate WireGuard key pair
         </button>
@@ -138,7 +138,7 @@
           <Icon v-else name="x" :size="18" class="nb-json-error" />
         </span>
       </div>
-      <div class="toolbar" style="padding: 8px 0 0">
+      <div class="toolbar toolbar--tail">
         <button class="nb-act" :disabled="supportBusy" @click="refreshSupport">
           <Icon name="refresh" :size="14" />Refresh
         </button>
@@ -154,7 +154,7 @@
           <span class="stg-head-sub">Fetch a URL into the core ruleset cache</span>
         </span>
       </div>
-      <div class="toolbar" style="padding: 0 0 8px">
+      <div class="toolbar">
         <input
           v-model="cacheInput"
           class="nb-mono nb-field"
@@ -195,10 +195,15 @@ function show(...keys: string[]): boolean {
 const connection = useConnectionStore()
 
 // --- Phase D tool cards: system-level RPCs. ---
-const isXray = computed(() => connection.status.core === 'xray')
+/** xray and mihomo expose no nekobox_core RPCs (Go: noCoreRPCs), so the
+ *  sing-box-only cards stay disabled on both instead of offering a call
+ *  that would dial a core which is not running. */
+const coreWithoutRPCs = computed(
+  () => connection.status.core === 'xray' || connection.status.core === 'mihomo',
+)
 const sysRunning = computed(() => connection.status.running)
 /** sing-box-only controls need a RUNNING sing-box core. */
-const canUseSys = computed(() => sysRunning.value && !isXray.value)
+const canUseSys = computed(() => sysRunning.value && !coreWithoutRPCs.value)
 /** The system-proxy toggle works on any running core: the GUI owns the
  *  OS proxy and knows each core's ports (ActiveProxyPorts). */
 const canUseProxy = computed(() => sysRunning.value)
@@ -219,12 +224,16 @@ async function flipProxy() {
   try {
     if (next) await backend.enableSystemProxyGUI()
     else await backend.disableSystemProxyGUI()
-    proxyOn.value = next
   } catch (e) {
     proxyError.value = String(e)
   } finally {
     proxyBusy.value = false
   }
+  // Re-read the OS instead of painting `next`: the switch is not ours
+  // to claim. A call that was refused (no core yet, a registry the
+  // administrator owns) used to render as if it had worked, and the
+  // card then sent the opposite verb on the next click.
+  await refreshProxyState()
 }
 
 // B) System DNS apply/restore (the RPC takes no address).

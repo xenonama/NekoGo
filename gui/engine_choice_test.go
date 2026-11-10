@@ -68,7 +68,7 @@ func TestSpoofTransportHonorsCoreEngine(t *testing.T) {
 	if rig.custom.IsRunning() {
 		t.Fatal("custom nekobox_core ran even though CoreEngine=upstream")
 	}
-	if !rig.cores.groupMemberAlive(true, false, false) {
+	if !rig.cores.groupMemberAlive(true, false, false, false) {
 		t.Fatal("group membership does not see the upstream transport")
 	}
 	if err := rig.cores.Stop(); err != nil {
@@ -97,7 +97,7 @@ func TestPlainProfileHonorsCoreEngine(t *testing.T) {
 	if !rig.upstream.IsRunning() {
 		t.Fatal("plain profile is not running the official sing-box")
 	}
-	if !rig.cores.groupMemberAlive(false, false, true) {
+	if !rig.cores.groupMemberAlive(false, false, true, false) {
 		t.Fatal("group membership does not see the upstream core")
 	}
 }

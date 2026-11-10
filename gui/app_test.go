@@ -304,6 +304,89 @@ func TestSystemProxyPointsAt(t *testing.T) {
 	}
 }
 
+// TestGetSystemProxyStateReportsOwnership — the toggle answers "is the
+// OS proxy OURS", not "is ProxyEnable set". A corporate or third-party
+// proxy reads OFF, so the card offers to take it over instead of
+// promising a disable that ClearSystemProxy rightly refuses to perform;
+// our own port reads ON; and once no core is running the ownership
+// record answers, because there is no live port to compare against.
+func TestGetSystemProxyStateReportsOwnership(t *testing.T) {
+	app, _ := testProxyApp(t, DefaultSettings(), CoreSingBox)
+	app.cores.mu.Lock()
+	app.cores.running = true
+	app.cores.mu.Unlock()
+	want := proxyServerValue(app.ActiveProxyPorts())
+
+	owned := false
+	oldOwned := sysproxyOwned
+	defer func() { sysproxyOwned = oldOwned }()
+	sysproxyOwned = func() bool { return owned }
+
+	cases := []struct {
+		name   string
+		on     bool
+		server string
+		own    bool
+		want   bool
+	}{
+		{"off", false, "", false, false},
+		{"foreign proxy", true, "proxy.corp:8080", false, false},
+		{"our port", true, want, false, true},
+		{"ours but the user edited the address", true, "127.0.0.1:3128", true, true},
+		{"switch killed by hand while we still hold it", false, "", true, false},
+	}
+	for _, tc := range cases {
+		owned = tc.own
+		app.sysStateHook = func() (bool, string, error) { return tc.on, tc.server, nil }
+		got, err := app.GetSystemProxyState()
+		if err != nil {
+			t.Fatalf("%s: %v", tc.name, err)
+		}
+		if got != tc.want {
+			t.Fatalf("%s: GetSystemProxyState = %v, want %v", tc.name, got, tc.want)
+		}
+	}
+
+	// Disconnected, no port matches, so only the ownership record can
+	// answer — and a foreign proxy must still read OFF.
+	app.cores.mu.Lock()
+	app.cores.running = false
+	app.cores.mu.Unlock()
+	app.sysStateHook = func() (bool, string, error) { return true, want, nil }
+	owned = true
+	if got, err := app.GetSystemProxyState(); err != nil || !got {
+		t.Fatalf("proxy owned across a disconnect = %v/%v, want true/nil", got, err)
+	}
+	owned = false
+	if got, _ := app.GetSystemProxyState(); got {
+		t.Fatal("foreign proxy reads as ours while disconnected")
+	}
+
+	// An unreadable OS stays an error: the cards fall back to their
+	// remembered setting, they do not guess OFF and re-enable over the
+	// user's head.
+	app.sysStateHook = func() (bool, string, error) { return false, "", fmt.Errorf("registry boom") }
+	if _, err := app.GetSystemProxyState(); err == nil {
+		t.Fatal("unreadable OS proxy = nil error, want the failure surfaced")
+	}
+}
+
+// TestEnableSystemProxyGUINeedsCore — the manual toggle is a live
+// control: with no core running there is no port to point the OS at, so
+// it must refuse rather than return nil and let the tile claim "On".
+func TestEnableSystemProxyGUINeedsCore(t *testing.T) {
+	s := DefaultSettings()
+	s.SystemProxy = false
+	app, _ := testProxyApp(t, s, CoreSingBox)
+	app.sysProxyHook = func(bool) error { return nil }
+	if err := app.EnableSystemProxyGUI(); err == nil {
+		t.Fatal("EnableSystemProxyGUI with no core = nil, want an error")
+	}
+	if app.store.GetSettings().SystemProxy {
+		t.Fatal("refused enable still persisted SystemProxy=true")
+	}
+}
+
 // TestCorePathRace — BUG-022: SaveSettings/recordSubscription writers
 // vs CoreVersion/XrayVersion readers must be race-clean. Missing
 // binaries make the version reads fail fast (""), so the loop stays
@@ -448,5 +531,21 @@ func TestImportRejectsUnroutableLink(t *testing.T) {
 	}
 	if got := res.Profiles[0].Flow; got != "xtls-rprx-vision" {
 		t.Fatalf("Flow = %q, want the link's xtls-rprx-vision", got)
+	}
+}
+
+// TestLaunchCountryRefreshSkippedAfterQuit — once Shutdown has begun, a
+// background refresh that has not started yet must be skipped, so the
+// waitCountryRefresh drain never blocks on a fresh run and no SaveFile
+// writes config after exit.
+func TestLaunchCountryRefreshSkippedAfterQuit(t *testing.T) {
+	a := newGeoTestApp(t)
+	a.mu.Lock()
+	a.quitting = true
+	a.mu.Unlock()
+	a.launchCountryRefresh("test")
+	a.refreshWG.Wait()
+	if got := a.RefreshCountriesProgress(); got.Running || got.Total != 0 {
+		t.Fatalf("background refresh ran after quit: %+v", got)
 	}
 }

@@ -59,8 +59,10 @@ func spoofChainPorts() (psiphonPort, upstreamPort int, ok bool) {
 }
 
 // spoofPsiphonChain reports whether [p]'s connect must run the chain.
+// Turning SNI spoofing off also disarms the chain: there is no engine to
+// carry Psiphon's upstream.
 func spoofPsiphonChain(p *Profile, settings Settings) bool {
-	return p != nil && p.Core.IsSpoof() && settings.SpoofPsiphon
+	return spoofConnectEnabled(p, settings) && settings.SpoofPsiphon
 }
 
 // spoofPsiphonRendering reports whether the chain ports are published
@@ -78,7 +80,7 @@ func spoofPsiphonRendering(p *Profile, settings Settings) bool {
 // chain is exempt: its TUN inbound is rendered by the sing-box
 // transport alone, so an armed chain always runs on sing-box.
 func spoofTransportXray(p *Profile, settings Settings) bool {
-	return p != nil && p.Core.IsSpoof() && settings.SpoofXray && !spoofPsiphonChain(p, settings)
+	return spoofConnectEnabled(p, settings) && settings.SpoofXray && !spoofPsiphonChain(p, settings)
 }
 
 // tunActiveFor reports whether the rendered config carries the TUN
@@ -109,7 +111,9 @@ func tunRequiredFor(p *Profile, settings Settings) bool {
 // TUN, which is why spoofPsiphonChain (not the port-dependent
 // spoofPsiphonRendering) is the right test here.
 func tunModeFor(p *Profile, settings Settings) bool {
-	if p == nil || p.Core.IsXray() || spoofTransportXray(p, settings) {
+	// Xray and mihomo render no TUN inbound, so neither is ever in TUN
+	// mode however the tunEnabled setting reads.
+	if p == nil || p.Core.IsXray() || p.Core.IsMihomo() || spoofTransportXray(p, settings) {
 		return false
 	}
 	if _, full, err := rawCoreOverride(settings.CoreOverrides); err == nil && full {

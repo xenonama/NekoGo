@@ -128,6 +128,13 @@ pub fn tcp_info(raw: &[u8]) -> Option<TcpInfo> {
     })
 }
 
+/// TCP payload bytes of a packet, or an empty slice for a packet that carries
+/// no payload. `None` only when the packet is not IPv4/TCP at all.
+pub fn tcp_payload(raw: &[u8]) -> Option<&[u8]> {
+    let (_, _, ip_hlen, tcp_hlen) = parse_ip_tcp(raw)?;
+    Some(raw.get(ip_hlen + tcp_hlen..).unwrap_or(&[]))
+}
+
 /// Core primitive: rebuild `orig` (an outbound ACK template) as one fake
 /// segment in old-seq space.
 ///

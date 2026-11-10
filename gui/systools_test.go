@@ -3,6 +3,7 @@ package main
 import (
 	"crypto/ecdh"
 	"encoding/base64"
+	"errors"
 	"testing"
 )
 
@@ -85,5 +86,59 @@ func TestEnableSystemProxyValidatesPort(t *testing.T) {
 	s.MixedPort = 70000
 	if err := m.EnableSystemProxy(s); err == nil {
 		t.Fatal("EnableSystemProxy(MixedPort=70000) = nil, want range error")
+	}
+}
+
+// TestNoCoreRPCs pins which engines the system legs may dial: only the
+// nekobox_core Thrift server has these RPCs. xray speaks stats gRPC and
+// mihomo its Clash REST controller, so both take the local legs.
+func TestNoCoreRPCs(t *testing.T) {
+	for _, c := range []struct {
+		core CoreType
+		want bool
+	}{
+		{CoreSingBox, false},
+		{CoreXray, true},
+		{CoreSpoof, false}, // a spoof group keeps its sing-box transport
+		{CoreMihomo, true},
+	} {
+		if got := noCoreRPCs(c.core); got != c.want {
+			t.Errorf("noCoreRPCs(%v) = %v, want %v", c.core, got, c.want)
+		}
+	}
+}
+
+// TestMihomoSystemToolsRouting: with mihomo active the sing-box-only legs
+// must refuse clearly, and the local legs must answer WITHOUT dialing the
+// idle Thrift core (which would report "core not running" instead).
+func TestMihomoSystemToolsRouting(t *testing.T) {
+	logCh := make(chan LogEntry, 8)
+	cores := NewCoreManager(NewSingBoxManager("", logCh), NewXrayManager("", t.TempDir(), logCh))
+	cores.SetMihomoManager(NewMihomoManager(logCh))
+	cores.mu.Lock()
+	cores.running, cores.activeCore = true, CoreMihomo
+	cores.mu.Unlock()
+
+	if err := cores.SetSystemDNS(false); !errors.Is(err, errSingBoxOnly) {
+		t.Errorf("SetSystemDNS() err = %v, want errSingBoxOnly", err)
+	}
+	if _, err := cores.CacheHTTP("https://example.com/ruleset.srs"); !errors.Is(err, errSingBoxOnly) {
+		t.Errorf("CacheHTTP() err = %v, want errSingBoxOnly", err)
+	}
+	if err := cores.EnableSystemProxy(DefaultSettings(), true); !errors.Is(err, errSingBoxOnly) {
+		t.Errorf("EnableSystemProxy() err = %v, want errSingBoxOnly", err)
+	}
+	if _, err := cores.IsPrivileged(); err != nil {
+		t.Errorf("IsPrivileged() err = %v, want the local elevation check", err)
+	}
+	if ok, err := cores.IsSupported("wireguard"); err != nil || !ok {
+		t.Errorf("IsSupported(wireguard) = %v, %v; want true, nil", ok, err)
+	}
+	if ok, err := cores.IsSupported("naive"); err != nil || ok {
+		t.Errorf("IsSupported(naive) = %v, %v; want the local mirror (false, nil)", ok, err)
+	}
+	pair, err := cores.GenWgKeyPair()
+	if err != nil || pair == nil || pair.PrivateKey == "" || pair.PublicKey == "" {
+		t.Fatalf("GenWgKeyPair() = %+v, %v; want a locally generated pair", pair, err)
 	}
 }
