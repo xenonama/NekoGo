@@ -3,11 +3,13 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"golang.org/x/sys/windows/registry"
 )
@@ -288,6 +290,36 @@ func setScratchProxyEnable(t *testing.T, v uint32) error {
 	return key.SetDWordValue("ProxyEnable", v)
 }
 
+func setScratchProxyServer(t *testing.T, v string) error {
+	t.Helper()
+	key, _, err := registry.CreateKey(registry.CURRENT_USER, sysproxyKeyPath, registry.ALL_ACCESS)
+	if err != nil {
+		return err
+	}
+	defer key.Close()
+	return key.SetStringValue("ProxyServer", v)
+}
+
+// readScratchProxyLoose is readScratchProxy for the cases where a value
+// is legitimately gone: a reverted ProxyServer is deleted, not emptied.
+func readScratchProxyLoose(t *testing.T) (uint64, string, bool) {
+	t.Helper()
+	key, err := registry.OpenKey(registry.CURRENT_USER, sysproxyKeyPath, registry.QUERY_VALUE)
+	if err != nil {
+		t.Fatalf("open scratch key: %v", err)
+	}
+	defer key.Close()
+	en, _, err := key.GetIntegerValue("ProxyEnable")
+	if err != nil {
+		t.Fatalf("read ProxyEnable: %v", err)
+	}
+	srv, _, err := key.GetStringValue("ProxyServer")
+	if err != nil {
+		return en, "", false
+	}
+	return en, srv, true
+}
+
 func readScratchOverride(t *testing.T) (string, bool) {
 	t.Helper()
 	key, err := registry.OpenKey(registry.CURRENT_USER, sysproxyKeyPath, registry.QUERY_VALUE)
@@ -376,11 +408,30 @@ func TestApplyOrderNeverEnablesAStaleServer(t *testing.T) {
 	if en, srv := readScratchProxy(t); en != 0 || srv != "prev-proxy:8888" {
 		t.Fatalf("partial apply left ProxyEnable=%d ProxyServer=%q, want the user's pair intact", en, srv)
 	}
-	if sysproxyOwned() {
-		t.Fatal("a failed apply claimed ownership of the OS proxy")
+	// The ProxyOverride write DID land, so this apply is not a no-op: the
+	// record has to survive and the revert has to take the "<local>" we
+	// installed back out. An earlier design deleted the marker here,
+	// which left our exception-list edit in the user's settings for good.
+	if !sysproxyMarkerExists() {
+		t.Fatal("a partial apply kept no crash record: the ProxyOverride it wrote is now permanent")
 	}
-	if sysproxyMarkerExists() {
-		t.Fatal("a failed apply wrote the crash-recovery marker")
+	if _, ok := readScratchOverride(t); !ok {
+		t.Fatal("setup: the partial apply wrote no ProxyOverride, so there is nothing to check")
+	}
+	// Release the injection: the revert below is the thing under test,
+	// not another victim of it.
+	sysproxyWriteString = oldWrite
+	if err := sysproxyRestore(); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := readScratchOverride(t); ok {
+		t.Fatal("restore left our ProxyOverride behind after a partial apply")
+	}
+	if en, srv := readScratchProxy(t); en != 0 || srv != "prev-proxy:8888" {
+		t.Fatalf("restore after a partial apply changed the user's pair: ProxyEnable=%d ProxyServer=%q", en, srv)
+	}
+	if sysproxyOwned() {
+		t.Fatal("restore left the OS proxy claimed as ours")
 	}
 }
 
@@ -567,5 +618,244 @@ func TestFailedReloadRevertsOwnedProxy(t *testing.T) {
 	}
 	if sysproxyMarkerExists() {
 		t.Fatal("failed reload left the crash marker behind")
+	}
+}
+
+// TestApplyRecapturesAProxyChangedWhileWeWereOff: the previous OS proxy
+// is what the revert puts back, so it has to be read at every take-over.
+// One capture per process meant the SECOND connect/disconnect cycle
+// restored (or deleted) the value cached at the first — a user who moves
+// to another proxy while NekoGo is disconnected loses it on the next
+// Disconnect.
+func TestApplyRecapturesAProxyChangedWhileWeWereOff(t *testing.T) {
+	restore := isolateSysproxy(t)
+	defer restore()
+	ports := ProxyPorts{HTTP: 2080, SOCKS: 2080, Mixed: true}
+	if err := sysproxyApply(ports); err != nil {
+		t.Fatalf("first apply: %v", err)
+	}
+	if err := sysproxyRestore(); err != nil {
+		t.Fatalf("first restore: %v", err)
+	}
+	// NekoGo is idle; the user (or IT) moves to a new proxy.
+	if err := setScratchProxyServer(t, "corp2.example:3128"); err != nil {
+		t.Fatal(err)
+	}
+	if err := setScratchProxyEnable(t, 1); err != nil {
+		t.Fatal(err)
+	}
+	if err := sysproxyApply(ports); err != nil {
+		t.Fatalf("second apply: %v", err)
+	}
+	if err := sysproxyRestore(); err != nil {
+		t.Fatalf("second restore: %v", err)
+	}
+	if en, srv := readScratchProxy(t); en != 1 || srv != "corp2.example:3128" {
+		t.Fatalf("second revert gave back ProxyEnable=%d ProxyServer=%q, want the proxy the user actually had (1, corp2.example:3128)", en, srv)
+	}
+}
+
+// TestAdoptedStaleProxyIsClearedNotRestored: the OS switch already reads
+// NekoGo's own address when this process takes the proxy — a leftover
+// from NekoBox on the same default 2080, from a crash whose marker is
+// gone, or typed by hand. Connect used to treat that as "already on,
+// nothing to do" and claim ownership anyway, so the later
+// ClearSystemProxy refused to act (no flag, no marker) and reported
+// success: the machine kept ProxyEnable=1 pointed at the port that had
+// just closed, i.e. no internet until the registry is fixed by hand.
+func TestAdoptedStaleProxyIsClearedNotRestored(t *testing.T) {
+	restore := isolateSysproxy(t)
+	defer restore()
+	oldReader := sysProxyReader
+	defer func() { sysProxyReader = oldReader }()
+	sysProxyReader = func() (bool, string, error) {
+		en, srv, _ := readScratchProxyLoose(t)
+		return en != 0, srv, nil
+	}
+	if err := setScratchProxyServer(t, "127.0.0.1:2080"); err != nil {
+		t.Fatal(err)
+	}
+	if err := setScratchProxyEnable(t, 1); err != nil {
+		t.Fatal(err)
+	}
+	app := runningProxyApp(t, 2080, CoreSingBox)
+	if err := app.ensureSystemProxy(app.ActiveProxyPorts()); err != nil {
+		t.Fatalf("ensureSystemProxy: %v", err)
+	}
+	if !sysproxyOwned() {
+		t.Fatal("ensure adopted a proxy this process did not install without recording ownership: the revert below has nothing to undo")
+	}
+	if err := app.ClearSystemProxy(); err != nil {
+		t.Fatalf("ClearSystemProxy: %v", err)
+	}
+	en, srv, haveSrv := readScratchProxyLoose(t)
+	if en != 0 {
+		t.Fatalf("revert left ProxyEnable=%d pointed at the closed port (ProxyServer=%q)", en, srv)
+	}
+	if haveSrv && srv == "127.0.0.1:2080" {
+		t.Fatal("revert wrote NekoGo's own address back as the previous proxy")
+	}
+}
+
+// A crash report can describe an engine that a newer connect already
+// replaced: handleEngineExit flips the group state, then a Start commits
+// while the report is still in flight. noteFault is the App-side observer
+// and used to tear the session's system proxy down on sight, so browsers
+// stopped using the tunnel while the app still reported it connected and
+// traffic still counted.
+func TestEngineFaultKeepsALiveSessionsProxy(t *testing.T) {
+	restore := isolateSysproxy(t)
+	defer restore()
+	app := runningProxyApp(t, 2080, CoreSpoof)
+	if err := app.EnableSystemProxyGUI(); err != nil {
+		t.Fatalf("EnableSystemProxyGUI: %v", err)
+	}
+	if en, srv := readScratchProxy(t); en != 1 || srv != "127.0.0.1:2080" {
+		t.Fatalf("rig is wrong: ProxyEnable=%d ProxyServer=%q", en, srv)
+	}
+
+	// The superseding connect commits inside the fault window.
+	app.cores.faultRaceHook = func() {
+		app.cores.mu.Lock()
+		app.cores.epoch++
+		app.cores.running = true
+		app.cores.activeID = "p2"
+		app.cores.mu.Unlock()
+	}
+	defer func() { app.cores.faultRaceHook = nil }()
+
+	app.cores.handleEngineExit(newEngineExit("spoof", nil, errors.New("engine died"), time.Now().Add(-time.Minute), nil))
+
+	if en, srv := readScratchProxy(t); en != 1 || srv != "127.0.0.1:2080" {
+		t.Fatalf("a superseded engine's death took the live session's proxy off: ProxyEnable=%d ProxyServer=%q", en, srv)
+	}
+	if msg := app.LastError(); msg != "" {
+		t.Fatalf("the live session was shown a disconnect banner for an engine it no longer uses: %q", msg)
+	}
+}
+
+// The other half: with nothing live the report IS the disconnect, and the
+// proxy has to come off — the tunnel's listener is gone.
+func TestEngineFaultWithNoLiveSessionStillRevertsTheProxy(t *testing.T) {
+	restore := isolateSysproxy(t)
+	defer restore()
+	app := runningProxyApp(t, 2080, CoreSpoof)
+	if err := app.EnableSystemProxyGUI(); err != nil {
+		t.Fatalf("EnableSystemProxyGUI: %v", err)
+	}
+	// handleEngineExit flips the group state before notifying, which is
+	// what "nothing is live any more" looks like from here.
+	app.cores.mu.Lock()
+	app.cores.running = false
+	app.cores.activeID = ""
+	app.cores.mu.Unlock()
+
+	app.noteFault(newEngineExit("spoof", nil, errors.New("engine died"), time.Now().Add(-time.Minute), nil))
+
+	if en, _ := readScratchProxy(t); en != 0 {
+		t.Fatalf("ProxyEnable=%d after a real engine death: traffic keeps dialing a closed listener", en)
+	}
+	if msg := app.LastError(); msg == "" {
+		t.Fatal("the engine death left no banner: the user cannot tell why it disconnected")
+	}
+}
+
+// TestMarkerWriteFailureKeepsTheOldRecord: the marker is the ONLY
+// record of the OS proxy values the GUI replaced, so an interrupted
+// write — a process killed mid-flush, or the ENOSPC this machine hits
+// daily — must not leave the user's own proxy unrecoverable. The record
+// is a whole value: it either reaches the disk complete or the previous
+// complete one stays readable.
+func TestMarkerWriteFailureKeepsTheOldRecord(t *testing.T) {
+	restore := isolateSysproxy(t)
+	defer restore()
+
+	sysproxyMu.Lock()
+	sysproxyCached = true
+	sysproxyPrev = sysproxyState{enable: 1, haveEnable: true, server: "corp:8888", haveServer: true}
+	sysproxyMu.Unlock()
+	sysproxyWriteMarker()
+	if st, ok := readSysproxyMarker(); !ok || st.Server != "corp:8888" {
+		t.Fatalf("setup: marker = %+v (readable=%v)", st, ok)
+	}
+
+	old := sysproxyMarkerWrite
+	// Exactly what a crash during the write leaves behind: some bytes
+	// reached the disk, the operation never completed.
+	sysproxyMarkerWrite = func(p string, data []byte, perm os.FileMode) error {
+		_ = os.WriteFile(p, data[:len(data)/2], perm)
+		return errors.New("write interrupted")
+	}
+	sysproxyMu.Lock()
+	sysproxyPrev = sysproxyState{enable: 0, haveEnable: true, server: "next:1", haveServer: true}
+	sysproxyMu.Unlock()
+	sysproxyWriteMarker()
+	sysproxyMarkerWrite = old
+
+	st, ok := readSysproxyMarker()
+	if !ok {
+		t.Fatal("the interrupted write left no readable marker: the user's own proxy is gone, and the next restore can only disable")
+	}
+	if st.Server != "corp:8888" {
+		t.Fatalf("marker now records %q, want the previous complete record %q", st.Server, "corp:8888")
+	}
+}
+
+// TestProxyIsNeverInstalledWithoutACrashRecord: the registry commit and
+// the marker used to be ordered the wrong way round — ProxyServer and
+// ProxyEnable went to the OS first, and the record of what they
+// replaced went second, unchecked. An apply interrupted in that window
+// (marker write fails, or the process dies) leaves the machine pointing
+// at our 127.0.0.1:<port> with nothing marking it as ours, so the next
+// launch treats a dead proxy as somebody else's setting and leaves it
+// alone for good.
+func TestProxyIsNeverInstalledWithoutACrashRecord(t *testing.T) {
+	restore := isolateSysproxy(t)
+	defer restore()
+	old := sysproxyMarkerWrite
+	sysproxyMarkerWrite = func(string, []byte, os.FileMode) error {
+		return errors.New("no space left on device")
+	}
+	defer func() { sysproxyMarkerWrite = old }()
+
+	app := runningProxyApp(t, 2080, CoreSingBox)
+	err := app.EnableSystemProxyGUI()
+	en, srv := readScratchProxy(t)
+	if err == nil {
+		t.Fatalf("a session that cannot record its own revert reported success: ProxyEnable=%d ProxyServer=%q is now unrecoverable by us", en, srv)
+	}
+	if en != 0 || srv != "prev-proxy:8888" {
+		t.Fatalf("the OS proxy was changed even though the record failed: ProxyEnable=%d ProxyServer=%q", en, srv)
+	}
+}
+
+// TestApplyFailingBeforeAnyWriteLeavesNoClaim: the marker moved in
+// front of the registry commit, so the other half of the invariant needs
+// its own test — an apply that changed nothing at all must not start
+// claiming the user's proxy as ours. Losing that would make a failed
+// toggle disable a corporate proxy at the next exit for nothing.
+func TestApplyFailingBeforeAnyWriteLeavesNoClaim(t *testing.T) {
+	restore := isolateSysproxy(t)
+	defer restore()
+	oldWrite := sysproxyWriteString
+	defer func() { sysproxyWriteString = oldWrite }()
+	sysproxyWriteString = func(k registry.Key, name, v string) error {
+		if name == "ProxyOverride" {
+			return fmt.Errorf("injected ProxyOverride failure")
+		}
+		return oldWrite(k, name, v)
+	}
+	app := runningProxyApp(t, 2080, CoreSingBox)
+	if err := app.SetSystemProxy(app.ActiveProxyPorts()); err == nil {
+		t.Fatal("SetSystemProxy with a failing first write = nil, want an error")
+	}
+	if en, srv := readScratchProxy(t); en != 0 || srv != "prev-proxy:8888" {
+		t.Fatalf("registry changed despite the failure: ProxyEnable=%d ProxyServer=%q", en, srv)
+	}
+	if sysproxyMarkerExists() {
+		t.Fatal("an apply that wrote nothing left a crash record claiming the user's proxy")
+	}
+	if sysproxyOwned() {
+		t.Fatal("an apply that wrote nothing claimed ownership of the OS proxy")
 	}
 }

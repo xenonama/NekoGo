@@ -56,6 +56,12 @@ func sysproxyMarkerPath() string {
 	return filepath.Join(d, ".sysproxy_set")
 }
 
+// sysproxyMarkerWrite is how the marker bytes reach the disk. It exists
+// so a test can stop a write half way through — the way a killed process
+// or a full disk does — and then look at what the on-disk record is
+// (same purpose as the registry write seams below).
+var sysproxyMarkerWrite = os.WriteFile
+
 // sysproxyMarkerState is the crash-recovery record: the OS proxy values
 // the GUI replaced. A crashed session restores THESE on the next launch.
 // The marker used to carry just the word "set", so recovery could only
@@ -70,11 +76,13 @@ type sysproxyMarkerState struct {
 }
 
 // sysproxyWriteMarker records the cached previous state. Callers hold
-// sysproxyMu.
-func sysproxyWriteMarker() {
+// sysproxyMu. It writes through a temporary file and renames, so the
+// destination only ever holds a complete record: an interrupted write
+// costs the new value, never the old one the next launch has to restore.
+func sysproxyWriteMarker() error {
 	p := sysproxyMarkerPath()
 	if p == "" {
-		return
+		return nil
 	}
 	_ = os.MkdirAll(filepath.Dir(p), 0o755)
 	st := sysproxyMarkerState{
@@ -87,9 +95,18 @@ func sysproxyWriteMarker() {
 	}
 	data, err := json.Marshal(st)
 	if err != nil {
-		return
+		return err
 	}
-	_ = os.WriteFile(p, data, 0o644)
+	tmp := p + ".tmp"
+	if err := sysproxyMarkerWrite(tmp, data, 0o644); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	if err := os.Rename(tmp, p); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	return nil
 }
 
 // readSysproxyMarker loads a marker written by sysproxyWriteMarker.
@@ -162,8 +179,10 @@ func refreshWinINET() {
 	_, _, _ = proc.Call(0, uintptr(refresh), 0, 0)
 }
 
-// sysproxyApply sets the OS proxy for the given core ports, caching
-// the previous OS values on the first call of the session.
+// sysproxyApply sets the OS proxy for the given core ports. The
+// previous OS values are captured for the revert on every take-over,
+// kept across a failed one so the original still comes back, and
+// dropped again by sysproxyRestore (see there).
 func sysproxyApply(p ProxyPorts) error {
 	sysproxyMu.Lock()
 	defer sysproxyMu.Unlock()
@@ -183,20 +202,55 @@ func sysproxyApply(p ProxyPorts) error {
 			sysproxyPrev.override, sysproxyPrev.haveOverride = v, true
 		}
 		key.Close()
+		// A previous state that already IS our target address is not
+		// something to restore. That shape is a stale pointer at a NekoGo
+		// port — NekoBox used the same default 2080, and a crashed session
+		// whose marker did not survive reads the same — so keeping it would
+		// have the revert put the dead address back instead of clearing it.
+		// Drop only the enable/server pair: the user's own ProxyOverride is
+		// still theirs and still comes back.
+		if sysproxyPrev.haveEnable && sysproxyPrev.enable != 0 &&
+			sysproxyPrev.haveServer && sysproxyPrev.server == proxyServerValue(p) {
+			sysproxyPrev.enable, sysproxyPrev.haveEnable = 0, false
+			sysproxyPrev.server, sysproxyPrev.haveServer = "", false
+		}
 		sysproxyCached = true
 	}
 
+	// The crash record goes down BEFORE the OS values change. It used to
+	// be written last, and its error ignored: an apply that committed
+	// ProxyServer and ProxyEnable and then died here (or hit a full disk)
+	// left the machine dialing our 127.0.0.1:<port> with nothing marking
+	// that address as ours, so the next launch read a foreign proxy and
+	// the dead pointer stayed until the user found the setting by hand.
+	hadMarker := sysproxyMarkerExists()
+	if err := sysproxyWriteMarker(); err != nil {
+		return fmt.Errorf("record the revert: %w", err)
+	}
+	// keep the invariant that a marker is only left behind when the
+	// registry may really have changed: no change, no claim.
+	rollback := func() {
+		if !hadMarker {
+			sysproxyRemoveMarker()
+		}
+	}
 	key, err := registry.OpenKey(registry.CURRENT_USER, sysproxyKeyPath, registry.SET_VALUE)
 	if err != nil {
+		rollback()
 		return fmt.Errorf("open internet settings for write: %w", err)
 	}
 	defer key.Close()
 	// Commit order: values first, ProxyEnable last. ProxyEnable is what
 	// makes WinINET read ProxyServer at all, so a write that fails part
 	// way through this list leaves the switch wherever the user had it —
-	// never switched on at an address we did not finish installing.
+	// never switched on at an address we did not finish installing. A
+	// failure after the first value write keeps the marker: the registry
+	// now holds something we did change, and the record is what puts it
+	// back (the old order dropped it, leaking our "<local>" ProxyOverride
+	// into the user's exception list for good).
 	if !sysproxyPrev.haveOverride {
 		if err := sysproxyWriteString(key, "ProxyOverride", "<local>"); err != nil {
+			rollback()
 			return fmt.Errorf("set ProxyOverride: %w", err)
 		}
 	}
@@ -208,7 +262,6 @@ func sysproxyApply(p ProxyPorts) error {
 	}
 	refreshWinINET()
 	sysproxyIsSet = true
-	sysproxyWriteMarker()
 	return nil
 }
 
@@ -278,6 +331,13 @@ func sysproxyRestore() error {
 	}
 	refreshWinINET()
 	sysproxyIsSet = false
+	// The captured snapshot has now been handed back, so it describes a
+	// proxy the OS no longer has. Keeping it alive for the whole process
+	// made the SECOND connect/disconnect cycle restore (or delete, when
+	// the first capture found nothing) what was there at the FIRST — a
+	// user who changed their proxy while NekoGo was off lost it on the
+	// next Disconnect. The next apply re-reads instead.
+	sysproxyCached = false
 	sysproxyRemoveMarker()
 	return nil
 }

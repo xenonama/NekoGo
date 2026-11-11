@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -444,5 +445,68 @@ func TestRefreshOneCountryKeepsConcurrentEdits(t *testing.T) {
 	}
 	if cur.CountryCode != "DE" || cur.CountryName != "Germany" || cur.CountryAt == nil {
 		t.Fatalf("country not stamped: %+v", cur)
+	}
+}
+
+// TestGeoIPReloadErrorContract: Reload used to return nil whatever
+// happened, so an updater that had just replaced the file could not tell a
+// clean swap from a database that will not open. A present-but-unopenable
+// file must now report, while a still-missing one stays quiet — degrading
+// to "unknown country" without a DB is the documented behaviour, not a
+// failure.
+func TestGeoIPReloadErrorContract(t *testing.T) {
+	dir := t.TempDir()
+	broken := filepath.Join(dir, "GeoLite2-Country.mmdb")
+	if err := os.WriteFile(broken, []byte("<html>403 — not a database</html>"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	g := NewGeoIP(broken)
+	if g.Available() {
+		t.Fatal("Available() = true with an unopenable file")
+	}
+	err := g.Reload()
+	if err == nil {
+		t.Fatal("Reload() = nil, want the open failure reported")
+	}
+	if !strings.Contains(err.Error(), "MaxMind") {
+		t.Fatalf("Reload err = %v, want the reader's own message", err)
+	}
+
+	t.Chdir(dir)
+	missing := NewGeoIP(`Z:\definitely\not\here\GeoLite2-Country.mmdb`)
+	if err := missing.Reload(); err != nil {
+		t.Fatalf("Reload with no database anywhere = %v, want nil", err)
+	}
+	if err := missing.LastErr(); !errors.Is(err, errGeoIPNoDB) {
+		t.Fatalf("LastErr = %v, want the no-database sentinel", err)
+	}
+}
+
+// TestValidateMMDBBytes pins the gate the GeoIP updater runs before it
+// touches the installed file: real bytes and trailing padding pass, the
+// shapes a CDN or an LFS-enabled mirror can hand back do not.
+func TestValidateMMDBBytes(t *testing.T) {
+	raw, err := os.ReadFile("assets/GeoLite2-Country.mmdb")
+	if err != nil {
+		t.Skip("no real GeoLite2 DB present")
+	}
+	for _, good := range [][]byte{raw, append(append([]byte{}, raw...), "padding"...), append(append([]byte{}, raw...), 0)} {
+		if err := validateMMDBBytes(good); err != nil {
+			t.Errorf("valid database of %d bytes refused: %v", len(good), err)
+		}
+	}
+	for _, bad := range []struct {
+		name string
+		data []byte
+	}{
+		{"empty", []byte{}},
+		{"error page", []byte("<html>see vless://a-link</html>")},
+		{"lfs pointer", []byte("#!GITLFS version https://git-lfs.github.com/spec/v1\noid sha256:0\nsize 1\n")},
+		{"truncated", raw[:len(raw)/2]},
+		{"header only", raw[:64]},
+	} {
+		if err := validateMMDBBytes(bad.data); err == nil {
+			t.Errorf("%s accepted as a database, want refusal", bad.name)
+		}
 	}
 }

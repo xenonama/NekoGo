@@ -89,6 +89,17 @@ func forgetDoH(t *testing.T, hosts ...string) {
 	t.Cleanup(drop)
 }
 
+// allowLoopbackSpoofAnswers opens the public-answer gate for one test. A
+// hermetic scan can only ever dial loopback, so Plan A's scan tests answer
+// the decoy SNI with the local TLS server's address; gate behaviour itself
+// is covered in sni_doh_filter_test.go, which leaves this closed.
+func allowLoopbackSpoofAnswers(t *testing.T) {
+	t.Helper()
+	old := spoofEndpointUsable
+	spoofEndpointUsable = func(net.IP) bool { return true }
+	t.Cleanup(func() { spoofEndpointUsable = old })
+}
+
 func planTestApp(t *testing.T, plan string) (*App, *ConfigStore) {
 	t.Helper()
 	store, err := NewConfigStore(t.TempDir())
@@ -245,6 +256,9 @@ func TestScanSNIPairsPlanAStampsResolvedIP(t *testing.T) {
 	withLocalTLS(t, ts)
 	f := newFakeDoH(t, map[string]string{"example.com": "127.0.0.1"})
 	useDoH(t, f)
+	// The answer is loopback because the handshake target is the local TLS
+	// server above; see allowLoopbackSpoofAnswers.
+	allowLoopbackSpoofAnswers(t)
 
 	a, store := planTestApp(t, "A")
 	res, err := a.ScanSNIPairs(nil, []string{"example.com"})
@@ -290,6 +304,7 @@ func TestScanSNIPairsPlanAResolveFailure(t *testing.T) {
 	// TLS server's certificate covers.
 	f := newFakeDoH(t, map[string]string{"example.com": "127.0.0.1"})
 	useDoH(t, f)
+	allowLoopbackSpoofAnswers(t)
 
 	a, store := planTestApp(t, "A")
 	if err := store.UpdateSNI(func(s *Settings) {

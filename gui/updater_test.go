@@ -39,7 +39,19 @@ func newUpdaterTestApp(t *testing.T) *App {
 	if err != nil {
 		t.Fatal(err)
 	}
-	return NewApp(store, make(chan LogEntry, 64))
+	app := NewApp(store, make(chan LogEntry, 64))
+	// The GeoIP reader memory-maps the database, and Windows refuses to
+	// rewrite a file with a live mapping. updaterDataDir() is the test
+	// binary's own directory, shared by every test in this package, so a
+	// fixture that writes the database with os.WriteFile would fail on
+	// whatever the previous test left mapped. installFile is unaffected
+	// (it renames, which works), only the fixtures.
+	t.Cleanup(func() {
+		if app.geo != nil {
+			app.geo.Configure(`Z\definitely\not\here\GeoLite2-Country.mmdb`)
+		}
+	})
+	return app
 }
 
 // TestListUpdatablesNoFiles — no DBs, no cores, no externals: 7 rows,
@@ -112,11 +124,25 @@ func fakeMMDBServer(t *testing.T, payload []byte, etag string) *httptest.Server 
 	return httptest.NewServer(mux)
 }
 
+// geoDBPayload returns bytes the GeoIP installer accepts: the bundled
+// database with a salt appended. The reader ignores anything after the
+// metadata marker, so two salts give two distinct "revisions" without a
+// second database — and a made-up string is no longer an option, because
+// updateDataFile refuses bytes that are not a database.
+func geoDBPayload(t *testing.T, salt string) []byte {
+	t.Helper()
+	raw, err := os.ReadFile("assets/GeoLite2-Country.mmdb")
+	if err != nil {
+		t.Skip("no real GeoLite2 DB present")
+	}
+	return append(append([]byte{}, raw...), salt...)
+}
+
 // TestUpdateComponentGeoIP — redirected download installs the file,
 // Current tracks the new hash, geo detector reloads without panic.
 func TestUpdateComponentGeoIP(t *testing.T) {
 	saveUpdateBaseURL(t)
-	payload := []byte("fake-mmdb-bytes-v1")
+	payload := geoDBPayload(t, "rev-1")
 	srv := fakeMMDBServer(t, payload, "etag-v1")
 	defer srv.Close()
 	updateBaseURL["jsdelivr"] = srv.URL
@@ -157,7 +183,7 @@ func TestGeoIPUpdateWithAnOverrideReportsTheTruth(t *testing.T) {
 		t.Fatal(err)
 	}
 	saveUpdateBaseURL(t)
-	payload := []byte("fake-mmdb-bytes-v2")
+	payload := append(append([]byte{}, raw...), "rev-2"...)
 	srv := fakeMMDBServer(t, payload, "etag-v2")
 	defer srv.Close()
 	updateBaseURL["jsdelivr"] = srv.URL
@@ -183,6 +209,54 @@ func TestGeoIPUpdateWithAnOverrideReportsTheTruth(t *testing.T) {
 	}
 	if !bytes.Equal(after, raw) {
 		t.Fatal("the update overwrote the user's override file")
+	}
+}
+
+// TestUpdateComponentGeoIPRejectsNonDatabase — the jsDelivr GeoIP copy
+// publishes no sha256, so verifyDigest cannot help here: the only thing
+// standing between a truncated download, an error page or an LFS pointer
+// and the file every country lookup reads is this check. It has to refuse
+// BEFORE writing — accepting junk put it on disk, moved the revision marker
+// to the new revision and left nothing to retry, so lookups went dead
+// silently at the next restart.
+func TestUpdateComponentGeoIPRejectsNonDatabase(t *testing.T) {
+	saveUpdateBaseURL(t)
+	good := geoDBPayload(t, "rev-1")
+	dest := filepath.Join(updaterDataDir(), "GeoLite2-Country.mmdb")
+	if err := os.WriteFile(dest, good, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	for _, junk := range []struct {
+		name    string
+		payload []byte
+	}{
+		{"error page", []byte("<html>403 — see vless://looks-like-a-link</html>")},
+		{"empty body", []byte{}},
+		{"lfs pointer", []byte("#!GITLFS version https://git-lfs.github.com/spec/v1\noid sha256:0000\nsize 7649827\n")},
+		{"truncated", good[:len(good)/2]},
+	} {
+		srv := fakeMMDBServer(t, junk.payload, "etag-junk")
+		updateBaseURL["jsdelivr"] = srv.URL
+		a := newUpdaterTestApp(t)
+		if _, err := a.UpdateComponent("geoip"); err == nil {
+			t.Errorf("%s: junk download accepted, want refusal", junk.name)
+		} else if !strings.Contains(err.Error(), "database") {
+			t.Errorf("%s: err = %v, want it to name the database", junk.name, err)
+		}
+		srv.Close()
+	}
+	after, err := os.ReadFile(dest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(after, good) {
+		t.Fatal("a refused download replaced the installed database")
+	}
+	// A marker left by an earlier test in this package (same shared
+	// directory) is fine; one moved to the junk revision is not — that is
+	// what would make checkGeoIP stop offering a re-download.
+	if m, err := os.ReadFile(geoipMarker()); err == nil && strings.Contains(string(m), "junk") {
+		t.Fatalf("a refused download moved the revision marker to %q", m)
 	}
 }
 
@@ -533,7 +607,7 @@ func TestUpdateGUIDoesNotAutoOpen(t *testing.T) {
 // revision marker written so the next check stops offering the update.
 func TestUpdateComponentIdenticalIsNoop(t *testing.T) {
 	saveUpdateBaseURL(t)
-	payload := []byte("fake-mmdb-bytes-v1")
+	payload := geoDBPayload(t, "rev-1")
 	srv := fakeMMDBServer(t, payload, "etag-v1")
 	defer srv.Close()
 	updateBaseURL["jsdelivr"] = srv.URL

@@ -90,7 +90,73 @@ type LinkImportResult struct {
 	Invalid  int       `json:"invalid"`
 }
 
-var subHTTP = &http.Client{Timeout: 20 * time.Second}
+// maxSubRedirects is the chain length the default net/http policy would
+// have enforced; supplying CheckRedirect replaces that limit, so the
+// client has to carry its own.
+const maxSubRedirects = 10
+
+var subHTTP = &http.Client{
+	Timeout: 20 * time.Second,
+	CheckRedirect: func(req *http.Request, via []*http.Request) error {
+		if len(via) >= maxSubRedirects {
+			return fmt.Errorf("subscription redirect chain longer than %d", maxSubRedirects)
+		}
+		return subRedirectAllowed(req.URL)
+	},
+}
+
+// subRedirectAllowed gates the hops a subscription URL can point at.
+//
+// A subscription is fetched again on a timer (Settings → auto-update), so a
+// redirect is a second hop the server picked and nobody looks at: a public
+// feed can 302 to 127.0.0.1:8080 (a local admin API), 169.254.169.254
+// (cloud metadata) or an RFC1918 host, and the reply body gets scanned for
+// "://" and reported back — a read primitive against the user's own
+// network.
+//
+// Only redirect targets are gated: the first URL is the user's own choice
+// and may legitimately be a LAN subscription server. Hosts are judged as
+// written, without a DNS round trip — a name that happens to resolve to a
+// private address is outside what this can see, and resolving inside the
+// client would make every refresh depend on the resolver.
+func subRedirectAllowed(target *url.URL) error {
+	switch target.Scheme {
+	case "http", "https":
+	default:
+		return fmt.Errorf("subscription redirects to unsupported scheme %q", target.Scheme)
+	}
+	host := target.Hostname()
+	if host == "" {
+		return fmt.Errorf("subscription redirect has no host")
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		// 100.64.0.0/10 is not routable anywhere and is exactly where
+		// Tailscale puts its peers (plus 100.100.100.100, served by the
+		// local tailscaled) — RFC 1918 alone would miss it.
+		if ip4 := ip.To4(); ip4 != nil && ip4[0] == 100 && ip4[1]&0xc0 == 0x40 {
+			return fmt.Errorf("subscription redirects to shared-address space %s", host)
+		}
+		// 0.0.0.0 / :: mean "this host" to the dialer.
+		if ip.IsUnspecified() || !isPublicIP(ip) {
+			return fmt.Errorf("subscription redirects to a local or private address (%s)", host)
+		}
+		return nil
+	}
+	low := strings.ToLower(strings.TrimSuffix(host, "."))
+	switch {
+	case low == "localhost",
+		strings.HasSuffix(low, ".localhost"), // RFC 6761
+		strings.HasSuffix(low, ".local"),     // mDNS
+		strings.HasSuffix(low, ".internal"),
+		strings.HasSuffix(low, ".home.arpa"):
+		return fmt.Errorf("subscription redirects to a local hostname (%s)", host)
+	case !strings.Contains(low, "."):
+		// No public name is dot-free; a single label only resolves
+		// through whatever search domain this machine appends.
+		return fmt.Errorf("subscription redirects to a single-label hostname (%s)", host)
+	}
+	return nil
+}
 
 // decodeB64 tries all common base64 alphabets, padded or raw.
 func decodeB64(s string) ([]byte, error) {
@@ -126,20 +192,92 @@ func splitHostPort(hp string) (string, int, error) {
 	return strings.Trim(host, "[]"), port, nil
 }
 
+// splitLinkFragment cuts the label off the end of a link BEFORE url.Parse
+// sees it. A bare "%" in a name ("#100%", "#50% off") is not a valid
+// percent-escape, and Go rejects the entire URL for it — so a node whose
+// endpoint is perfectly fine used to be reported as an import error simply
+// because of its label. Generators do write labels unencoded.
+func splitLinkFragment(link string) (rest, frag string) {
+	if i := strings.IndexByte(link, '#'); i >= 0 {
+		return link[:i], link[i+1:]
+	}
+	return link, ""
+}
+
+// escapeUserinfoPercents rewrites every "%" in a link's credential that is
+// not a valid percent-escape into "%25", so url.Parse accepts the link and
+// its own unescaping returns exactly the bytes the generator wrote. Go
+// rejects the ENTIRE URL over one invalid escape, which used to lose a node
+// whose endpoint was perfectly readable just because its password held a
+// bare "%" — the same class as the label, but in the userinfo. A correctly
+// escaped credential is left untouched and still decodes once.
+func escapeUserinfoPercents(rest string) string {
+	i := strings.Index(rest, "://")
+	if i < 0 {
+		return rest
+	}
+	start := i + 3
+	// The authority ends at the first "/" or "?", matching url.Parse.
+	end := len(rest)
+	if j := strings.IndexAny(rest[start:], "/?"); j >= 0 {
+		end = start + j
+	}
+	// url.Parse splits host from userinfo at the LAST "@", so the userinfo
+	// may itself hold an escaped "@"; only a bare "%" needs fixing.
+	at := strings.LastIndexByte(rest[start:end], '@')
+	if at < 0 {
+		return rest
+	}
+	userinfo := rest[start : start+at]
+	if !strings.Contains(userinfo, "%") {
+		return rest
+	}
+	var b strings.Builder
+	b.Grow(len(userinfo) + 8)
+	for k := 0; k < len(userinfo); k++ {
+		if userinfo[k] == '%' && !hasHexEscape(userinfo[k:]) {
+			b.WriteString("%25")
+			continue
+		}
+		b.WriteByte(userinfo[k])
+	}
+	return rest[:start] + b.String() + rest[start+at:]
+}
+
+// hasHexEscape reports whether s begins with a complete "%XX" escape.
+func hasHexEscape(s string) bool {
+	return len(s) >= 3 && s[0] == '%' && isHexDigit(s[1]) && isHexDigit(s[2])
+}
+
+func isHexDigit(c byte) bool {
+	return c >= '0' && c <= '9' || c >= 'a' && c <= 'f' || c >= 'A' && c <= 'F'
+}
+
+// linkName turns a link's fragment into the profile label. frag must be
+// given in its ON-THE-WIRE (percent-encoded) form: url.Parse already
+// decodes u.Fragment, so passing that here decoded twice and rewrote
+// "a%41b" into "aAb".
 func linkName(frag, fallback string) string {
 	if frag != "" {
 		if n, err := url.PathUnescape(frag); err == nil && n != "" {
 			return n
 		}
+		// Not percent-encoded after all — a bare "%" is ordinary in a
+		// label ("100%"). Falling back here threw the user's own name
+		// away and replaced it with host:port.
+		return frag
 	}
 	return fallback
 }
 
 // --- vmess ---
 
-// parseVmess parses vmess://base64(json).
+// parseVmess parses vmess://base64(json), with or without a trailing
+// #remark. Generators that put the label in the fragment are common, and
+// "#" is outside every base64 alphabet: before the split the payload looked
+// like corrupt base64 and the whole node was rejected as unreadable.
 func parseVmess(link string) (*Profile, error) {
-	raw := strings.TrimPrefix(link, "vmess://")
+	raw, rawFrag := splitLinkFragment(strings.TrimPrefix(link, "vmess://"))
 	data, err := decodeB64(raw)
 	if err != nil {
 		return nil, fmt.Errorf("vmess: %w", err)
@@ -148,11 +286,19 @@ func parseVmess(link string) (*Profile, error) {
 	if err := json.Unmarshal(data, &m); err != nil {
 		return nil, fmt.Errorf("vmess: bad json: %w", err)
 	}
+	// A JSON null is a converter's way of writing "option absent". Turning
+	// the value into a string with fmt.Sprint rendered that as the literal
+	// "<nil>", which then reached the profile as an SNI/Host/path of <nil>
+	// and broke TLS on an otherwise readable node.
 	str := func(k string) string {
-		if v, ok := m[k]; ok {
+		switch v := m[k].(type) {
+		case nil:
+			return ""
+		case string:
+			return v
+		default:
 			return fmt.Sprint(v)
 		}
-		return ""
 	}
 	addr := str("add")
 	if addr == "" {
@@ -169,7 +315,6 @@ func parseVmess(link string) (*Profile, error) {
 	p := &Profile{
 		Protocol:     "vmess",
 		Core:         CoreSingBox,
-		Name:         linkName("", ""),
 		Address:      addr,
 		Port:         port,
 		IDOrPassword: str("id"),
@@ -186,12 +331,12 @@ func parseVmess(link string) (*Profile, error) {
 	if p.Network == "" {
 		p.Network = "tcp"
 	}
-	p.Name = linkName("", "")
-	if ps := str("ps"); ps != "" {
-		p.Name = ps
-	}
+	// "ps" is the field the format reserves for the remark, so it wins over
+	// the fragment; the fragment (percent-encoded on the wire, so it goes
+	// through linkName) is the fallback for payloadless labels.
+	p.Name = str("ps")
 	if p.Name == "" {
-		p.Name = fmt.Sprintf("%s:%d", addr, port)
+		p.Name = linkName(rawFrag, fmt.Sprintf("%s:%d", addr, port))
 	}
 	if p.IDOrPassword == "" {
 		return nil, fmt.Errorf("vmess: missing id")
@@ -200,6 +345,18 @@ func parseVmess(link string) (*Profile, error) {
 }
 
 // --- vless / trojan ---
+
+// linkFlag reads a URI query boolean. "1" is what this app writes, but
+// generators emit "true" just as often, and a value that only matched "1"
+// dropped the option without a word — for allowInsecure that meant
+// verifying a certificate the link explicitly said not to.
+func linkFlag(v string) bool {
+	switch strings.ToLower(strings.TrimSpace(v)) {
+	case "1", "true":
+		return true
+	}
+	return false
+}
 
 func queryLower(q url.Values) url.Values {
 	out := url.Values{}
@@ -213,7 +370,8 @@ func queryLower(q url.Values) url.Values {
 // trojan://password@host:port?...#name.
 func parseVlessTrojan(link string) (*Profile, error) {
 	isVless := strings.HasPrefix(link, "vless://")
-	u, err := url.Parse(link)
+	rest, rawFrag := splitLinkFragment(link)
+	u, err := url.Parse(escapeUserinfoPercents(rest))
 	if err != nil {
 		return nil, fmt.Errorf("bad url: %w", err)
 	}
@@ -305,7 +463,7 @@ func parseVlessTrojan(link string) (*Profile, error) {
 		p.Host = get("authority")
 	}
 	p.ALPN = get("alpn")
-	p.AllowInsecure = get("allowinsecure") == "1" || get("insecure") == "1" || get("skip-cert-verify") == "1"
+	p.AllowInsecure = linkFlag(get("allowinsecure")) || linkFlag(get("insecure")) || linkFlag(get("skip-cert-verify"))
 	// Fragment + mux (Streisand/v2rayNG URI convention):
 	// fragment=<packets>,<length>,<interval> (either part order),
 	// mux=<concurrency>, muxproto=<h2mux|smux|yamux>. A muxproto
@@ -332,7 +490,7 @@ func parseVlessTrojan(link string) (*Profile, error) {
 		p.MuxEnabled = true
 		p.MuxProtocol = proto
 	}
-	p.Name = linkName(u.Fragment, fmt.Sprintf("%s:%d", host, port))
+	p.Name = linkName(rawFrag, fmt.Sprintf("%s:%d", host, port))
 	return p, nil
 }
 
@@ -367,7 +525,12 @@ func parseSS(link string) (*Profile, error) {
 	var method, password, hostport string
 	if i := strings.LastIndex(rest, "@"); i >= 0 {
 		userinfo, hp := rest[:i], rest[i+1:]
-		if strings.Contains(userinfo, ":") && !strings.ContainsAny(userinfo, "=%") {
+		// ":" is in no base64 alphabet, so a literal colon can only come from
+		// the plaintext method:password shape — whatever else that password
+		// holds ("=", "%", "+", "/"). Requiring "no = or %" as well used to
+		// send such userinfo to the base64 decoder, which refused it and lost
+		// a readable node.
+		if strings.Contains(userinfo, ":") {
 			method, password, _ = strings.Cut(userinfo, ":")
 		} else {
 			dec, err := decodeB64(userinfo)
@@ -393,7 +556,12 @@ func parseSS(link string) (*Profile, error) {
 	if method == "" || password == "" {
 		return nil, fmt.Errorf("ss: missing method or password")
 	}
-	mp, _ := url.PathUnescape(password)
+	// The password is stored verbatim. Both base64 shapes just decoded it
+	// from the payload, so it is raw bytes and "%" is an ordinary password
+	// character there — percent-decoding emptied a password carrying a
+	// stray "%" and rewrote "%41" into "A". The plaintext branch takes its
+	// password verbatim for the same reason, and a round-trip through this
+	// app never reaches it: buildSSLink base64s without escaping.
 	host, port, err := splitHostPort(hostport)
 	if err != nil {
 		return nil, fmt.Errorf("ss: %w", err)
@@ -404,7 +572,7 @@ func parseSS(link string) (*Profile, error) {
 		Name:         linkName(name, fmt.Sprintf("%s:%d", host, port)),
 		Address:      host,
 		Port:         port,
-		IDOrPassword: mp,
+		IDOrPassword: password,
 		Method:       method,
 	}, nil
 }
@@ -412,7 +580,8 @@ func parseSS(link string) (*Profile, error) {
 // --- socks ---
 
 func parseSocks(link string) (*Profile, error) {
-	u, err := url.Parse(link)
+	rest, rawFrag := splitLinkFragment(link)
+	u, err := url.Parse(escapeUserinfoPercents(rest))
 	if err != nil {
 		return nil, fmt.Errorf("bad url: %w", err)
 	}
@@ -434,7 +603,7 @@ func parseSocks(link string) (*Profile, error) {
 		Protocol:     "socks",
 		Core:         CoreSingBox,
 		Network:      "tcp",
-		Name:         linkName(u.Fragment, fmt.Sprintf("%s:%d", host, port)),
+		Name:         linkName(rawFrag, fmt.Sprintf("%s:%d", host, port)),
 		Address:      host,
 		Port:         port,
 		IDOrPassword: cred,
@@ -626,4 +795,28 @@ func urlParseHost(rawURL string) string {
 		return ""
 	}
 	return u.Hostname()
+}
+
+// subFetchError renders a subscription download failure so it can be
+// written down. Every transport failure comes back as a *url.Error whose
+// text repeats the request URL, and a feed URL carries the access token in
+// its query — the log file is the thing users hand to whoever is helping
+// them, so only the wrapped cause is safe to keep.
+func subFetchError(err error) string {
+	if err == nil {
+		return ""
+	}
+	if ue, ok := err.(*url.Error); ok && ue.Err != nil {
+		return ue.Err.Error()
+	}
+	return err.Error()
+}
+
+// subLabel names a feed by host alone: enough to tell WHICH subscription
+// failed, without the query that holds the token.
+func subLabel(rawURL string) string {
+	if h := urlParseHost(rawURL); h != "" {
+		return h
+	}
+	return "(unreadable feed URL)"
 }

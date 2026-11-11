@@ -1512,7 +1512,7 @@ func mapProfileToSingBoxOutbound(p *Profile) (map[string]any, error) {
 		base["type"] = "vmess"
 		base["uuid"] = p.IDOrPassword
 		base["alter_id"] = p.AlterID
-		base["security"] = valueOr(p.Security, "auto")
+		base["security"] = vmessSecuritySingBox(p.Security)
 	case "vless":
 		base["type"] = "vless"
 		base["uuid"] = p.IDOrPassword
@@ -1550,7 +1550,11 @@ func mapProfileToSingBoxOutbound(p *Profile) (map[string]any, error) {
 	default:
 		return nil, fmt.Errorf("protocol %q needs RawOutbound JSON for sing-box", p.Protocol)
 	}
-	if p.TLS || p.Protocol == "trojan" || p.Protocol == "vless" && p.Flow != "" {
+	// RealityEnabled is part of this gate because sing-box nests reality
+	// inside tls: leaving it out rendered a REALITY profile as plaintext
+	// vless, while the xray, mihomo and fingerprint paths (which all list
+	// it) connected fine with the same profile.
+	if p.TLS || p.RealityEnabled || p.Protocol == "trojan" || p.Protocol == "vless" && p.Flow != "" {
 		if err := validateFingerprint(p); err != nil {
 			return nil, err
 		}
@@ -1620,6 +1624,40 @@ func valueOr(v, d string) string {
 		return v
 	}
 	return d
+}
+
+// vmessSecuritySingBox folds a profile's vmess cipher onto the value the
+// sing-box engine accepts. option/vmess.go declares the field as an
+// enum — auto, none, zero, aes-128-cfb, aes-128-gcm,
+// chacha20-poly1305 — and matches it case-sensitively with no fallback,
+// so any other spelling fails config load and the profile cannot connect
+// at all. import.go stores a link's scy= verbatim and legacy panels keep
+// publishing the old names (v2rayN writes chacha20-ietf-poly1305), so
+// the aliases are folded here. What is left over takes Xray's own answer
+// for an unknown cipher — auto — because a cipher the core does not have
+// is still a working tunnel with a different cipher, while handing the
+// value through would be no tunnel at all.
+func vmessSecuritySingBox(v string) string {
+	folded := strings.ToLower(strings.TrimSpace(v))
+	for _, sep := range []string{" ", "-", "_", "\t"} {
+		folded = strings.ReplaceAll(folded, sep, "")
+	}
+	switch folded {
+	case "", "auto":
+		return "auto"
+	case "none":
+		return "none"
+	case "zero":
+		return "zero"
+	case "aes128cfb", "idaes128cfb":
+		return "aes-128-cfb"
+	case "aes128gcm", "idaes128gcm":
+		return "aes-128-gcm"
+	case "chacha20poly1305", "chacha20ietfpoly1305", "ietfchacha20poly1305":
+		return "chacha20-poly1305"
+	default:
+		return "auto"
+	}
 }
 
 // alpnList splits a link's comma-separated ALPN value into the protocol

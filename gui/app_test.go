@@ -3,10 +3,69 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 )
+
+// versionFileWant reads the VERSION file build.bat stamps. Every other
+// version literal in the tree has to agree with it.
+func versionFileWant(t *testing.T) string {
+	t.Helper()
+	raw, err := os.ReadFile(filepath.Join("..", "VERSION"))
+	if err != nil {
+		t.Fatalf("reading the VERSION file build.bat stamps: %v", err)
+	}
+	want := strings.TrimSpace(string(raw))
+	if want == "" {
+		t.Fatal("VERSION is empty")
+	}
+	return want
+}
+
+// TestAppVersionMatchesVERSIONFile pins the fallback stamp to the file
+// build.bat reads. appVersion's comment says to keep the two in step, but
+// nothing enforced it: a plain `go build` / `go run` reported
+// "1.0.0-beta.3-dev" while VERSION, the installer and the README all said
+// "1.0.0-beta.3". The right-panel card and the About tab then showed a
+// version no release ever had, and the updater compared that phantom
+// prerelease against the published tag instead of the real one.
+func TestAppVersionMatchesVERSIONFile(t *testing.T) {
+	if want := versionFileWant(t); appVersion != want {
+		t.Errorf("appVersion = %q, want %q", appVersion, want)
+	}
+}
+
+// TestBuildMetadataVersionMatchesVERSIONFile: wails.json and the frontend
+// package manifest carried the pre-rename "5.11.28.3-fork.1" long after
+// VERSION moved to 1.0.0-beta.3, so the packaged app metadata and the
+// version the UI reports described two different products.
+func TestBuildMetadataVersionMatchesVERSIONFile(t *testing.T) {
+	want := versionFileWant(t)
+	for _, path := range []string{
+		filepath.Join("wails.json"),
+		filepath.Join("frontend", "package.json"),
+		filepath.Join("frontend", "package-lock.json"),
+	} {
+		raw, err := os.ReadFile(path)
+		if err != nil {
+			t.Errorf("reading %s: %v", path, err)
+			continue
+		}
+		var meta struct {
+			Version string `json:"version"`
+		}
+		if err := json.Unmarshal(raw, &meta); err != nil {
+			t.Errorf("parsing %s: %v", path, err)
+			continue
+		}
+		if meta.Version != want {
+			t.Errorf("%s version = %q, want %q", path, meta.Version, want)
+		}
+	}
+}
 
 // TestCoreVersionCacheInvalidatesOnPathChange — changing corePath must
 // drop the cached version instead of serving it stale (P3-15).
@@ -233,11 +292,16 @@ func TestTunModeFor(t *testing.T) {
 }
 
 // TestEnsureSystemProxySkipsAndRepairs — the Connect-time ensure
-// leaves an already-correct proxy alone (no rewrite, still owned)
-// and (re-)applies when it is off, foreign, or unreadable.
+// leaves an already-correct proxy it OWNS alone (no rewrite) and
+// (re-)applies when it is off, foreign, unreadable, or already reading
+// our own address without this process having installed it.
 func TestEnsureSystemProxySkipsAndRepairs(t *testing.T) {
 	ports := ProxyPorts{HTTP: 2280, SOCKS: 2280, Mixed: true}
 	want := proxyServerValue(ports)
+	owned := true
+	oldOwned := sysproxyOwned
+	defer func() { sysproxyOwned = oldOwned }()
+	sysproxyOwned = func() bool { return owned }
 	mk := func(state func() (bool, string, error)) (*App, *proxyRecorder) {
 		app, _ := testProxyApp(t, DefaultSettings(), CoreSingBox)
 		rec := &proxyRecorder{}
@@ -246,7 +310,8 @@ func TestEnsureSystemProxySkipsAndRepairs(t *testing.T) {
 		return app, rec
 	}
 
-	// Already ON + pointing at us: no rewrite, still owned.
+	// Already ON + pointing at us + ours: no rewrite, still owned.
+	owned = true
 	app, rec := mk(func() (bool, string, error) { return true, want, nil })
 	if err := app.ensureSystemProxy(ports); err != nil {
 		t.Fatalf("ensure (correct): %v", err)
@@ -256,6 +321,19 @@ func TestEnsureSystemProxySkipsAndRepairs(t *testing.T) {
 	}
 	if !app.getAutoProxy() {
 		t.Fatal("autoProxyOn false after skip (still owned)")
+	}
+
+	// ON + our address, but this process never installed it (a stale
+	// proxy from another client on the same port): skipping it here
+	// would claim ownership the revert cannot honour later, because
+	// sysproxyRestore only acts on a proxy it records itself.
+	owned = false
+	app, rec = mk(func() (bool, string, error) { return true, want, nil })
+	if err := app.ensureSystemProxy(ports); err != nil {
+		t.Fatalf("ensure (adopted): %v", err)
+	}
+	if rec.enables != 1 {
+		t.Fatalf("enables (adopted) = %d, want 1 (take ownership of the stale proxy)", rec.enables)
 	}
 
 	// OFF: applied.

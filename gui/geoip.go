@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -128,7 +129,7 @@ func (g *GeoIP) ensure() {
 	}
 	path := resolveDBPath(g.cfgPath)
 	if path == "" {
-		g.lastErr = fmt.Errorf("GeoLite2-Country.mmdb not found")
+		g.lastErr = errGeoIPNoDB
 		return
 	}
 	db, err := maxminddb.Open(path)
@@ -300,8 +301,11 @@ func (g *GeoIP) rememberNegative(host string) {
 	g.negMu.Unlock()
 }
 
-// Reload drops the opened reader and re-resolves (used after the user
-// drops in a new DB file). A still-missing DB is not an error.
+// Reload drops the opened reader and re-resolves (used after the updater
+// swapped the file, or the user dropped in a new DB). A still-missing DB is
+// not an error. An existing file that will not open is: the detector keeps
+// answering "unknown country" from then on with nothing left to retry, so
+// the caller that just replaced it has to hear about it.
 func (g *GeoIP) Reload() error {
 	g.mu.Lock()
 	g.closeLocked()
@@ -309,7 +313,31 @@ func (g *GeoIP) Reload() error {
 	g.lastErr = nil
 	g.mu.Unlock()
 	g.ensure()
+	g.mu.RLock()
+	defer g.mu.RUnlock()
+	if g.db == nil && !errors.Is(g.lastErr, errGeoIPNoDB) {
+		return g.lastErr
+	}
 	return nil
+}
+
+// errGeoIPNoDB marks the benign absence of a database, as opposed to one
+// that exists and cannot be opened.
+var errGeoIPNoDB = errors.New("GeoLite2-Country.mmdb not found")
+
+// validateMMDBBytes reports whether data is a database the reader can
+// actually open. The updater fetches GeoIP copies that publish no sha256,
+// so this is the only check standing between a truncated download, an HTML
+// error page or an LFS pointer and the file every country lookup reads.
+func validateMMDBBytes(data []byte) error {
+	if len(data) == 0 {
+		return fmt.Errorf("empty database")
+	}
+	db, err := maxminddb.FromBytes(data)
+	if err != nil {
+		return fmt.Errorf("not an openable MaxMind database: %w", err)
+	}
+	return db.Close()
 }
 
 // Available reports whether a usable DB is loaded.

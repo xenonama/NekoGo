@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"runtime"
 	"sync"
@@ -253,6 +254,137 @@ func TestCancelRefreshCountries(t *testing.T) {
 		t.Fatal("progress still Running after cancel")
 	}
 	close(release)
+}
+
+// TestCancelledRefreshKeepsNewRunSlot: CancelRefreshCountries frees the
+// one-at-a-time slot right away (the UI's Cancel has to work while the
+// run still drains), so a newer run can register before the cancelled
+// one returns. The cancelled run's cleanup must not clear the NEWER
+// registration — that made the progress readout report "not running"
+// during a live refresh, turned Cancel into a no-op, and re-armed the
+// "refresh already running" guard so repeated Cancel→Refresh clicks
+// stack concurrent runs on one set of progress counters.
+func TestCancelledRefreshKeepsNewRunSlot(t *testing.T) {
+	old := countryLookup
+	defer func() { countryLookup = old }()
+	release := make(chan struct{})
+	countryLookup = func(*App, *Profile) (bool, error) {
+		<-release // blocked until the run is cancelled, then drained here
+		return false, nil
+	}
+	a := newGeoTestApp(t)
+	for _, n := range []string{"slot1", "slot2"} {
+		if _, err := a.store.SaveProfile(Profile{Name: n, Address: "8.8.8.8", Port: 443}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	closeOnce := func(ch chan struct{}) func() {
+		var once sync.Once
+		return func() { once.Do(func() { close(ch) }) }
+	}
+	hold := make(chan struct{})
+	unpin := closeOnce(hold)
+	unblock := closeOnce(release)
+	defer unblock()
+	defer unpin()
+
+	// Pin the store lock: a run stops at its first store call
+	// (ListProfiles), AFTER registering its slot. That holds the
+	// cancelled run alive while the second one registers — an ordering
+	// no amount of sleeping could sample reliably.
+	holding := make(chan struct{})
+	pinned := make(chan struct{})
+	go func() {
+		defer close(pinned)
+		if err := a.store.UpdateCoreOverrides(func(map[string]json.RawMessage) bool {
+			close(holding)
+			<-hold
+			return false
+		}); err != nil {
+			t.Errorf("pinning the store lock: %v", err)
+		}
+	}()
+	select {
+	case <-holding:
+	case <-time.After(3 * time.Second):
+		t.Fatal("store lock never pinned")
+	}
+
+	type rr struct {
+		res *CountryRefreshResult
+		err error
+	}
+	start := func() chan rr {
+		out := make(chan rr, 1)
+		go func() {
+			res, err := a.RefreshAllCountries()
+			out <- rr{res, err}
+		}()
+		return out
+	}
+	waitRegistered := func(out chan rr, why string) {
+		t.Helper()
+		deadline := time.Now().Add(3 * time.Second)
+		for {
+			if a.RefreshCountriesProgress().Running {
+				return
+			}
+			select {
+			case r := <-out:
+				t.Fatalf("refresh %s returned %v instead of running", why, r.err)
+			default:
+			}
+			if time.Now().After(deadline) {
+				unblock()
+				unpin()
+				t.Fatalf("refresh %s never registered as running", why)
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+	}
+	waitReturn := func(out chan rr, why string) rr {
+		t.Helper()
+		select {
+		case r := <-out:
+			return r
+		case <-time.After(5 * time.Second):
+			unblock()
+			unpin()
+			t.Fatalf("refresh %s did not return", why)
+			return rr{}
+		}
+	}
+
+	first := start()
+	waitRegistered(first, "run A")
+	if !a.CancelRefreshCountries() {
+		t.Fatal("CancelRefreshCountries = false while run A is registered, want true")
+	}
+	// The cancelled run is still draining (pinned at ListProfiles); a
+	// second run registers in its freed slot.
+	second := start()
+	waitRegistered(second, "run B")
+
+	unpin() // both runs resume; A now finishes and runs its cleanup
+	r := waitReturn(first, "run A after the store lock was released")
+	if r.err != nil {
+		t.Fatalf("cancelled run A err = %v, want nil with the lookups counted as failed", r.err)
+	}
+	if p := a.RefreshCountriesProgress(); !p.Running {
+		t.Fatal("run B lost its slot to cancelled run A: progress reports not running during a live refresh")
+	}
+	if !a.CancelRefreshCountries() {
+		t.Fatal("CancelRefreshCountries = false while run B is live: run A cleared B's registration")
+	}
+	unblock()
+	if r := waitReturn(second, "run B"); r.err != nil {
+		t.Fatalf("run B err = %v, want nil", r.err)
+	}
+	select {
+	case <-pinned:
+	case <-time.After(3 * time.Second):
+		t.Error("store-lock pin goroutine never exited")
+	}
 }
 
 // TestGetSystemProxyStateSmoke — BUG-010: the OS query answers without

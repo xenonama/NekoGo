@@ -104,6 +104,11 @@ func run() error {
 		MinWidth:  940,
 		MinHeight: 600,
 		URL:       "/",
+		// The native caption is off: TitleBar.vue draws the bar and owns
+		// dragging and the caption buttons. Frameless keeps WS_THICKFRAME,
+		// so edge resizing and Aero Snap still work — the runtime drives
+		// both from the frontend.
+		Frameless: true,
 	})
 
 	// CASE A (beta.20): RegisterHook runs synchronously before the

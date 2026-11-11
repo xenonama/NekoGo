@@ -2,18 +2,23 @@
      remount on a mode switch. Advanced only reveals extra sections
      inside the same Simple tabs. -->
 <template>
-  <div v-if="!settings.loaded" class="nb-splash">
-    <img class="nb-logo-img" :src="appIcon" alt="NekoGo" />
-    <span class="nb-spin" title="Loading…" />
+  <div class="nb-root">
+    <!-- Above both branches: with the native caption gone this is the only
+         way to move or close the window, including while settings load. -->
+    <TitleBar />
+    <div v-if="!settings.loaded" class="nb-splash">
+      <img class="nb-logo-img" :src="appIcon" alt="NekoGo" />
+      <span class="nb-spin" title="Loading…" />
+    </div>
+    <SimpleShell
+      v-else
+      :version="version"
+      :mode="settings.settings.advancedMode ? 'advanced' : 'simple'"
+      :startup-error="startupError"
+      @dismiss-error="startupError = ''"
+    />
+    <CustomContextMenu v-if="settings.loaded" />
   </div>
-  <SimpleShell
-    v-if="settings.loaded"
-    :version="version"
-    :mode="settings.settings.advancedMode ? 'advanced' : 'simple'"
-    :startup-error="startupError"
-    @dismiss-error="startupError = ''"
-  />
-  <CustomContextMenu v-if="settings.loaded" />
 </template>
 
 <script setup lang="ts">
@@ -22,16 +27,17 @@ import { useProfilesStore } from './stores/profiles'
 import { useSettingsStore } from './stores/settings'
 import { useConnectionStore } from './stores/connection'
 import { useSubscriptionsStore } from './stores/subscriptions'
-import { backend } from './api'
+import { backend, versionPending } from './api'
 import { syncThemeClass } from './theme'
 import appIcon from './assets/app.png'
 import SimpleShell from './components/SimpleShell.vue'
 import CustomContextMenu from './components/CustomContextMenu.vue'
+import TitleBar from './components/TitleBar.vue'
 
 const profiles = useProfilesStore()
 const settings = useSettingsStore()
 const connection = useConnectionStore()
-const version = ref('1.0.0')
+const version = ref(versionPending)
 // Last startup/tray-level backend error (auto-connect etc.), if any.
 const startupError = ref('')
 
@@ -139,9 +145,9 @@ onMounted(async () => {
     startupError.value = ''
   }
   try {
-    version.value = await backend.appVersion()
+    version.value = (await backend.appVersion()) || versionPending
   } catch {
-    version.value = '1.0.0'
+    version.value = versionPending
   }
 })
 </script>

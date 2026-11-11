@@ -25,6 +25,69 @@ button,
   -webkit-user-select: none;
 }
 
+/* ---------- Custom title bar ----------
+   The native Windows caption is disabled (WebviewWindowOptions.Frameless),
+   so this bar is the window's only drag surface and holds the caption
+   buttons. `.nb-root` now owns the 100vh the shell used to claim for
+   itself, because the bar has to fit inside that height too. */
+.nb-root {
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+  max-width: 100vw;
+  overflow: hidden;
+  background: var(--bg);
+}
+.nb-titlebar {
+  /* Inherited by the bar's children, which is what makes the icon and
+     title draggable too. The button cluster resets it (see below). */
+  --wails-draggable: drag;
+  flex: 0 0 34px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  height: 34px;
+  padding-left: 12px;
+  background: var(--sidebar);
+  border-bottom: 1px solid var(--border);
+  user-select: none;
+  -webkit-user-select: none;
+}
+/* pointer-events:none keeps the drag surface contiguous — a press that
+   lands on the glyph still belongs to the caption, not to the child. */
+.nb-titlebar-icon {
+  width: 16px; height: 16px; border-radius: 4px; object-fit: cover;
+  pointer-events: none;
+}
+.nb-titlebar-title {
+  font-size: 12.5px; font-weight: 600; color: var(--fg);
+  letter-spacing: 0.2px; pointer-events: none;
+}
+.nb-titlebar-controls {
+  /* Without this the buttons inherit `drag` and a click on Close starts
+     a window drag instead of reaching the button. */
+  --wails-draggable: no-drag;
+  margin-left: auto;
+  display: flex;
+  height: 100%;
+}
+/* Caption buttons drop the global button chrome: square, borderless and
+   flush with the bar, per the Windows caption convention. */
+.nb-tb-btn {
+  width: 46px; height: 100%;
+  padding: 0; border: none; border-radius: 0;
+  background: transparent; color: var(--fg);
+  display: flex; align-items: center; justify-content: center;
+  transition: background 0.12s ease, color 0.12s ease;
+}
+.nb-tb-btn:hover { background: var(--hover); }
+.nb-tb-btn:active { background: var(--btn-hover); }
+.nb-tb-btn:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+/* Close keeps the system red in both themes: it is the one caption
+   button whose hover is a warning, not a highlight. */
+.nb-tb-btn--close:hover { background: #e81123; color: #fff; }
+.nb-tb-btn--close:active { background: #c50f1f; color: #fff; }
+
 /* ---------- Left sidebar ---------- */
 .nb-sidebar {
   width: 180px;
@@ -958,6 +1021,16 @@ input.nb-field:not([type="checkbox"]):not([type="radio"]):focus {
   border-radius: 16px; box-shadow: var(--shadow); padding: 20px;
 }
 .about-title { font-size: 16px; font-weight: 600; color: var(--fg); margin-bottom: 12px; }
+.about-stats {
+  display: grid; grid-template-columns: max-content minmax(0, 1fr);
+  gap: 6px 16px; margin: 0 0 14px; font-size: 13px;
+}
+.about-stats dt { color: var(--muted); }
+.about-stats dd {
+  margin: 0; min-width: 0; color: var(--fg);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.about-stats-wait { margin: 0 0 14px; font-size: 13px; color: var(--muted); }
 .about-link {
   display: flex; align-items: center; gap: 12px; width: 100%;
   min-height: 44px; border-radius: 10px; padding: 10px 12px;
@@ -1160,11 +1233,12 @@ input.nb-field:not([type="checkbox"]):not([type="radio"]):focus {
 /* Thin router splash. */
 .nb-splash {
   display: flex; flex-direction: column; align-items: center; justify-content: center;
-  gap: 16px; height: 100vh; background: var(--bg); color: var(--muted);
+  gap: 16px; flex: 1; min-height: 0; background: var(--bg); color: var(--muted);
 }
 .nb-splash .nb-logo-img { width: 64px; height: 64px; }
-/* Simple shell wrapper: sidebar column + scrolling center + servers. */
-.nb-simple { display: flex; flex-direction: column; height: 100vh; overflow: hidden; }
+/* Simple shell wrapper: sidebar column + scrolling center + servers.
+   Height comes from .nb-root, which also holds the title bar. */
+.nb-simple { display: flex; flex-direction: column; flex: 1; min-height: 0; overflow: hidden; }
 .nb-simple > .nb-shell { height: auto; flex: 1; min-height: 0; }
 /* Shared mode switch: token track, token knob. */
 .adv-switch:focus-visible {

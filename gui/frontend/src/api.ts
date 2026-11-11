@@ -16,6 +16,12 @@ let probed = false
  *  offline-disabled states instead. Set once by init(). */
 export const backendAvailable = ref(false)
 
+/** What the UI shows until the backend reports its version — and in
+ *  `vite dev`, where there is no backend to ask. Deliberately not a release
+ *  number: the right-panel card and the About tab both render this, and the
+ *  previous literal "1.0.0" claimed a version the running build never had. */
+export const versionPending = 'dev'
+
 function withTimeout<T>(p: Promise<T>, ms: number): Promise<T> {
   return new Promise<T>((resolve, reject) => {
     const t = window.setTimeout(() => reject(new Error('backend probe timeout')), ms)
@@ -131,6 +137,7 @@ export const backend = {
   appVersion: () => Promise.resolve(App.AppVersion()),
   openURL: (raw: string) => Promise.resolve(App.OpenURL(raw)),
   coreVersion: () => Promise.resolve(App.CoreVersion()),
+  upstreamSingBoxVersion: () => Promise.resolve(App.UpstreamSingBoxVersion()),
   xrayVersion: () => Promise.resolve(App.XrayVersion()),
   mihomoVersion: () => Promise.resolve(App.MihomoVersion()),
   runtimeInfo: () => Promise.resolve(App.RuntimeInfo()) as Promise<Record<string, string>>,

@@ -1,4 +1,5 @@
-<!-- About tab: program identity page (hero, links, advanced, credits). -->
+<!-- About tab: program identity page (hero, version stats, links,
+     advanced, credits). -->
 <template>
   <div class="about">
     <!-- Card 1 — Hero / Identity -->
@@ -11,7 +12,27 @@
       </div>
     </div>
 
-    <!-- Card 2 — Links -->
+    <!-- Card 2 — Version stats. The bottom-right app card shows the same
+         app version; this adds the engines, all read from the backend so
+         neither place can drift from the running build. sing-box and
+         NekoBox are separate rows because they are separate binaries:
+         the fork is stamped with the NekoGo build version, so only the
+         official sing-box.exe reports a sing-box version. -->
+    <div class="about-card">
+      <div class="about-title">Version stats</div>
+      <dl v-if="statRows.length" class="about-stats">
+        <template v-for="row in statRows" :key="row.label">
+          <dt>{{ row.label }}</dt>
+          <dd :title="row.value">{{ row.value }}</dd>
+        </template>
+      </dl>
+      <p v-else class="about-stats-wait">Reading versions…</p>
+      <button class="nb-act nb-act--ghost" :disabled="!versions" @click="copyDiag">
+        <Icon name="copy" :size="14" />{{ copyLabel }}
+      </button>
+    </div>
+
+    <!-- Card 3 — Links -->
     <div class="about-card">
       <div class="about-title">Links</div>
       <button
@@ -29,7 +50,7 @@
       </button>
     </div>
 
-    <!-- Card 3 — Advanced. The export/reset entries this used to carry
+    <!-- Card 4 — Advanced. The export/reset entries this used to carry
          were disabled "Phase F" placeholders; both shipped under
          Settings → Backup & reset, so pointing at them from here would
          only duplicate a live feature with a dead button. -->
@@ -45,7 +66,7 @@
       </button>
     </div>
 
-    <!-- Card 4 — Credits -->
+    <!-- Card 5 — Credits -->
     <div class="about-card">
       <div class="about-title">Credits</div>
       <ul class="about-credits">
@@ -55,7 +76,7 @@
       </ul>
     </div>
 
-    <!-- Card 5 — Footer -->
+    <!-- Card 6 — Footer -->
     <p class="about-footer">
       NekoGo is not affiliated with NekoBox, sing-box, or Xray.
       Use at your own risk.
@@ -64,13 +85,65 @@
 </template>
 
 <script setup lang="ts">
+import { computed, onUnmounted, ref, watch } from 'vue'
 import Icon, { type IconName } from './Icon.vue'
 import appIcon from '../assets/app.png'
 import { backend } from '../api'
 import { useSettingsStore } from '../stores/settings'
+import { useConnectionStore } from '../stores/connection'
+import { collectVersions, formatDiagText, type DiagVersions } from '../diag'
+import { copyText } from '../clipboard'
 
-defineProps<{ version: string }>()
+const props = defineProps<{ version: string }>()
 const settings = useSettingsStore()
+const connection = useConnectionStore()
+
+const versions = ref<DiagVersions | null>(null)
+const copyState = ref<'' | 'ok' | 'fail'>('')
+const copyLabel = computed(() =>
+  copyState.value === 'ok' ? 'Copied' : copyState.value === 'fail' ? 'Copy failed' : 'Copy diagnostics',
+)
+let copyTimer = 0
+onUnmounted(() => window.clearTimeout(copyTimer))
+
+// A running core is the truth; idle, the configured engine is what the
+// next Connect will use, which is what a bug report needs to say.
+const coreText = computed(() =>
+  connection.status.running
+    ? connection.status.core
+    : `${settings.settings.coreEngine || 'custom'} (idle)`,
+)
+
+const statRows = computed(() => {
+  const v = versions.value
+  if (!v) return []
+  return [
+    { label: 'NekoGo', value: v.app },
+    { label: 'sing-box core', value: v.singBox },
+    { label: 'NekoBox core', value: v.nekoBox },
+    { label: 'Xray core', value: v.xray },
+    { label: 'mihomo core', value: v.mihomo },
+    { label: 'Engine', value: v.core },
+    { label: 'OS', value: v.os },
+  ]
+})
+
+async function loadVersions() {
+  versions.value = await collectVersions({ version: props.version, coreText: coreText.value })
+}
+
+// About can mount before App.vue's version call resolves, and the engine
+// changes on connect/disconnect — neither may leave a stale card behind.
+watch([() => props.version, coreText], loadVersions, { immediate: true })
+
+async function copyDiag() {
+  if (!versions.value) return
+  // WebView2 can deny the clipboard without a permission grant; saying
+  // nothing would leave the user clicking a button that appears dead.
+  copyState.value = (await copyText(formatDiagText(versions.value))) ? 'ok' : 'fail'
+  window.clearTimeout(copyTimer)
+  copyTimer = window.setTimeout(() => { copyState.value = '' }, 2000)
+}
 
 // TODO: make this list configurable (e.g. from settings or a JSON file)
 // if the link set ever needs to change without a code edit.

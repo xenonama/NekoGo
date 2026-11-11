@@ -140,12 +140,16 @@ func loopbackListenerAlive(addr string, port int) bool {
 // (trojan://...@127.0.0.1:40443 ws imported before the auto-detect):
 // sing-box "connects" while every dial is refused. A live listener
 // means a legitimate local relay chain on that port — never hijack
-// it. Callers gate on GOOS (the engine ships as sni-spoof.exe). mihomo is
-// excluded like an already-spoof profile: the rescue converges stale
-// imports, and a core the user explicitly picked is not one — rewriting
-// it would silently run a different engine than the one selected.
+// it. Callers gate on GOOS (the engine ships as sni-spoof.exe). Only the
+// sing-box core is ever rescued: that is what a stale import arrived
+// with, and a profile on any other core got there by a choice — the
+// importer hands reality and flow profiles to xray, and the core selector
+// is the documented way off the spoof engine. Rewriting that would
+// silently run another engine than the one selected, and would make the
+// profile unconnectable wherever sni-spoof cannot start (no binary, no
+// administrator).
 func shouldRescueLoopbackProfile(p *Profile, settings Settings) bool {
-	if p == nil || p.Core.IsSpoof() || p.Core.IsMihomo() {
+	if p == nil || p.Core != CoreSingBox {
 		return false
 	}
 	if !spoofEnabled(settings) {
@@ -171,10 +175,10 @@ func shouldRescueLoopbackProfile(p *Profile, settings Settings) bool {
 // auto-tag rule (import.go), so Connect converges a stale profile
 // to the same core a fresh import would get. IP literals are
 // excluded (never auto-tag: proving CF-fronting needs a live
-// lookup). Callers gate on GOOS like the loopback rescue, and mihomo is
-// excluded for the reason given there.
+// lookup). Callers gate on GOOS like the loopback rescue, and for the
+// reason given there only a profile still on the sing-box core is one.
 func shouldRescueDirectSpoofProfile(p *Profile, settings Settings) bool {
-	if p == nil || p.Core.IsSpoof() || p.Core.IsMihomo() || !spoofEnabled(settings) {
+	if p == nil || p.Core != CoreSingBox || !spoofEnabled(settings) {
 		return false
 	}
 	if spoofEligibilityIssue(p) != nil {
@@ -276,7 +280,10 @@ func resolveSNITarget(p *Profile, settings Settings) (ip, sni string, port int, 
 // timeout, and (b) the ENDPOINTS entry the config still carries is the
 // honest current answer rather than a stale pool IP. The Cloudflare
 // range check that Plan B applies is deliberately NOT applied: in Plan A
-// the endpoint is by definition whatever the SNI resolves to.
+// the endpoint is whatever the SNI resolves to, and requiring Cloudflare
+// here would reject the whole point of the mode. Address usability (not
+// being a private/loopback answer) is enforced one layer down, in
+// resolveA, which is the same gate Plan B's picker applies.
 func resolvePlanATarget(p *Profile, settings Settings) (ip, sni string, port int, err error) {
 	sni = spoofPinSNI(&settings)
 	if sni == "" {

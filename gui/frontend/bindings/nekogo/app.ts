@@ -620,8 +620,9 @@ export function ResetToDefaults(confirm: string): $CancellablePromise<void> {
 }
 
 /**
- * RuntimeInfo reports the GUI process runtime for the About diagnostics
- * card (OS + Go toolchain; the cores report their own versions above).
+ * RuntimeInfo reports the GUI process platform for the About diagnostics
+ * card. The cores report their own versions above, and the GUI's Go
+ * toolchain is not one a user can act on, so it is not reported.
  */
 export function RuntimeInfo(): $CancellablePromise<{ [_ in string]?: string }> {
     return $Call.ByID(1014147495).then(($result: any) => {

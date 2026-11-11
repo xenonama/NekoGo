@@ -134,10 +134,15 @@ func (a *App) osProxyOwned() (bool, error) {
 }
 
 // ensureSystemProxy makes the OS proxy point at the given ports on
-// every Connect: if it is already ON and already targets our proxy
-// it is left alone; if it is OFF or points elsewhere it is
-// (re-)applied via SetSystemProxy. Success (either path) marks
-// autoProxyOn so Disconnect reverts what this session ensured.
+// every Connect: if it is already ON, already targets our proxy AND
+// this process owns it, it is left alone; anything else — off, foreign,
+// unreadable, or an adopted stale proxy that already reads our own
+// address — is (re-)applied via SetSystemProxy. Success (either path)
+// marks autoProxyOn so Disconnect reverts what this session ensured.
+// The ownership half of the first test is what makes that promise true:
+// skipping here records nothing, and sysproxyRestore only acts on a
+// proxy it installed (flag or crash marker), so an un-owned skip left
+// ProxyEnable=1 at the port Disconnect was about to close.
 // Zero ports (no core) are a no-op, matching SetSystemProxy.
 func (a *App) ensureSystemProxy(p ProxyPorts) error {
 	if p.HTTP > 0 || p.SOCKS > 0 {
@@ -151,7 +156,7 @@ func (a *App) ensureSystemProxy(p ProxyPorts) error {
 					read = osSystemProxy
 				}
 			}
-			if on, server, err := read(); err == nil && on && server == proxyServerValue(p) {
+			if on, server, err := read(); err == nil && on && server == proxyServerValue(p) && sysproxyOwned() {
 				a.setAutoProxy(true)
 				a.emitLog("gui", "info", fmt.Sprintf("system proxy already on nekogo proxy: %+v", p))
 				return nil

@@ -7,10 +7,16 @@ package main
 // NekoGo needs the same answer two other times: before spawning the
 // engine (to report a dead SNI as a Start error instead of a silent
 // 10 s timeout) and when the SNI tab scans a row. Both must agree with
-// what the core will do, so this mirrors core/src/net.rs exactly: the
-// Cloudflare dns-json endpoint, dialed at the resolver IP directly so a
-// hijacked local resolver cannot steer the answer, 1.1.1.1 then 1.0.0.1,
-// successes cached for the process, failures never cached.
+// what the core will do, so this follows core/src/net.rs: dns-json
+// providers dialed at their pinned anycast address so a hijacked local
+// resolver cannot steer the answer, successes cached for the process,
+// failures never cached.
+//
+// Where it deliberately goes further: an answer is only usable if it can
+// actually be a decoy endpoint (spoofEndpointUsable). The resolved address
+// IS what gets dialed, so a loopback/RFC1918 reply — a poisoned resolver or
+// a captive portal — must move on to the next provider instead of handing
+// the tunnel to the interceptor. Plan B has always refused those answers.
 
 import (
 	"context"
@@ -89,11 +95,14 @@ var dohCache = struct {
 	ips map[string]string
 }{ips: map[string]string{}}
 
-// resolveA returns the first IPv4 A record for host. Every DoH provider is
-// tried in order; in production (no test override) a final OS-resolver
-// fallback runs when all of them fail, because a dead DoH path must not make
-// Plan A unusable. The fallback is skipped while dohServersOverride is set so
-// offline tests stay deterministic and never touch the real resolver.
+// resolveA returns the first dialable IPv4 A record for host. Every DoH
+// provider is tried in order; in production (no test override) a final
+// OS-resolver fallback runs when all of them fail, because a dead DoH path
+// must not make Plan A unusable. The fallback is skipped while
+// dohServersOverride is set so offline tests stay deterministic and never
+// touch the real resolver. Answers that cannot be a real decoy endpoint
+// (spoofEndpointUsable) are rejected here rather than passed on, on every
+// path including the fallback.
 func resolveA(ctx context.Context, host string) (string, error) {
 	ip, err := resolveAVia(ctx, dohServers(), host)
 	if err == nil {
@@ -108,22 +117,41 @@ func resolveA(ctx context.Context, host string) (string, error) {
 	return "", err
 }
 
-// resolveAOS is the last-resort OS-resolver lookup (first IPv4). Plan A exists
-// to bypass a poisoned local resolver, so this is only reached when every DoH
-// provider fails; the caller warns when it is used.
+// osLookupIP is the OS-resolver seam behind resolveAOS. A poisoned local
+// resolver is the case Plan A exists for, so the last-resort path has to be
+// testable without one: tests swap this for a function that returns answers.
+var osLookupIP = func(ctx context.Context, host string) ([]net.IP, error) {
+	return net.DefaultResolver.LookupIP(ctx, "ip4", host)
+}
+
+// resolveAOS is the last-resort OS-resolver lookup (first dialable IPv4).
+// Plan A exists to bypass a poisoned local resolver, so this is only reached
+// when every DoH provider fails; the caller warns when it is used. It is also
+// the single most likely source of an intercepted answer, so the same gate
+// that Plan B applies to its resolver output runs here.
 func resolveAOS(ctx context.Context, host string) (string, error) {
 	host = normalizeFakeSNI(host)
 	if host == "" {
 		return "", fmt.Errorf("nothing to resolve (empty host)")
 	}
-	ips, err := net.DefaultResolver.LookupIP(ctx, "ip4", host)
+	ips, err := osLookupIP(ctx, host)
 	if err != nil {
 		return "", err
 	}
+	skipped := make([]string, 0, len(ips))
 	for _, ip := range ips {
-		if v4 := ip.To4(); v4 != nil {
-			return v4.String(), nil
+		v4 := ip.To4()
+		if v4 == nil {
+			continue
 		}
+		if !spoofEndpointUsable(v4) {
+			skipped = append(skipped, v4.String())
+			continue
+		}
+		return v4.String(), nil
+	}
+	if len(skipped) > 0 {
+		return "", fmt.Errorf("OS resolver answered %q with undialable addresses only (%s) — it is poisoned or a portal intercepted the lookup", host, strings.Join(skipped, ", "))
 	}
 	return "", fmt.Errorf("no IPv4 from OS resolver for %q", host)
 }
@@ -220,9 +248,15 @@ func pinnedDialer(pin string) func(context.Context, string, string) (net.Conn, e
 	}
 }
 
-// firstARecord picks the first type-1 (A) answer that is a real IPv4.
+// firstARecord picks the first type-1 (A) answer that is a dialable IPv4.
 // Cloudflare sends Answer as an array, but a single-object body is also
 // accepted (same tolerance as the core).
+//
+// An address the engine cannot legitimately dial is reported as an error,
+// not as "no record": this answer IS the Plan A connect endpoint, so a
+// loopback or RFC1918 reply means the lookup was intercepted and must not
+// be cached, must not be handed downstream, and should push the caller on
+// to the next provider.
 func firstARecord(body []byte) (string, error) {
 	var reply struct {
 		Status int             `json:"Status"`
@@ -251,13 +285,23 @@ func firstARecord(body []byte) (string, error) {
 			Data string `json:"data"`
 		}{one}
 	}
+	skipped := make([]string, 0, len(records))
 	for _, r := range records {
 		if r.Type != 1 {
 			continue
 		}
-		if ip := net.ParseIP(strings.TrimSpace(r.Data)); ip != nil && ip.To4() != nil {
-			return ip.String(), nil
+		v4 := net.ParseIP(strings.TrimSpace(r.Data)).To4()
+		if v4 == nil {
+			continue
 		}
+		if !spoofEndpointUsable(v4) {
+			skipped = append(skipped, v4.String())
+			continue
+		}
+		return v4.String(), nil
+	}
+	if len(skipped) > 0 {
+		return "", fmt.Errorf("answered only undialable addresses (%s) — resolver or DPI intercepted this lookup", strings.Join(skipped, ", "))
 	}
 	return "", nil
 }

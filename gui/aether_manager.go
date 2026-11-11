@@ -527,8 +527,10 @@ func (m *AetherManager) watchChild(cmd *exec.Cmd, exited chan<- error, done chan
 	m.mu.Lock()
 	current := m.cmd == cmd && m.running
 	dataDir := ""
+	port := 0
 	var job *procJob
 	if m.cmd == cmd {
+		port = m.port
 		m.running = false
 		m.port = 0
 		// Only the chain instance publishes one, and the child is reaped
@@ -555,6 +557,14 @@ func (m *AetherManager) watchChild(cmd *exec.Cmd, exited chan<- error, done chan
 	}
 	ev := newEngineExit(m.engineName(), cmd, err, started, m.recent.tail(engineLastLines))
 	m.log("warn", ev.Summary())
+	// This process' listener died with it, so the port it published goes
+	// away here — by value, because a connect that raced the crash may
+	// already have published a newer one, which CoreManager's fault path
+	// used to clear on sight. Only the aether-profile instance publishes:
+	// the chain's Psiphon listener is private and named in its config.
+	if m.engineName() != "psiphon" {
+		clearAetherActivePortIf(port)
+	}
 	if handler != nil {
 		handler(ev)
 	}

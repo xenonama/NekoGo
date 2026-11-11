@@ -290,3 +290,49 @@ func TestSpoofProfileEphemeralPing(t *testing.T) {
 	}
 	t.Logf("spoof probe latency: %d ms", res.LatencyMs)
 }
+
+// A spoof probe owns the process-wide front port only while its
+// throwaway engine runs — and its teardown cleared that slot
+// unconditionally. A connect that commits during the probe publishes its
+// own engine's port, so the probe's cleanup took the LIVE port down: the
+// connection stayed up with no front published, every later config
+// rendered direct (DPI sees the real SNI), and later probes dialled a slot
+// nobody owns.
+func TestSpoofProbeTeardownKeepsAConnectionsFrontPort(t *testing.T) {
+	buildSpoofRelayMock(t)
+	coreBin, xrayBin := testCoreBins(t)
+	t.Cleanup(clearSpoofFrontPort)
+	clearSpoofFrontPort()
+
+	// The port a concurrent connect would publish for its own engine —
+	// not the probe's throwaway one.
+	const connectPort = 41511
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		setSpoofFrontPort(connectPort)
+		fmt.Fprint(w, "spoof-probe-ok")
+	}))
+	defer origin.Close()
+
+	trojanPort := startTrojanTLSServer(t, "pw")
+	settings := DefaultSettings()
+	settings.SNISelectedIP = "127.0.0.1"
+	settings.SNISelectedSNI = "decoy.example.test"
+	profile := &Profile{
+		ID: "spoof-race", Name: "spoof-race", Core: CoreSpoof,
+		Protocol: "trojan", Address: "decoy.example.test", Port: trojanPort,
+		IDOrPassword: "pw", TLS: true, ServerName: "decoy.example.test",
+		AllowInsecure: true,
+	}
+
+	logs := make(chan LogEntry, 2048)
+	cm := NewCoreManager(NewSingBoxManager(coreBin, logs), NewXrayManager(xrayBin, "", logs))
+	cm.SetSpoofManager(NewSpoofManager(logs))
+
+	if _, err := cm.EphemeralURLTest(profile, settings, origin.URL+"/", 15000, probeOwnerProxies); err != nil {
+		drainLogs(t, logs)
+		t.Fatalf("EphemeralURLTest: %v", err)
+	}
+	if p, ok := currentSpoofFrontPort(); !ok || p != connectPort {
+		t.Fatalf("the probe's teardown took the connect's front port down: %d/%v, want %d still published", p, ok, connectPort)
+	}
+}

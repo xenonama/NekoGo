@@ -352,6 +352,25 @@ func appendSeenIPAddrs(seen, add []net.IPAddr) []net.IPAddr {
 	return seen
 }
 
+// spoofEndpointUsable reports whether a DNS answer may be dialed as a
+// spoof endpoint. Loopback, RFC1918, link-local, multicast and the
+// unspecified address are never the real decoy host — they mean the
+// resolver was poisoned or a captive portal swallowed the lookup, and
+// dialing one hands the tunnel to the interceptor instead of failing.
+// Both address pickers share this predicate so Plan A's DoH path and
+// Plan B's resolver path cannot drift apart.
+//
+// It is a var for the same reason dohServersOverride is: a hermetic test
+// can only ever dial loopback, so the Plan A scan tests must be able to
+// answer with a local address and still reach the code they exercise. No
+// production path changes it.
+var spoofEndpointUsable = publiclyDialableV4
+
+func publiclyDialableV4(v4 net.IP) bool {
+	return !v4.IsUnspecified() && !v4.IsPrivate() && !v4.IsLoopback() &&
+		!v4.IsLinkLocalUnicast() && !v4.IsMulticast()
+}
+
 // pickSpoofEndpointIP chooses the dial address out of one DNS answer set.
 // Split from resolveSpoofEndpointIP so the choice is testable without a
 // resolver: the Cloudflare-only gate this replaces was fused to live DNS,
@@ -365,7 +384,7 @@ func pickSpoofEndpointIP(domain string, ips []net.IPAddr) (string, error) {
 			continue
 		}
 		s := v4.String()
-		if v4.IsPrivate() || v4.IsLoopback() || v4.IsLinkLocalUnicast() || v4.IsMulticast() {
+		if !spoofEndpointUsable(v4) {
 			skipped = append(skipped, s)
 			continue
 		}

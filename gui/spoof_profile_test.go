@@ -197,6 +197,16 @@ func TestShouldRescueLoopbackProfile(t *testing.T) {
 	if shouldRescueLoopbackProfile(&spoofed, DefaultSettings()) {
 		t.Fatal("already spoof core: want no rescue")
 	}
+	// The rescue converges a stale sing-box import; a profile on the xray
+	// core got there either from reality/flow (both ineligible here) or
+	// from the core selector, and rewriting that choice would run a
+	// different engine than the one the user picked.
+	xray := base()
+	xray.Core = CoreXray
+	xray.Port = deadPort // the port is dead, so only the core can rule this out
+	if shouldRescueLoopbackProfile(&xray, DefaultSettings()) {
+		t.Fatal("explicit xray core: want no rescue")
+	}
 	direct := base()
 	direct.Address = "www.calmlunch.com"
 	if shouldRescueLoopbackProfile(&direct, DefaultSettings()) {
@@ -231,6 +241,14 @@ func TestShouldRescueDirectSpoofProfile(t *testing.T) {
 	spoofed.Core = CoreSpoof
 	if shouldRescueDirectSpoofProfile(&spoofed, DefaultSettings()) {
 		t.Fatal("already spoof core: want no rescue")
+	}
+	// An import only reaches the xray core through reality or a flow,
+	// which are ineligible; this shape on xray is the core selector's
+	// doing, and Connect must not undo it on every attempt.
+	xray := base()
+	xray.Core = CoreXray
+	if shouldRescueDirectSpoofProfile(&xray, DefaultSettings()) {
+		t.Fatal("explicit xray core: want no rescue")
 	}
 	lit := base()
 	lit.Address = "104.18.9.83"
@@ -311,6 +329,57 @@ func TestConnectRescuesDeadLoopbackProfile(t *testing.T) {
 	app.logMu.RUnlock()
 	if !found {
 		t.Fatal("no spoof log line for the rescue conversion")
+	}
+}
+
+// TestConnectKeepsAnExplicitXrayCore — the other half of the rescue: a
+// profile the core selector put on xray stays there through Connect, and
+// the choice is not rewritten on disk underneath the user. Otherwise
+// every Connect flipped it back to the spoof core, so running xray meant
+// re-picking it each time — and with sni-spoof.exe missing the profile
+// became unconnectable at all.
+func TestConnectKeepsAnExplicitXrayCore(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("the rescue is Windows-only (sni-spoof.exe)")
+	}
+	store, err := NewConfigStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("NewConfigStore: %v", err)
+	}
+	s := DefaultSettings()
+	s.SystemProxy = false
+	if err := store.SaveSettings(s); err != nil {
+		t.Fatalf("SaveSettings: %v", err)
+	}
+	probe, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	deadPort := probe.Addr().(*net.TCPAddr).Port
+	_ = probe.Close()
+
+	saved, err := store.SaveProfile(Profile{
+		Name: "APPXA-xray", Core: CoreXray, Protocol: "trojan",
+		Address: "127.0.0.1", Port: deadPort, IDOrPassword: "pw",
+		TLS: true, Network: "ws", ServerName: "www.calmlunch.com",
+	})
+	if err != nil {
+		t.Fatalf("SaveProfile: %v", err)
+	}
+	app := NewApp(store, make(chan LogEntry, 16))
+	var started Profile
+	app.coreStarter = func(p *Profile, _ Settings) error {
+		started = *p
+		return nil
+	}
+	if err := app.Connect(saved.ID); err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	if started.Core != CoreXray {
+		t.Fatalf("connect started core %v, want the profile's own xray", started.Core)
+	}
+	if got, _ := store.GetProfile(saved.ID); got.Core != CoreXray {
+		t.Fatalf("persisted core = %v, want xray (Connect rewrote the user's choice)", got.Core)
 	}
 }
 

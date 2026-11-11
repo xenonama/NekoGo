@@ -5,6 +5,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -30,6 +31,124 @@ func TestParseVmess(t *testing.T) {
 	}
 	if !p.TLS || p.Network != "ws" || p.Path != "/p" || p.Name != "test-vm" {
 		t.Fatalf("bad vmess fields: %+v", p)
+	}
+}
+
+// TestParseVmessFragmentRemark: plenty of generators put the label after the
+// payload ("vmess://<base64>#Node 01") instead of in "ps". "#" is outside
+// every base64 alphabet, so the payload used to be judged corrupt and the
+// whole node was rejected as an import error.
+func TestParseVmessFragmentRemark(t *testing.T) {
+	id := `"id":"11111111-2222-4333-8444-555555555555"`
+	payload := base64.StdEncoding.EncodeToString([]byte(
+		`{"v":"2","add":"1.2.3.4","port":"8443",` + id + `,"net":"ws","path":"/p"}`))
+	withPS := base64.StdEncoding.EncodeToString([]byte(
+		`{"v":"2","ps":"fromJSON","add":"1.2.3.4","port":"8443",` + id + `}`))
+	for _, tc := range []struct{ link, want string }{
+		{"#Node%2001", "Node 01"},
+		{"#%E6%97%A5%E6%9C%AC", "日本"},
+		{"#100%", "100%"},
+		{"#héllo", "héllo"},
+	} {
+		p := mustParse(t, "vmess://"+payload+tc.link)
+		if p.Name != tc.want {
+			t.Fatalf("fragment %q -> name %q, want %q", tc.link, p.Name, tc.want)
+		}
+		if p.Address != "1.2.3.4" || p.Port != 8443 || p.Path != "/p" || p.Network != "ws" {
+			t.Fatalf("fragment %q lost fields: %+v", tc.link, p)
+		}
+	}
+	// "ps" is the field the format reserves for the remark, so it wins.
+	if p := mustParse(t, "vmess://"+withPS+"#fromFrag"); p.Name != "fromJSON" {
+		t.Fatalf("ps/fragment precedence: name = %q", p.Name)
+	}
+	// A bare payload keeps the endpoint as its label.
+	if p := mustParse(t, "vmess://"+payload); p.Name != "1.2.3.4:8443" {
+		t.Fatalf("no label: name = %q", p.Name)
+	}
+}
+
+// TestParseVmessNullFields: a converter that serialises absent options as
+// JSON null is saying "no value", not "<nil>". fmt.Sprint of the nil made
+// exactly that four-character string reach the profile, so the SNI/Host/path
+// of the node became the literal <nil> and TLS broke on a readable link.
+func TestParseVmessNullFields(t *testing.T) {
+	payload := base64.StdEncoding.EncodeToString([]byte(
+		`{"v":"2","ps":null,"add":"1.2.3.4","port":"2053",` +
+			`"id":"11111111-2222-4333-8444-555555555555","aid":null,` +
+			`"scy":null,"net":null,"host":null,"path":null,"sni":null,"fp":null,"alpn":null,"tls":null}`))
+	p := mustParse(t, "vmess://"+payload)
+	for _, f := range []struct {
+		field, got string
+	}{
+		{"ServerName", p.ServerName}, {"Host", p.Host}, {"Path", p.Path},
+		{"Fingerprint", p.Fingerprint}, {"ALPN", p.ALPN},
+		{"Security", p.Security}, {"Name", p.Name},
+	} {
+		if strings.Contains(f.got, "<nil>") {
+			t.Fatalf("%s = %q, want no <nil> placeholder", f.field, f.got)
+		}
+	}
+	if p.Security != "" || p.Host != "" || p.Path != "" || p.ServerName != "" || p.Fingerprint != "" || p.ALPN != "" {
+		t.Fatalf("null fields materialised: %+v", p)
+	}
+	// Null "net" still means the tcp default, and a null "ps" still falls
+	// back to the endpoint label rather than an empty name.
+	if p.Network != "tcp" || p.Name != "1.2.3.4:2053" || p.AlterID != 0 {
+		t.Fatalf("mapping = %+v", p)
+	}
+}
+
+// TestParseVlessAllowInsecureSpellings: this app writes allowInsecure=1, but
+// generators emit "true" just as often. Matching only "1" dropped the option
+// silently, so the profile verified a certificate its own link said not to —
+// a handshake failure with no clue where it came from.
+func TestParseVlessAllowInsecureSpellings(t *testing.T) {
+	for _, key := range []string{"allowInsecure", "insecure", "skip-cert-verify"} {
+		for _, v := range []string{"1", "true", "TRUE", "True"} {
+			link := "vless://aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee@in.example:443?security=tls&" +
+				key + "=" + v + "#Insec"
+			p := mustParse(t, link)
+			if !p.AllowInsecure {
+				t.Fatalf("%s=%s ignored: %+v", key, v, p)
+			}
+		}
+		for _, v := range []string{"0", "false", "off"} {
+			link := "vless://aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee@in.example:443?security=tls&" +
+				key + "=" + v + "#Secure"
+			if p := mustParse(t, link); p.AllowInsecure {
+				t.Fatalf("%s=%s read as enabled: %+v", key, v, p)
+			}
+		}
+	}
+}
+
+// TestParseCredentialPercent: a bare "%" inside the password is the same
+// class as the one already fixed in the label — Go rejects the entire URL
+// over an invalid percent-escape, so a node whose endpoint reads perfectly
+// was reported as an import error because of one character of its
+// credential.
+func TestParseCredentialPercent(t *testing.T) {
+	for _, tc := range []struct{ link, want string }{
+		{"trojan://a%b@cred.example:443#x", "a%b"},
+		{"trojan://100%@cred.example:443#x", "100%"},
+		{"trojan://s3cr3t%p4ss@cred.example:443?security=tls#x", "s3cr3t%p4ss"},
+		{"vless://aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee@cred.example:443?security=tls#x", "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"},
+		{"socks://bob:pa%ss@cred.example:1080#x", "bob:pa%ss"},
+		// A correctly escaped credential still decodes exactly once.
+		{"trojan://a%25b@cred.example:443#x", "a%b"},
+		{"trojan://a%40b@cred.example:443#x", "a@b"},
+	} {
+		p, err := parseOneLink(tc.link)
+		if err != nil {
+			t.Fatalf("parse %q: %v", tc.link, err)
+		}
+		if p.IDOrPassword != tc.want {
+			t.Fatalf("%q -> credential %q, want %q", tc.link, p.IDOrPassword, tc.want)
+		}
+		if p.Address != "cred.example" {
+			t.Fatalf("%q -> address %q", tc.link, p.Address)
+		}
 	}
 }
 
@@ -122,6 +241,77 @@ func TestParseSS(t *testing.T) {
 	}
 }
 
+// TestLinkNameFragmentShapes pins the label coming off the wire. A
+// generator that encodes writes "#100%25"; plenty of them never encode and
+// write "#100%". Both must give the name a person can read — the encoded
+// form decodes exactly once, and an invalid escape is taken literally
+// instead of throwing the label away in favour of host:port.
+func TestLinkNameFragmentShapes(t *testing.T) {
+	userinfo := base64.URLEncoding.EncodeToString([]byte("aes-256-gcm:pw"))
+	for _, tc := range []struct{ link, want string }{
+		{"trojan://pw@h.example:443?security=tls#100%25", "100%"},
+		{"trojan://pw@h.example:443?security=tls#100%", "100%"},
+		{"trojan://pw@h.example:443?security=tls#a%41b", "aAb"},
+		{"trojan://pw@h.example:443?security=tls", "h.example:443"},
+		{"vless://11111111-2222-4333-8444-555555555555@h.example:443?type=ws&path=%2Fx#%40Delta", "@Delta"},
+		{"vless://11111111-2222-4333-8444-555555555555@h.example:443?type=ws&path=%2Fx#100%", "100%"},
+		{"socks://a:b@h.example:1080#50%25off", "50%off"},
+		{"socks://a:b@h.example:1080#%E6%97%A5%E6%9C%AC 01", "日本 01"},
+		{"ss://" + userinfo + "@h.example:8388#%E6%97%A5%E6%9C%AC", "日本"},
+		{"ss://" + userinfo + "@h.example:8388#100%", "100%"},
+	} {
+		p := mustParse(t, tc.link)
+		if p.Name != tc.want {
+			t.Errorf("%s: name = %q, want %q", tc.link, p.Name, tc.want)
+		}
+	}
+}
+
+func TestParseSSPercentInPassword(t *testing.T) {
+	// "%" is an ordinary shadowsocks password character: the base64
+	// payload carries it raw, so decoding it as a percent-escape used to
+	// empty the password (a stray "%") or rewrite it ("%41" -> "A").
+	for _, tc := range []struct{ pw, want string }{
+		{"s3cr3t%p4ss", "s3cr3t%p4ss"},
+		{"100%", "100%"},
+		{"%41%42", "%41%42"},
+		{"p@ss/w+o=rd", "p@ss/w+o=rd"},
+	} {
+		userinfo := base64.StdEncoding.EncodeToString([]byte("aes-256-gcm:" + tc.pw))
+		p := mustParse(t, "ss://"+userinfo+"@ss.example:8388#Percent")
+		if p.IDOrPassword != tc.want {
+			t.Fatalf("password %q arrived as %q", tc.pw, p.IDOrPassword)
+		}
+		if p.Method != "aes-256-gcm" || p.Address != "ss.example" || p.Port != 8388 {
+			t.Fatalf("endpoint/method = %+v", p)
+		}
+	}
+	// The 2019 whole-link base64 form follows the same rule.
+	whole := base64.StdEncoding.EncodeToString([]byte("chacha20-ietf-poly1305:a%b@1.2.3.4:8388"))
+	p := mustParse(t, "ss://"+whole+"#Old")
+	if p.IDOrPassword != "a%b" || p.Address != "1.2.3.4" || p.Port != 8388 {
+		t.Fatalf("2019 form = %+v", p)
+	}
+}
+
+// TestParseSSPlaintextSpecials covers the non-base64 userinfo shape. ":" is
+// outside every base64 alphabet, so a literal colon in the userinfo proves
+// the plaintext form — but the extra "and no = or %" condition overrode that
+// proof and sent passwords carrying base64 padding or a percent sign to the
+// base64 decoder, which refused them. The node was then reported as an
+// import error even though its endpoint was perfectly readable.
+func TestParseSSPlaintextSpecials(t *testing.T) {
+	for _, pw := range []string{"pa=ss", "s3cr3t%p4ss", "a+b/c=d", "p:w:rd", "100%"} {
+		p := mustParse(t, "ss://aes-256-gcm:"+pw+"@198.51.100.7:8443#plain")
+		if p.Method != "aes-256-gcm" || p.IDOrPassword != pw {
+			t.Fatalf("password %q arrived as method=%q password=%q", pw, p.Method, p.IDOrPassword)
+		}
+		if p.Address != "198.51.100.7" || p.Port != 8443 || p.Name != "plain" {
+			t.Fatalf("endpoint = %+v", p)
+		}
+	}
+}
+
 func TestParseSSQueryShape(t *testing.T) {
 	// Generated subscriptions routinely carry an empty query before the
 	// name, which used to leave "?" glued to the port: "ss: bad port 443?".
@@ -130,8 +320,8 @@ func TestParseSSQueryShape(t *testing.T) {
 	if p.Method != "chacha20-ietf-poly1305" {
 		t.Fatalf("method = %q", p.Method)
 	}
-	// PathUnescape must not turn the base64 punctuation in the password
-	// into spaces.
+	// The base64 punctuation in the password must reach the profile
+	// verbatim ("+" is not a space here, "%" is not an escape).
 	if p.IDOrPassword != "ARgvGZywA+gacgGV26Bvmu05+wZmRW/j+AdU+Z8Bt44=" {
 		t.Fatalf("password mangled: %q", p.IDOrPassword)
 	}
@@ -472,6 +662,194 @@ func TestFetchSubscriptionUserInfo(t *testing.T) {
 	}
 	if info3.Upload != 0 || info3.Total != 0 {
 		t.Fatalf("userinfo = %+v, want malformed pairs skipped", info3)
+	}
+}
+
+// TestFetchSubscriptionDecodesWrappedBase64Body pins the twice-encoded feed
+// shape: panels and `base64 -w 76` wrap the encoded link list across lines,
+// and the importer has to hand that back as three links, not three base64
+// fragments. Go's decoder ignores \r and \n inside the payload (any other
+// whitespace it rejects), which is what keeps this working — recorded here
+// so a future hand-rolled decoder cannot silently break real feeds.
+func TestFetchSubscriptionDecodesWrappedBase64Body(t *testing.T) {
+	plain := strings.Join([]string{
+		"vless://11111111-2222-4333-8444-555555555555@node-one.example.com:443?security=tls&sni=one.example.com#one",
+		"ss://" + base64.StdEncoding.EncodeToString([]byte("aes-256-gcm:s3cr3t")) + "@node-two.example.com:8388#two",
+		"trojan://pw3withme@node-three.example.com:443?type=ws&path=%2Fws#three",
+	}, "\n")
+	raw := base64.StdEncoding.EncodeToString([]byte(plain))
+	var wrapped strings.Builder
+	for i := 0; i < len(raw); i += 76 {
+		if i > 0 {
+			wrapped.WriteByte('\n')
+		}
+		wrapped.WriteString(raw[i:min(i+76, len(raw))])
+	}
+	wrapped.WriteByte('\n')
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		_, _ = w.Write([]byte(wrapped.String()))
+	}))
+	defer srv.Close()
+
+	lines, _, err := fetchSubscription(srv.URL)
+	if err != nil {
+		t.Fatalf("fetchSubscription: %v", err)
+	}
+	if len(lines) != 3 {
+		t.Fatalf("lines = %d, want 3 (got %q)", len(lines), lines)
+	}
+	want := []struct{ name, addr string }{{"one", "node-one.example.com"}, {"two", "node-two.example.com"}, {"three", "node-three.example.com"}}
+	for i, ln := range lines {
+		p, err := parseOneLink(ln)
+		if err != nil {
+			t.Fatalf("line %d %q: %v", i, ln, err)
+		}
+		if p.Name != want[i].name || p.Address != want[i].addr {
+			t.Fatalf("line %d parsed as %+v, want %s at %s", i, p, want[i].name, want[i].addr)
+		}
+	}
+}
+
+// TestSubscriptionFailureLogGivesReasonNotToken: a feed that refuses to
+// download used to leave nothing behind but "0 new profiles, 1 invalid", so
+// a 403, a refused redirect and an empty body were indistinguishable. The
+// obvious fix — log err.Error() — is the trap: net/http wraps every failure
+// in a *url.Error whose text repeats the request URL, and a feed URL carries
+// the access token in its query, which is exactly what users paste into the
+// log file when asking for help.
+func TestSubscriptionFailureLogGivesReasonNotToken(t *testing.T) {
+	store, err := NewConfigStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	app := NewApp(store, make(chan LogEntry, 64))
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/forbidden":
+			w.WriteHeader(http.StatusForbidden)
+		default:
+			http.Redirect(w, r, "http://127.0.0.1:6/again", http.StatusFound)
+		}
+	}))
+	defer srv.Close()
+
+	const token = "SECRET-TOKEN-9df87"
+	for _, path := range []string{"/forbidden?token=" + token, "/feed?token=" + token} {
+		if _, err := app.ImportLinks(srv.URL + path); err != nil {
+			t.Fatalf("ImportLinks(%s): %v", path, err)
+		}
+	}
+
+	var b strings.Builder
+	for _, e := range app.RecentLogs(200) {
+		b.WriteString(e.Message)
+		b.WriteString("\n")
+	}
+	text := b.String()
+	if !strings.Contains(text, "403") {
+		t.Fatalf("no reason logged for the 403 feed; logs:\n%s", text)
+	}
+	if !strings.Contains(text, "private address") {
+		t.Fatalf("no reason logged for the refused redirect; logs:\n%s", text)
+	}
+	if strings.Contains(text, token) {
+		t.Fatalf("the feed token reached the log:\n%s", text)
+	}
+}
+
+// TestSubRedirectAllowed: a subscription can 302 anywhere, and the feed is
+// re-fetched on a timer, so the redirect hop is server-chosen and
+// unwatched. Every local/private/metadata target must be refused while
+// ordinary public feeds keep working.
+func TestSubRedirectAllowed(t *testing.T) {
+	refused := []string{
+		"http://127.0.0.1:8080/admin",
+		"http://127.1.2.3/sub",
+		"http://[::1]:9000/sub",
+		"http://localhost/sub",
+		"http://LOCALHOST:3000/sub",
+		"http://nas.local/sub",
+		"http://srv.internal/sub",
+		"http://desk.home.arpa/sub",
+		"http://intranet/sub", // single label: only search domains resolve it
+		"http://10.1.2.3/sub",
+		"http://172.16.5.4/sub",
+		"http://192.168.1.1/sub",
+		"http://169.254.169.254/latest/meta-data/", // cloud metadata
+		"http://[fe80::1]:80/sub",
+		"http://100.64.0.1/sub", // CGNAT / Tailscale peer
+		"http://100.100.100.100/sub",
+		"http://0.0.0.0/sub",
+		"http://[::]/sub",
+		"http://:::1/sub", // IPv4-mapped loopback
+		"ftp://public.example/sub",
+		"file:///etc/passwd",
+		"http:///sub", // no host at all
+	}
+	allowed := []string{
+		"https://feed.example.com/sub",
+		"https://sub.example.com:8443/a?token=x",
+		"http://203.0.113.9/sub",
+		"https://[2001:db8::1]/sub",
+		"https://feed.example.com./sub", // trailing dot is the FQDN spelling
+	}
+	for _, u := range refused {
+		target, err := url.Parse(u)
+		if err != nil {
+			// A Location Go cannot parse is one the client rejects on its own.
+			continue
+		}
+		if err := subRedirectAllowed(target); err == nil {
+			t.Errorf("redirect to %s allowed, want refusal", u)
+		} else {
+			t.Logf("%s -> %v", u, err)
+		}
+	}
+	for _, u := range allowed {
+		target, err := url.Parse(u)
+		if err != nil {
+			t.Fatalf("parse %s: %v", u, err)
+		}
+		if err := subRedirectAllowed(target); err != nil {
+			t.Errorf("redirect to %s refused: %v", u, err)
+		}
+	}
+}
+
+// TestFetchSubscriptionRefusesLoopbackRedirect is the end-to-end shape of
+// the same hole: the feed itself is a legitimate local server (the test),
+// but its 302 must not be followed, because following it is what turns a
+// subscription refresh into a request against a port on this machine.
+func TestFetchSubscriptionRefusesLoopbackRedirect(t *testing.T) {
+	var mu sync.Mutex
+	hits := map[string]int{}
+	var srv *httptest.Server
+	srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		hits[r.URL.Path]++
+		mu.Unlock()
+		switch r.URL.Path {
+		case "/sub":
+			_, _ = w.Write([]byte("vless://u@h:443#leaked"))
+		default:
+			http.Redirect(w, r, srv.URL+"/sub", http.StatusFound)
+		}
+	}))
+	defer srv.Close()
+
+	_, _, err := fetchSubscription(srv.URL + "/feed")
+	if err == nil {
+		t.Fatal("loopback redirect followed, want refusal")
+	}
+	if !strings.Contains(err.Error(), "redirect") {
+		t.Fatalf("err = %v, want the redirect refusal to surface", err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if hits["/sub"] != 0 {
+		t.Fatalf("redirect target served %d times, want 0", hits["/sub"])
 	}
 }
 

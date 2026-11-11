@@ -657,6 +657,63 @@ func TestResolveAetherExeHonorsPath(t *testing.T) {
 	}
 }
 
+// TestAetherPortAllocationMatchesReference pins the listener port handout
+// of AetherArguments.cs:142-163: the one the app dials takes [port], the
+// tunnel's own comes next, then Tor's, then Psiphon's — each handed the
+// cursor's CURRENT value before it advances. A listener that took the
+// cursor itself instead of its value read whichever number the LAST
+// allocation left behind, one past its own, so the engine was told to
+// bind a port the app never set aside (and the one it did was skipped).
+func TestAetherPortAllocationMatchesReference(t *testing.T) {
+	cases := []struct {
+		name          string
+		tor, psiphon  string
+		bind, torBind int // -1: flag must be absent
+		psiphonBind   int // -1: absent, 0: the core picks it
+	}{
+		{"plain", "off", "off", 10819, -1, -1},
+		{"tor inside", "chain", "off", 10820, 10819, -1},
+		{"tor around", "reverse", "off", 10819, 10820, -1},
+		{"psiphon inside", "off", "chain", 10820, -1, 10819},
+		{"both inside", "chain", "chain", 10820, 10821, 10819},
+		{"tor around psiphon inside", "reverse", "chain", 10820, 10821, 10819},
+		{"tor inside psiphon around", "chain", "reverse", 10820, 10819, 0},
+		{"both around", "reverse", "reverse", 10819, 10820, 0},
+	}
+	check := func(t *testing.T, args []string, flag string, want int) {
+		t.Helper()
+		got, ok := aetherPortAfter(args, flag)
+		if want < 0 {
+			if ok || containsStr(args, flag) {
+				t.Fatalf("%s = %d present=%v, want the flag absent: %v", flag, got, ok, args)
+			}
+			return
+		}
+		if want == 0 {
+			// Port 0 is the handout itself ("the core takes the port
+			// Psiphon reports"), and aetherPortAfter reads 0 as absent.
+			if joined := strings.Join(args, " "); !strings.Contains(joined, flag+" 127.0.0.1:0") {
+				t.Fatalf("%s 127.0.0.1:0 missing: %s", flag, joined)
+			}
+			return
+		}
+		if !ok || got != want {
+			t.Fatalf("%s = %d (ok=%v), want %d: %v", flag, got, ok, want, args)
+		}
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			p := &Profile{Protocol: "aether", Core: CoreSingBox, Name: "t",
+				Address: "203.0.113.7", Port: 443,
+				Aether: aetherSettings{Protocol: "masque", Tor: c.tor, Psiphon: c.psiphon}}
+			args := buildAetherArguments(p, 10819)
+			check(t, args, "--bind", c.bind)
+			check(t, args, "--tor-bind", c.torBind)
+			check(t, args, "--psiphon-bind", c.psiphonBind)
+		})
+	}
+}
+
 // TestAetherPsiphonChainProfile: the Settings toggle arms psiphon=chain
 // on a copy, so the engine dials Psiphon's servers through the tunnel
 // while the app keeps dialling the Psiphon listener. The stored profile

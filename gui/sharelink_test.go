@@ -132,6 +132,18 @@ func TestShareLinkSS(t *testing.T) {
 	if got.Method != "aes-256-gcm" || got.IDOrPassword != "secret!" {
 		t.Fatalf("ss = %+v", got)
 	}
+
+	// buildSSLink base64s the password without escaping it, so a password
+	// carrying "%" must survive the round trip byte-for-byte — the parser
+	// used to percent-decode it into something else (or into "").
+	app2, saved2 := shareTestApp(t, Profile{
+		Name: "pct ss", Address: "10.0.0.2", Port: 8388,
+		Protocol: "shadowsocks", Method: "chacha20-ietf-poly1305",
+		IDOrPassword: "a%b+c/d=e%41",
+	})
+	if got := roundTrip(t, app2, saved2.ID); got.IDOrPassword != "a%b+c/d=e%41" {
+		t.Fatalf("ss round trip mangled the password: %q", got.IDOrPassword)
+	}
 }
 
 func TestShareLinkSocks(t *testing.T) {
@@ -142,6 +154,112 @@ func TestShareLinkSocks(t *testing.T) {
 	got := roundTrip(t, app, saved.ID)
 	if got.IDOrPassword != "user name:pw" || got.Name != "s 5" {
 		t.Fatalf("socks = %+v (space must survive both fields)", got)
+	}
+}
+
+// TestShareLinkRoundTripAdversarial — the names, paths and credentials
+// real subscriptions carry. URL syntax has opinions about "#", "?", "%",
+// "&", "=" and "+", and an escape applied on one side but not undone (or
+// not re-applied) on the other silently rewrites or empties the value:
+// that is exactly how the ss:// password bug shipped, so every field that
+// crosses the link format has to come back byte-for-byte.
+func TestShareLinkRoundTripAdversarial(t *testing.T) {
+	nasty := []string{
+		"@DeltaKroneckerGithub",
+		"100%",
+		"a%41b",
+		"a+b/c=d",
+		"node & edge?x=1",
+		"日本 01",
+		"héllo#2",
+		"trailing spaces  ",
+		"emoji🚀",
+	}
+	protocols := []struct {
+		name  string
+		probe func(string) Profile
+	}{
+		{"vless", func(n string) Profile {
+			return Profile{Protocol: "vless",
+				Name:           n,
+				Address:        "v.example",
+				Port:           443,
+				IDOrPassword:   "11111111-2222-4333-8444-555555555555",
+				TLS:            true,
+				Network:        "ws",
+				Path:           "/ws?ed=2560&host=a%3Ab",
+				Host:           "cdn." + n,
+				ServerName:     "tls.example",
+				Fingerprint:    "chrome",
+				ALPN:           "h3",
+				RealityEnabled: true, RealityPubKey: "pbkValue", RealityShortID: "00",
+				RealitySpiderX: "/spx?x=1"}
+		}},
+		{"trojan", func(n string) Profile {
+			return Profile{Protocol: "trojan", Name: n, Address: "t.example", Port: 443,
+				IDOrPassword: "p@ss:?#%&=+/ word", TLS: true, Network: "ws",
+				Path: "/rw?a=b", Host: "h." + n, ServerName: "t.example", Fingerprint: "firefox"}
+		}},
+		{"ss", func(n string) Profile {
+			return Profile{Protocol: "shadowsocks", Name: n, Address: "s.example", Port: 8388,
+				Method: "aes-256-gcm", IDOrPassword: "s3cr3t%p4ss+q/r=d?"}
+		}},
+		{"socks", func(n string) Profile {
+			return Profile{Protocol: "socks", Name: n, Address: "127.0.0.1", Port: 1080,
+				IDOrPassword: "user:name%41?pw"}
+		}},
+		{"vmess", func(n string) Profile {
+			return Profile{Protocol: "vmess", Name: n, Address: "v2.example", Port: 443,
+				IDOrPassword: "11111111-2222-4333-8444-555555555555", Security: "auto",
+				AlterID: 16, Network: "ws", Path: "/p?a=b&c=%41", Host: "h." + n,
+				TLS: true, ServerName: "sni.example", Fingerprint: "safari"}
+		}},
+	}
+	for _, pr := range protocols {
+		for _, n := range nasty {
+			want := pr.probe(n)
+			app, saved := shareTestApp(t, want)
+			got := roundTrip(t, app, saved.ID)
+			if got.Name != n {
+				t.Errorf("%s %q: name arrived as %q", pr.name, n, got.Name)
+			}
+			if got.IDOrPassword != want.IDOrPassword {
+				t.Errorf("%s %q: credential arrived as %q, want %q", pr.name, n, got.IDOrPassword, want.IDOrPassword)
+			}
+			if got.Address != want.Address || got.Port != want.Port {
+				t.Errorf("%s %q: endpoint = %s:%d, want %s:%d", pr.name, n, got.Address, got.Port, want.Address, want.Port)
+			}
+			if got.Protocol != want.Protocol {
+				t.Errorf("%s %q: protocol = %q", pr.name, n, got.Protocol)
+			}
+			for _, f := range []struct {
+				label     string
+				got, want string
+			}{
+				{"path", got.Path, want.Path},
+				{"host", got.Host, want.Host},
+				{"serverName", got.ServerName, want.ServerName},
+				{"fingerprint", got.Fingerprint, want.Fingerprint},
+				{"alpn", got.ALPN, want.ALPN},
+				{"method", got.Method, want.Method},
+				{"flow", got.Flow, want.Flow},
+				{"network", got.Network, want.Network},
+				{"realityPubKey", got.RealityPubKey, want.RealityPubKey},
+				{"realitySpiderX", got.RealitySpiderX, want.RealitySpiderX},
+				{"realityShortID", got.RealityShortID, want.RealityShortID},
+			} {
+				// Only fields the source profile actually carried: a
+				// parser may fill a sensible default for something the
+				// link format has no notion of (socks has no transport,
+				// so it arrives as "tcp").
+				if f.want != "" && f.got != f.want {
+					t.Errorf("%s %q: %s = %q, want %q", pr.name, n, f.label, f.got, f.want)
+				}
+			}
+			if got.RealityEnabled != want.RealityEnabled {
+				t.Errorf("%s %q: reality = %v, want %v", pr.name, n, got.RealityEnabled, want.RealityEnabled)
+			}
+		}
 	}
 }
 

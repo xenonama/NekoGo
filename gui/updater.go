@@ -30,6 +30,7 @@ package main
 import (
 	"archive/zip"
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -38,6 +39,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -77,7 +79,9 @@ func updateBase(key, def string) string {
 var updateHTTP = &http.Client{Timeout: 15 * time.Second}
 
 // downloadHTTP serves binaries: the connection phases are bounded, the
-// body is allowed to stream.
+// body is allowed to stream. Compression is off so Content-Length stays
+// the real byte count — a transparently gzipped body reports -1, which
+// would leave a resumed download unable to tell truncation from completion.
 var downloadHTTP = &http.Client{
 	Transport: &http.Transport{
 		Proxy:                 http.ProxyFromEnvironment,
@@ -85,6 +89,7 @@ var downloadHTTP = &http.Client{
 		TLSHandshakeTimeout:   20 * time.Second,
 		ResponseHeaderTimeout: 30 * time.Second,
 		ExpectContinueTimeout: 1 * time.Second,
+		DisableCompression:    true,
 	},
 }
 
@@ -95,6 +100,26 @@ var errAlreadyUpToDate = errors.New("already up to date")
 
 // maxDownloadBytes caps a single download (cores are tens of MB).
 const maxDownloadBytes = 512 << 20
+
+// Download resilience policy. A link that is slow, or that goes away and
+// comes back (mobile data, filtered networks), must not turn an update
+// into either an indefinite hang or a full restart of a 70 MB installer.
+// Vars, not consts, so tests can shrink the waits to milliseconds.
+var (
+	// downloadIdleTimeout is the longest a body may produce zero bytes.
+	// downloadHTTP deliberately has no whole-request Timeout (a slow link
+	// needs minutes), so without this a connection that dies mid-transfer
+	// — the common case when the network drops — blocks Read forever.
+	downloadIdleTimeout = 30 * time.Second
+	// downloadMaxAttempts counts the first try plus the retries.
+	downloadMaxAttempts = 5
+	// downloadRetryDelay doubles per attempt, capped at downloadRetryCap.
+	downloadRetryDelay = 1 * time.Second
+	// downloadProgressEvery throttles the progress log lines.
+	downloadProgressEvery = 2 * time.Second
+)
+
+const downloadRetryCap = 20 * time.Second
 
 // UpdatableComponent is one row of the Updates panel.
 type UpdatableComponent struct {
@@ -300,14 +325,24 @@ func updateGet(url string) (*http.Response, error) {
 	return updateHTTP.Do(req)
 }
 
-// downloadGet fetches a binary asset through downloadHTTP (no
-// whole-request deadline — see updateHTTP).
-func downloadGet(url string) (*http.Response, error) {
-	req, err := http.NewRequest("GET", url, nil)
+// downloadGet issues one attempt of a binary download through
+// downloadHTTP (no whole-request deadline — see updateHTTP). offset > 0
+// asks for the missing tail instead of the whole file; validator is the
+// strong ETag or Last-Modified of the first response, sent as If-Range so
+// an asset that changed since then comes back whole rather than letting
+// two different releases be spliced together.
+func downloadGet(ctx context.Context, rawURL string, offset int64, validator string) (*http.Response, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
 	if err != nil {
 		return nil, err
 	}
 	req.Header.Set("User-Agent", "NekoGo/"+appVersion)
+	if offset > 0 {
+		req.Header.Set("Range", fmt.Sprintf("bytes=%d-", offset))
+		if validator != "" {
+			req.Header.Set("If-Range", validator)
+		}
+	}
 	return downloadHTTP.Do(req)
 }
 
@@ -762,6 +797,16 @@ func (a *App) checkGeoIP(c *UpdatableComponent) {
 	// content hash, so comparing it with the remote ETag can never match —
 	// that mismatch made this row claim an update forever.
 	if m, err := os.ReadFile(geoipMarker()); err == nil && strings.TrimSpace(string(m)) == etag {
+		// "Up to date" would be a lie if the copy on disk cannot be opened:
+		// the detector has already degraded to "no country" and a re-download
+		// is the only fix, so keep the row actionable.
+		if a.geo != nil {
+			if e := a.geo.LastErr(); e != nil && !errors.Is(e, errGeoIPNoDB) {
+				c.UpdateAvail = true
+				c.Notes = "The installed database cannot be opened (" + e.Error() + ") — re-download to replace it"
+				return
+			}
+		}
 		c.Notes = "Up to date"
 		return
 	}
@@ -982,26 +1027,229 @@ func (a *App) CheckUpdates() ([]UpdatableComponent, error) {
 
 // --- download + install ---
 
-// downloadFile fetches url to memory (capped), logging progress lines.
-func (a *App) downloadFile(id, url string) ([]byte, error) {
-	a.updateLog(id, "info", "[update:"+id+"] downloading from "+url)
-	resp, err := downloadGet(url)
+// downloadState is what survives between attempts: the bytes already in
+// hand, the full length the source declared (-1 when it declared none),
+// and the validator that keeps a resume honest.
+type downloadState struct {
+	data      []byte
+	total     int64
+	validator string
+}
+
+// downloadFile fetches rawURL into memory (capped at maxDownloadBytes),
+// logging progress. It is built for a link that is slow and intermittently
+// dies: each attempt reads under an idle deadline, a failed attempt keeps
+// its bytes and asks for the tail with a Range request, and transient
+// failures are retried with backoff. A permanent answer (404, an oversized
+// body) is returned at once instead of being retried.
+func (a *App) downloadFile(id, rawURL string) ([]byte, error) {
+	a.updateLog(id, "info", "[update:"+id+"] downloading from "+redactURLQuery(rawURL))
+	st := downloadState{total: -1}
+	for attempt := 1; ; attempt++ {
+		complete, retryable, err := a.downloadAttempt(id, rawURL, &st)
+		if err == nil && complete {
+			a.updateLog(id, "info", fmt.Sprintf("[update:%s] downloaded %d bytes", id, len(st.data)))
+			return st.data, nil
+		}
+		if err == nil {
+			err = errors.New("download ended before the declared length")
+		}
+		if !retryable || attempt >= downloadMaxAttempts {
+			return nil, err
+		}
+		delay := downloadRetryDelay << (attempt - 1)
+		if delay <= 0 || delay > downloadRetryCap {
+			delay = downloadRetryCap
+		}
+		a.updateLog(id, "warn", fmt.Sprintf("[update:%s] attempt %d/%d failed (%s); retrying in %s, %d bytes kept",
+			id, attempt, downloadMaxAttempts, err, delay.Round(time.Millisecond), len(st.data)))
+		time.Sleep(delay)
+	}
+}
+
+// downloadAttempt makes one GET and folds the body into st. complete
+// reports a finished body that matches the declared length; retryable
+// says another attempt could plausibly succeed.
+func (a *App) downloadAttempt(id, rawURL string, st *downloadState) (complete, retryable bool, err error) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	offset := int64(len(st.data))
+	resp, err := downloadGet(ctx, rawURL, offset, st.validator)
 	if err != nil {
-		return nil, err
+		return false, true, errors.New(downloadErrorText(err))
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode != 200 {
-		return nil, fmt.Errorf("download %s: %s", url, resp.Status)
+
+	switch resp.StatusCode {
+	case http.StatusOK:
+		// A 200 to a Range request means the source ignored the range (or
+		// If-Range decided the asset changed): this body is the whole file,
+		// so appending it to the partial buffer would corrupt the install.
+		st.data = st.data[:0]
+		st.total = resp.ContentLength
+		st.validator = rangeValidator(resp)
+	case http.StatusPartialContent:
+		start, total, ok := contentRangeStart(resp.Header.Get("Content-Range"))
+		if !ok || start != offset {
+			st.data = st.data[:0]
+			st.total, st.validator = -1, ""
+			return false, true, fmt.Errorf("download %s: Content-Range %q does not start at the requested offset %d",
+				redactURLQuery(rawURL), resp.Header.Get("Content-Range"), offset)
+		}
+		st.total = total
+	case http.StatusRequestedRangeNotSatisfiable:
+		// The offset no longer exists: the asset changed, or the buffer is
+		// already the whole file. Either way the only way forward is a
+		// fresh start.
+		st.data = st.data[:0]
+		st.total, st.validator = -1, ""
+		return false, true, fmt.Errorf("download %s: %s", redactURLQuery(rawURL), resp.Status)
+	default:
+		retry := resp.StatusCode == http.StatusRequestTimeout ||
+			resp.StatusCode == http.StatusTooManyRequests ||
+			resp.StatusCode >= 500
+		return false, retry, fmt.Errorf("download %s: %s", redactURLQuery(rawURL), resp.Status)
 	}
-	data, err := io.ReadAll(io.LimitReader(resp.Body, maxDownloadBytes+1))
+
+	// The network going away mid-transfer usually leaves the socket open
+	// with no FIN, so Read blocks forever. downloadHTTP has no whole-request
+	// timeout on purpose (a slow link legitimately needs minutes); this
+	// watchdog bounds the silence instead, and cancels the request so the
+	// blocked Read actually returns.
+	timer := time.AfterFunc(downloadIdleTimeout, cancel)
+	defer timer.Stop()
+	body := &idleBody{r: resp.Body, t: timer, d: downloadIdleTimeout}
+
+	lastProgress := time.Now()
+	buf := make([]byte, 256*1024)
+	for {
+		n, readErr := body.Read(buf)
+		if n > 0 {
+			st.data = append(st.data, buf[:n]...)
+			if len(st.data) > maxDownloadBytes {
+				return false, false, fmt.Errorf("download exceeds %d bytes", maxDownloadBytes)
+			}
+			if time.Since(lastProgress) >= downloadProgressEvery {
+				a.updateLog(id, "info", downloadProgressText(id, int64(len(st.data)), st.total))
+				lastProgress = time.Now()
+			}
+		}
+		if readErr == io.EOF {
+			break
+		}
+		if readErr != nil {
+			return false, true, fmt.Errorf("download %s: %w", redactURLQuery(rawURL), readErr)
+		}
+	}
+	if st.total >= 0 && int64(len(st.data)) < st.total {
+		// A clean close short of the declared length: something cut the body
+		// without signalling an error. Retrying beats installing a truncated
+		// binary, which then fails its digest — or has none and runs.
+		return false, true, fmt.Errorf("download %s: got %d of %d bytes", redactURLQuery(rawURL), len(st.data), st.total)
+	}
+	return true, false, nil
+}
+
+// idleBody restarts the stall timer on every read that produced bytes.
+type idleBody struct {
+	r io.Reader
+	t *time.Timer
+	d time.Duration
+}
+
+func (b *idleBody) Read(p []byte) (int, error) {
+	n, err := b.r.Read(p)
+	if n > 0 {
+		b.t.Reset(b.d)
+	}
+	return n, err
+}
+
+// rangeValidator picks the strong validator to replay as If-Range. A weak
+// ETag must not be used (RFC 7233 §3.3): it can match two different bodies.
+func rangeValidator(resp *http.Response) string {
+	if et := resp.Header.Get("ETag"); et != "" && !strings.HasPrefix(et, "W/") {
+		return et
+	}
+	return resp.Header.Get("Last-Modified")
+}
+
+// contentRangeStart parses "bytes START-END/TOTAL" (RFC 7233). TOTAL may be
+// "*", reported as -1. Anything else — including the "bytes */N" form a 416
+// carries — is not a usable partial answer.
+func contentRangeStart(v string) (start, total int64, ok bool) {
+	v = strings.TrimSpace(v)
+	if len(v) < 6 || !strings.EqualFold(v[:6], "bytes ") {
+		return 0, -1, false
+	}
+	span, totalStr, found := strings.Cut(strings.TrimSpace(v[6:]), "/")
+	if !found {
+		return 0, -1, false
+	}
+	from, to, found := strings.Cut(span, "-")
+	if !found {
+		return 0, -1, false
+	}
+	start, err := strconv.ParseInt(strings.TrimSpace(from), 10, 64)
+	if err != nil || start < 0 {
+		return 0, -1, false
+	}
+	end, err := strconv.ParseInt(strings.TrimSpace(to), 10, 64)
+	if err != nil || end < start {
+		return 0, -1, false
+	}
+	total = -1
+	if s := strings.TrimSpace(totalStr); s != "*" {
+		if total, err = strconv.ParseInt(s, 10, 64); err != nil || total <= end {
+			return 0, -1, false
+		}
+	}
+	return start, total, true
+}
+
+func downloadProgressText(id string, have, total int64) string {
+	if total > 0 {
+		return fmt.Sprintf("[update:%s] %s / %s (%d%%)", id, humanBytes(have), humanBytes(total), have*100/total)
+	}
+	return fmt.Sprintf("[update:%s] %s received", id, humanBytes(have))
+}
+
+func humanBytes(n int64) string {
+	if n < 1024 {
+		return strconv.FormatInt(n, 10) + " B"
+	}
+	units := []string{"KiB", "MiB", "GiB", "TiB"}
+	v, i := float64(n), -1
+	for v >= 1024 && i < len(units)-1 {
+		v /= 1024
+		i++
+	}
+	return fmt.Sprintf("%.1f %s", v, units[i])
+}
+
+// redactURLQuery keeps the scheme, host and path of a download URL and
+// drops the userinfo, query and fragment. GitHub asset links redirect to
+// signed CDN URLs whose query is a bearer credential, and both the log
+// lines and the error text are shown in the UI and written to
+// LogOutputPath — the same reason subscription failures name the host only.
+func redactURLQuery(raw string) string {
+	u, err := url.Parse(raw)
 	if err != nil {
-		return nil, err
+		return "(unreadable URL)"
 	}
-	if len(data) > maxDownloadBytes {
-		return nil, fmt.Errorf("download exceeds %d bytes", maxDownloadBytes)
+	u.User, u.RawQuery, u.Fragment, u.RawFragment = nil, "", "", ""
+	return u.String()
+}
+
+// downloadErrorText renders a transport error without the signed query.
+// net/http reports the URL it was actually talking to, which after a
+// redirect is the CDN link rather than the public asset URL.
+func downloadErrorText(err error) string {
+	var ue *url.Error
+	if errors.As(err, &ue) && ue.Err != nil {
+		return ue.Op + " " + redactURLQuery(ue.URL) + ": " + ue.Err.Error()
 	}
-	a.updateLog(id, "info", fmt.Sprintf("[update:%s] downloaded %d bytes", id, len(data)))
-	return data, nil
+	return err.Error()
 }
 
 func sha256Hex(data []byte) string {
@@ -1153,6 +1401,18 @@ func (a *App) updateDataFile(id, fileURL, destName, digest string) (*UpdatableCo
 		a.updateLog(id, "error", "[update:"+id+"] ERROR: "+err.Error())
 		return nil, err
 	}
+	if id == "geoip" {
+		// The jsDelivr copy publishes no sha256, so verifyDigest above is a
+		// no-op for this row: the bytes have to be proven to be a database
+		// before they replace the one every country lookup reads. Writing
+		// them anyway would degrade lookups silently and, with the revision
+		// marker updated, leave no retry path.
+		if err := validateMMDBBytes(data); err != nil {
+			err = fmt.Errorf("geoip download rejected: %w", err)
+			a.updateLog(id, "error", "[update:"+id+"] ERROR: "+err.Error())
+			return nil, err
+		}
+	}
 	dest := filepath.Join(updaterDataDir(), destName)
 	if id == "geoip" {
 		// Overwrite the database the detector actually reads (bin\ in the
@@ -1175,8 +1435,8 @@ func (a *App) updateDataFile(id, fileURL, destName, digest string) (*UpdatableCo
 		// Record the revision now on disk (even for a no-op) so checkGeoIP
 		// can tell "up to date" from "changed".
 		a.writeGeoIPMarker(fileURL)
-		if installed && a.geo != nil {
-			_ = a.geo.Reload()
+		if installed {
+			a.reloadGeoDB()
 		}
 	}
 	c.Current = "sha:" + sha256Hex(data)[:12]
@@ -1196,6 +1456,19 @@ func (a *App) updateDataFile(id, fileURL, destName, digest string) (*UpdatableCo
 		}
 	}
 	return &c, nil
+}
+
+// reloadGeoDB re-opens the database after it changed on disk. A copy that
+// will not open is worth a log line: every country lookup goes quiet from
+// then on with no retry path, and nothing else in the UI hints that the
+// file is present-but-broken.
+func (a *App) reloadGeoDB() {
+	if a.geo == nil {
+		return
+	}
+	if err := a.geo.Reload(); err != nil {
+		a.emitLog("update:geoip", "warn", "GeoIP database re-open failed: "+err.Error())
+	}
 }
 
 // geoipMarker records the published revision (the source ETag) of the

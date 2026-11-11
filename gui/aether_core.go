@@ -49,10 +49,18 @@ func buildAetherArguments(p *Profile, port int) []string {
 	dialsPsiphon := psiphon == "chain"
 	dialsTor := tor == "chain" && !dialsPsiphon
 	next := port + 1
+	// takeNext hands out the cursor's current value and then advances it,
+	// exactly like the reference's `next++`. Handing out a pointer to the
+	// cursor instead made every listener that took one read the LAST
+	// number allocated rather than its own.
+	takeNext := func() int {
+		v := next
+		next++
+		return v
+	}
 	own := port
 	if dialsPsiphon || dialsTor {
-		own = next
-		next++
+		own = takeNext()
 	}
 	var torBind, psiphonBind *int
 	switch tor {
@@ -61,12 +69,12 @@ func buildAetherArguments(p *Profile, port int) []string {
 			p := port
 			torBind = &p
 		} else {
-			torBind = &next
-			next++
+			v := takeNext()
+			torBind = &v
 		}
 	case "reverse":
-		torBind = &next
-		next++
+		v := takeNext()
+		torBind = &v
 	}
 	switch psiphon {
 	case "chain":
@@ -74,8 +82,8 @@ func buildAetherArguments(p *Profile, port int) []string {
 			p := port
 			psiphonBind = &p
 		} else {
-			psiphonBind = &next
-			next++
+			v := takeNext()
+			psiphonBind = &v
 		}
 	case "reverse":
 		z := 0 // the core takes the port the Psiphon client reports

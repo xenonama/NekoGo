@@ -561,9 +561,17 @@ func (c *ConfigStore) GetSettings() Settings {
 		v := true
 		s.SpoofEnabled = &v
 	}
-	// CoreOverrides is a map: the struct copy above still aliases the
-	// live one, and callers (Advanced editors, exports) must never be
-	// able to mutate store state off-lock.
+	// CoreOverrides is a map and every list below is a slice: the struct
+	// copy above still aliases the live store, so a snapshot kept
+	// mutating after it was handed out. That is not cosmetic —
+	// TouchSubscription, RenameSubscription, SetSubscriptionEnabled, the
+	// SNI scanner and UpdateAetherScanResults rewrite rows IN PLACE under
+	// the lock, while a caller marshals the aliased array off-lock
+	// (ListSubscriptions hands it straight to the Wails marshaller) or
+	// iterates one snapshot across whole network fetches (the
+	// subscription update loop). A torn value is garbage in the UI and a
+	// concurrent map read/write is a fatal throw, so hand out detached
+	// copies of every reference field, not just the map.
 	if len(s.CoreOverrides) > 0 {
 		m := make(map[string]json.RawMessage, len(s.CoreOverrides))
 		for k, v := range s.CoreOverrides {
@@ -571,7 +579,24 @@ func (c *ConfigStore) GetSettings() Settings {
 		}
 		s.CoreOverrides = m
 	}
+	s.Subscriptions = cloneSlice(s.Subscriptions)
+	s.AetherScanResults = cloneSlice(s.AetherScanResults)
+	s.SNIIPs = cloneSlice(s.SNIIPs)
+	s.SNISNIs = cloneSlice(s.SNISNIs)
+	s.ProxyGroups = cloneSlice(s.ProxyGroups)
+	s.CollapsedProxyGroups = cloneSlice(s.CollapsedProxyGroups)
 	return s
+}
+
+// cloneSlice detaches one settings list from the store's own array.
+// nil stays nil so an absent list keeps rendering as absent.
+func cloneSlice[T any](in []T) []T {
+	if in == nil {
+		return nil
+	}
+	out := make([]T, len(in))
+	copy(out, in)
+	return out
 }
 
 // SaveSettings replaces and persists the settings.

@@ -44,6 +44,13 @@ type CoreManager struct {
 	// it to log, surface LastError and revert the auto system proxy.
 	onFault func(EngineExit)
 
+	// faultRaceHook is a test seam. It runs in the window between
+	// accepting a death report and acting on it — the window a concurrent
+	// Start lands in, which is what makes a death report "stale". Without
+	// it the race can only be hit by luck, and a test that relies on luck
+	// is not a regression test. Production leaves it nil.
+	faultRaceHook func()
+
 	singboxMgr *SingBoxManager
 	xrayMgr    *XrayManager
 	// spoofMgr owns the sni-spoof.exe child process (CoreSpoof).
@@ -185,8 +192,10 @@ func (m *CoreManager) engineInGroupLocked(engine string) bool {
 // handleEngineExit is the managers' death callback (PattN's
 // SessionEnded → OnAetherSessionEnded). It flips the group state at
 // once, tells App, and tears the surviving members down before
-// returning: a Start that runs concurrently waits on the same lock, so
-// it can never begin while a half-dead group still holds ports.
+// returning. The teardown is generation-checked (teardownFaultedGroup):
+// a Start does not block here — the lock is released between the two —
+// so a report that lands after a newer group committed must leave that
+// group standing.
 func (m *CoreManager) handleEngineExit(ev EngineExit) {
 	m.mu.Lock()
 	if !m.running || !m.engineInGroupLocked(ev.Engine) {
@@ -198,15 +207,17 @@ func (m *CoreManager) handleEngineExit(ev EngineExit) {
 	m.activeID = ""
 	handler := m.onFault
 	m.mu.Unlock()
-	if ev.Engine == "aether" {
-		// Config rendering must not point at a dead SOCKS listener.
-		clearAetherActivePort()
+	if m.faultRaceHook != nil {
+		m.faultRaceHook()
 	}
-	if ev.Engine == "spoof" {
-		// Same for the published SNI front port: leaving it makes later
-		// loopback connects and latency probes dial a closed port.
-		clearSpoofFrontPort()
-	}
+	// Nothing is unpublished here. These death reports are async: the
+	// group they describe may already have been replaced by a Start that
+	// published a fresh SNI front / aether listener, and clearing on sight
+	// used to take that live port down (the epoch is only consulted in
+	// teardownFaultedGroup below). The port instead goes away in the two
+	// places that know which process owned it — the manager's own reaper
+	// (spoof_manager.go, aether_manager.go: value-scoped, so a newer spawn
+	// survives) and stopLocked, which runs only for the accepted teardown.
 	if handler != nil {
 		handler(ev)
 	}
@@ -380,7 +391,11 @@ func (m *CoreManager) Start(profile *Profile, settings Settings) error {
 		defer m.mu.Unlock()
 		if m.epoch != epoch {
 			_ = m.stopLocked()
-			return fmt.Errorf("connect aborted (concurrent stop)")
+			// Named err: the deferred rollback above is what unpublishes
+			// this connect's engine port and stops exactly its child, and
+			// it only fires on a non-nil one.
+			err = fmt.Errorf("connect aborted (concurrent stop)")
+			return err
 		}
 		// The engine can die between its readiness probe and this
 		// commit; publishing then would advertise a group that already
@@ -747,6 +762,36 @@ func (m *CoreManager) activeCoreHint(xray bool) {
 	}
 }
 
+// stopSingBoxLegs takes down both sing-box binaries: the official CLI
+// and the custom core. Which one a group runs is committed by Start only
+// after that engine is already up, so `upstreamActive` still carries the
+// PREVIOUS connect's answer for the whole probe window — and a
+// Disconnect landing in it would otherwise stop a core that never ran
+// and leave the live sing-box.exe behind, with its manager still
+// reporting running: every later Connect then fails "upstream sing-box
+// already running" until the app is restarted. A Stop on an idle manager
+// is a no-op, so asking both is always safe (the Psiphon and aether legs
+// above are stopped the same way).
+func stopSingBoxLegs(upstreamActive bool, upstreamMgr *UpstreamSingBoxManager, singboxMgr *SingBoxManager) error {
+	var err error
+	if upstreamActive && upstreamMgr == nil {
+		err = fmt.Errorf("upstream sing-box manager is nil")
+	} else if !upstreamActive && singboxMgr == nil {
+		err = fmt.Errorf("sing-box manager is nil")
+	}
+	if upstreamMgr != nil {
+		if uErr := upstreamMgr.Stop(); uErr != nil && err == nil {
+			err = uErr
+		}
+	}
+	if singboxMgr != nil {
+		if sErr := singboxMgr.Stop(); sErr != nil && err == nil {
+			err = sErr
+		}
+	}
+	return err
+}
+
 // Stop disconnects whichever core is active. It bumps the epoch first so
 // an in-flight Start aborts, then stops the engine WITHOUT holding m.mu
 // (the engine managers have their own locks) so Shutdown/tray-Quit can
@@ -851,19 +896,7 @@ func (m *CoreManager) Stop() error {
 		clearSpoofChainPorts()
 		clearSpoofFrontPort()
 	default:
-		if upstreamActive {
-			if upstreamMgr != nil {
-				err = upstreamMgr.Stop()
-			} else {
-				err = fmt.Errorf("upstream sing-box manager is nil")
-			}
-		} else {
-			if singboxMgr == nil {
-				err = fmt.Errorf("sing-box manager is nil")
-			} else {
-				err = singboxMgr.Stop()
-			}
-		}
+		err = stopSingBoxLegs(upstreamActive, upstreamMgr, singboxMgr)
 	}
 	if !aetherWasActive && aetherMgr != nil {
 		// A Start still warming an aether engine (or waiting on its
@@ -949,17 +982,7 @@ func (m *CoreManager) stopLocked() error {
 		clearSpoofChainPorts()
 		clearSpoofFrontPort()
 	default:
-		if m.upstreamActive {
-			if m.upstreamMgr == nil {
-				err = fmt.Errorf("upstream sing-box manager is nil")
-			} else {
-				err = m.upstreamMgr.Stop()
-			}
-		} else if m.singboxMgr == nil {
-			err = fmt.Errorf("sing-box manager is nil")
-		} else {
-			err = m.singboxMgr.Stop()
-		}
+		err = stopSingBoxLegs(m.upstreamActive, m.upstreamMgr, m.singboxMgr)
 	}
 	m.running = false
 	m.activeID = ""
@@ -1442,7 +1465,10 @@ func (m *CoreManager) EphemeralURLTest(profile *Profile, settings Settings, url 
 			m.ephProbeAddStop(gen, func() { _ = tmp.Stop() })
 			setSpoofFrontPort(listenPort)
 			return func() {
-				clearSpoofFrontPort()
+				// By value: a connect that committed during the probe
+				// published its own engine here, and clearing on sight
+				// took that live port down.
+				clearSpoofFrontPortIf(listenPort)
 				_ = tmp.Stop()
 			}, nil
 		}

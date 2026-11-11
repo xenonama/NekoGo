@@ -20,7 +20,10 @@ import (
 // go build -ldflags="-X main.appVersion=1.2.3"
 // Keep the default in step with the VERSION file so a plain `go build`
 // (wails3 task, `go run`) still reports a real version to the updater.
-var appVersion = "1.0.0-beta.3-dev"
+// TestAppVersionMatchesVERSIONFile fails the build when the two drift: a
+// "-dev" suffix here made the UI claim a prerelease no release ever had,
+// and the updater order it against the published tag as a different build.
+var appVersion = "1.0.0-beta.3"
 
 // App is the Wails bound service. Every public method is callable from the
 // Vue frontend.
@@ -97,6 +100,15 @@ type App struct {
 	connMu    sync.Mutex
 	connBusy  bool
 	connEpoch uint64
+	// importMu guards importBusy: at most one link/subscription import
+	// runs at a time. Each one builds its "already have this node" set
+	// BEFORE the network fetch and SaveProfile matches by id only, so two
+	// overlapping imports (a manual per-feed refresh does not set the
+	// busy flag the auto-update timer checks, and two feeds from the same
+	// reseller share nodes) both file the same node as new — a duplicate
+	// that stays in Proxies forever.
+	importMu   sync.Mutex
+	importBusy bool
 	// autoProxyOn tracks whether THIS session ensured the OS proxy in
 	// Connect (GUI-owned, any core). Disconnect/Shutdown only revert
 	// what we ensured — never a proxy the user turned on manually via
@@ -121,9 +133,13 @@ type App struct {
 	// runs at a time, and CancelRefreshCountries aborts it
 	// (integration BUG-003). refreshDone/refreshTotal are progress
 	// counters read by RefreshCountriesProgress (atomics: workers bump
-	// them without holding refreshMu).
+	// them without holding refreshMu). refreshRun numbers the
+	// registrations: Cancel frees the slot while the cancelled run still
+	// drains, so a run may exit after a newer one has registered, and
+	// only the newest one may clear it.
 	refreshMu     sync.Mutex
 	refreshCancel context.CancelFunc
+	refreshRun    uint64
 	refreshDone   atomic.Int64
 	refreshTotal  atomic.Int64
 	// refreshWG tracks the fire-and-forget refreshCountriesBackground
@@ -156,12 +172,19 @@ func (a *App) clearError() {
 }
 
 // noteFault reports an unexpected engine death (CoreManager's
-// EngineExit callback): log it, surface it through LastError/Status, and
-// revert the system proxy so traffic is not pointed at a closed port.
-// The group teardown itself belongs to CoreManager.
+// EngineExit callback): log it, and when nothing is connected any more,
+// surface it through LastError/Status and revert the system proxy so
+// traffic is not pointed at a closed port. Reports are asynchronous and
+// can describe an engine a newer connect already replaced (the managers'
+// reapers pass their own identity check before CoreManager's generation
+// gate runs), so a live session keeps both. The teardown belongs to
+// CoreManager.
 func (a *App) noteFault(ev EngineExit) {
 	msg := ev.Summary()
 	a.emitLog("gui", "error", msg)
+	if _, _, live := a.cores.Status(); live {
+		return
+	}
 	a.noteError(msg)
 	a.revertSystemProxyOnExit("engine exit")
 	a.refreshTray()
@@ -340,6 +363,25 @@ func (a *App) tryBeginConnect() bool {
 	a.connBusy = true
 	a.connEpoch++
 	return true
+}
+
+// tryBeginImport claims the import slot. A second import is refused
+// rather than run in parallel: see the importMu comment on App. Callers
+// must pair every success with endImport (defer).
+func (a *App) tryBeginImport() bool {
+	a.importMu.Lock()
+	defer a.importMu.Unlock()
+	if a.importBusy {
+		return false
+	}
+	a.importBusy = true
+	return true
+}
+
+func (a *App) endImport() {
+	a.importMu.Lock()
+	defer a.importMu.Unlock()
+	a.importBusy = false
 }
 
 // setConnectBusy marks a Connect as in flight (true) or settled
@@ -1542,6 +1584,10 @@ func (a *App) saveImportedProfile(p Profile) (Profile, error) {
 // ImportLinks parses pasted text, records subscription URLs, and saves all
 // new profiles (deduplicated against the existing store).
 func (a *App) ImportLinks(text string) (*LinkImportResult, error) {
+	if !a.tryBeginImport() {
+		return nil, fmt.Errorf("another import is already running")
+	}
+	defer a.endImport()
 	direct, subs := collectLinks(text)
 	known := map[string]bool{}
 	for _, e := range a.store.ListProfiles() {
@@ -1597,9 +1643,27 @@ func (a *App) ImportLinks(text string) (*LinkImportResult, error) {
 func (a *App) importSubscription(rawURL string) ([]Profile, int, error) {
 	lines, info, err := fetchSubscription(rawURL)
 	if err != nil {
+		a.emitLog("gui", "warn", "subscription "+subLabel(rawURL)+" failed: "+subFetchError(err))
 		return nil, 0, err
 	}
 	u := urlParseHost(rawURL)
+	// Record first, then group: the group is the FEED, and its display
+	// name is what the record carries. UpdateSubscriptions already stamps
+	// sub.Name, so stamping the host here meant that renaming a feed (a
+	// rename regroups the profiles it already imported) and refreshing it
+	// dropped the new nodes back into a second group named
+	// "provider.example.com" next to "My VPN".
+	a.recordSubscription(rawURL, u, info)
+	group := u
+	if group == "" {
+		group = rawURL
+	}
+	for _, s := range a.store.GetSettings().Subscriptions {
+		if s.URL == rawURL && s.Name != "" {
+			group = s.Name
+			break
+		}
+	}
 	var out []Profile
 	invalid := 0
 	for _, ln := range lines {
@@ -1608,11 +1672,10 @@ func (a *App) importSubscription(rawURL string) ([]Profile, int, error) {
 			invalid++
 			continue
 		}
-		p.Group = u
+		p.Group = group
 		p.SubURL = rawURL
 		out = append(out, *p)
 	}
-	a.recordSubscription(rawURL, u, info)
 	return out, invalid, nil
 }
 
@@ -1645,6 +1708,10 @@ func (a *App) recordSubscription(rawURL, name string, info SubUserInfo) {
 // UpdateSubscriptions re-fetches every recorded subscription and saves profiles
 // not already in the store. It returns only the newly added profiles.
 func (a *App) UpdateSubscriptions() (*LinkImportResult, error) {
+	if !a.tryBeginImport() {
+		return nil, fmt.Errorf("another import is already running")
+	}
+	defer a.endImport()
 	// Snapshot the subscription list; each timestamp touch below is an
 	// atomic locked RMW (BUG-043) instead of a copy-modify-SaveSettings
 	// of the whole Settings that would drop concurrent settings edits.
@@ -1664,6 +1731,7 @@ func (a *App) UpdateSubscriptions() (*LinkImportResult, error) {
 		}
 		lines, info, err := fetchSubscription(sub.URL)
 		if err != nil {
+			a.emitLog("gui", "warn", "subscription "+subLabel(sub.URL)+" not updated: "+subFetchError(err))
 			invalid++
 			continue
 		}
@@ -1717,6 +1785,10 @@ func (a *App) EditSubscription(oldURL, newURL, name string) (*LinkImportResult, 
 	if newURL == "" {
 		return nil, fmt.Errorf("subscription URL required")
 	}
+	if !a.tryBeginImport() {
+		return nil, fmt.Errorf("another import is already running")
+	}
+	defer a.endImport()
 	// The display name to keep: the user's new one, else the old one.
 	oldName := ""
 	for _, s := range a.store.GetSettings().Subscriptions {
@@ -1731,11 +1803,33 @@ func (a *App) EditSubscription(oldURL, newURL, name string) (*LinkImportResult, 
 	}
 	res := &LinkImportResult{}
 	if newURL != oldURL {
+		alreadyRecorded := false
+		for _, s := range a.store.GetSettings().Subscriptions {
+			if s.URL == newURL {
+				alreadyRecorded = true
+				break
+			}
+		}
 		added, invalid, err := a.importSubscription(newURL)
 		if err != nil {
 			return nil, err
 		}
 		res.Invalid = invalid
+		// A transport/status/empty-body failure already bailed above. This
+		// is the quieter one: a typo'd path, a rotated token page or a
+		// Clash-YAML answer returns 200 with "://" in the body and parses
+		// to zero usable links — and the rest of this call would delete
+		// the working record and re-stamp every one of its profiles onto
+		// the dead URL. importSubscription recorded that URL too, so undo
+		// that unless it was a feed in its own right before this call.
+		if len(added) == 0 {
+			if !alreadyRecorded {
+				if _, delErr := a.store.DeleteSubscription(newURL); delErr != nil {
+					return res, delErr
+				}
+			}
+			return res, fmt.Errorf("the new address yielded no usable profiles (%d links rejected); the feed stays on its old address", invalid)
+		}
 		known := map[string]bool{}
 		for _, e := range a.store.ListProfiles() {
 			known[dedupeKey(&e)] = true
@@ -2062,11 +2156,20 @@ func (a *App) RefreshAllCountries() (*CountryRefreshResult, error) {
 	}
 	total, cancel := context.WithTimeout(context.Background(), refreshTotalTimeout)
 	a.refreshCancel = cancel
+	a.refreshRun++
+	myRun := a.refreshRun
 	a.refreshMu.Unlock()
 	defer func() {
 		cancel()
 		a.refreshMu.Lock()
-		a.refreshCancel = nil
+		// Only our own registration: CancelRefreshCountries frees the slot
+		// immediately so the UI can start a newer run while this one still
+		// drains, and clearing that newer registration would leave the
+		// progress readout blind, Cancel a no-op, and let the
+		// already-running guard below admit stacked runs.
+		if a.refreshRun == myRun {
+			a.refreshCancel = nil
+		}
 		a.refreshMu.Unlock()
 	}()
 	profiles := a.store.ListProfiles()
@@ -2398,10 +2501,11 @@ func (a *App) MihomoVersion() string {
 	return v
 }
 
-// RuntimeInfo reports the GUI process runtime for the About diagnostics
-// card (OS + Go toolchain; the cores report their own versions above).
+// RuntimeInfo reports the GUI process platform for the About diagnostics
+// card. The cores report their own versions above, and the GUI's Go
+// toolchain is not one a user can act on, so it is not reported.
 func (a *App) RuntimeInfo() map[string]string {
-	return map[string]string{"goos": runtime.GOOS, "goarch": runtime.GOARCH, "go": runtime.Version()}
+	return map[string]string{"goos": runtime.GOOS, "goarch": runtime.GOARCH}
 }
 
 // runVersionQuery runs bin with args, kills it after 3 seconds, and parses

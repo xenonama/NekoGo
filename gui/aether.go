@@ -401,7 +401,8 @@ func aetherSettingsEqual(a, b aetherSettings) bool {
 // chain exit-nodes) are dropped; everything else round-trips through
 // buildAetherLink.
 func parseAetherLink(link string) (*Profile, error) {
-	u, err := url.Parse(strings.TrimSpace(link))
+	rest, rawFrag := splitLinkFragment(strings.TrimSpace(link))
+	u, err := url.Parse(rest)
 	if err != nil {
 		return nil, fmt.Errorf("bad url: %w", err)
 	}
@@ -481,7 +482,7 @@ func parseAetherLink(link string) (*Profile, error) {
 	p := &Profile{
 		Protocol: "aether",
 		Core:     CoreSingBox,
-		Name:     linkName(u.Fragment, "Aether"),
+		Name:     linkName(rawFrag, "Aether"),
 		Aether:   cfg,
 	}
 	if aetherIsTwoHops(protocol) {
