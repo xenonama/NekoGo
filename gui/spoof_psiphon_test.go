@@ -131,7 +131,7 @@ func TestSpoofPsiphonChainRendering(t *testing.T) {
 	hijack := false
 	for _, r := range route["rules"].([]any) {
 		m, _ := r.(map[string]any)
-		if m["protocol"] == "dns" && m["action"] == "hijack-dns" {
+		if hijackRuleCoversPort53(m) {
 			hijack = true
 		}
 	}
@@ -226,18 +226,22 @@ func TestAllocateSpoofChainPorts(t *testing.T) {
 }
 
 func TestPsiphonOnlyArgs(t *testing.T) {
-	got := psiphonOnlyArgs(1234, 5678, "debug", "")
+	// psiphonOnlyArgs with no chain options set is the pre-existing
+	// chain shape plus aether's own default mode; TestPsiphonOnlyArgs-
+	// CarriesChainOptions covers the options.
+	got := psiphonOnlyArgs(1234, 5678, "debug", "", DefaultSettings())
 	want := []string{
 		"--bind", "127.0.0.1:1234",
 		"--psiphon-only",
 		"--upstream", "socks5://127.0.0.1:5678",
 		"--log-level", "debug",
+		"--psiphon-mode", "auto",
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("psiphonOnlyArgs = %v, want %v", got, want)
 	}
 	// A chain dir pins Psiphon's datastore away from the shared default.
-	withDir := psiphonOnlyArgs(1234, 5678, "debug", `C:\chain-dir`)
+	withDir := psiphonOnlyArgs(1234, 5678, "debug", `C:\chain-dir`, DefaultSettings())
 	wantDir := append(append([]string{}, want...), "--psiphon-dir", `C:\chain-dir`)
 	if !reflect.DeepEqual(withDir, wantDir) {
 		t.Fatalf("psiphonOnlyArgs = %v, want %v", withDir, wantDir)

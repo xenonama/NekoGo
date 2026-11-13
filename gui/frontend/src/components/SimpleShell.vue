@@ -248,6 +248,7 @@ import { useProfilesStore } from '../stores/profiles'
 import { useSettingsStore } from '../stores/settings'
 import { useConnectionStore } from '../stores/connection'
 import { useSubscriptionsStore } from '../stores/subscriptions'
+import { useConfirmStore } from '../stores/confirm'
 import { reloadProfilesAndSubs } from '../stores/sync'
 import { backendAvailable } from '../api'
 import { copyText } from '../clipboard'
@@ -296,6 +297,7 @@ const configPanel = ref<{ isDirty: () => boolean } | null>(null)
 const profiles = useProfilesStore()
 const settings = useSettingsStore()
 const connection = useConnectionStore()
+const confirmBox = useConfirmStore()
 const editing = ref(false)
 const editingProfile = ref<Profile | null>(null)
 const subUrl = ref('')
@@ -495,23 +497,28 @@ async function doRemoveSub(alsoProfiles: boolean) {
 }
 const showImport = ref(false)
 
-function confirmLeaveConfig(next: NavKey | null): boolean {
+async function confirmLeaveConfig(next: NavKey | null): Promise<boolean> {
   if (next === 'settings') return true
   if (view.value !== 'settings' || configPanel.value?.isDirty() !== true) return true
-  return window.confirm('Discard unsaved config changes?')
+  return confirmBox.ask({
+    title: 'Discard unsaved config changes?',
+    body: 'The core config editor holds unsaved JSON. Leaving Settings throws it away.',
+    confirmLabel: 'Discard',
+    danger: true,
+  })
 }
 
-function onNav(key: NavKey) {
-  if (!confirmLeaveConfig(key)) return
+async function onNav(key: NavKey) {
+  if (!(await confirmLeaveConfig(key))) return
   view.value = key
 }
 
 function onGoto(key: 'proxies') {
-  onNav(key)
+  void onNav(key)
 }
 
-function onExitRequest() {
-  if (!confirmLeaveConfig(null)) return
+async function onExitRequest() {
+  if (!(await confirmLeaveConfig(null))) return
   void settings.setAdvancedMode(false)
 }
 

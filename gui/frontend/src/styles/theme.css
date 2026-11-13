@@ -1171,8 +1171,10 @@ input.nb-field:not([type="checkbox"]):not([type="radio"]):focus {
 .nb-px-rowmenu .nb-mi:hover:not(:disabled) { background: var(--hover); }
 .nb-px-rowmenu .nb-mi:disabled { opacity: 0.45; cursor: not-allowed; }
 .nb-px-sep { border-top: 1px solid var(--border); margin: 5px 4px; background: var(--card); }
-/* Sticky batch bar: bulk actions stay reachable at the list end. */
-.nb-px-bar {
+/* Sticky batch bar: bulk actions stay reachable at the list end. Scoped
+   to the Proxies table — Backup reuses .nb-px-bar for its card bars, and
+   an unscoped sticky rule pulled those over their own card head. */
+.nb-px-bar--sticky {
   position: sticky; bottom: 0; z-index: 2;
   background: var(--card); padding-bottom: 4px;
 }

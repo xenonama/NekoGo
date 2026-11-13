@@ -46,7 +46,7 @@
         class="nb-side-advrow"
         role="switch"
         :aria-checked="isAdvancedMode"
-        :aria-label="modeLabel"
+        aria-label="Advanced Mode"
         :title="modeTitle"
         @click="toggleMode"
       >
@@ -125,7 +125,11 @@ const navItems: { key: NavKey; label: string; icon: IconName; advancedOnly?: boo
 const items = computed(() =>
   navItems.filter((i) => !i.advancedOnly || isAdvancedMode.value),
 )
-const modeLabel = computed(() => (isAdvancedMode.value ? 'Simple Mode' : 'Advanced Mode'))
+// A switch is named after the thing it controls, never the destination:
+// "Simple Mode" on an aria-checked switch reads as "Simple Mode is on"
+// while Advanced is the mode actually running. The destination lives in
+// the tooltip.
+const modeLabel = 'Advanced Mode'
 const modeTitle = computed(() =>
   isAdvancedMode.value ? 'Switch back to Simple mode' : 'Switch to the expert workspace',
 )

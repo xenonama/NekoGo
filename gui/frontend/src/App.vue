@@ -18,6 +18,8 @@
       @dismiss-error="startupError = ''"
     />
     <CustomContextMenu v-if="settings.loaded" />
+    <ElevationPrompt />
+    <ConfirmPrompt />
   </div>
 </template>
 
@@ -32,6 +34,8 @@ import { syncThemeClass } from './theme'
 import appIcon from './assets/app.png'
 import SimpleShell from './components/SimpleShell.vue'
 import CustomContextMenu from './components/CustomContextMenu.vue'
+import ElevationPrompt from './components/ElevationPrompt.vue'
+import ConfirmPrompt from './components/ConfirmPrompt.vue'
 import TitleBar from './components/TitleBar.vue'
 
 const profiles = useProfilesStore()

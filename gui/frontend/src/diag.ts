@@ -1,6 +1,8 @@
-// Shared version facts. The About "Version stats" card renders these and
-// its Copy diagnostics button emits formatDiagText of the same values, so
-// what the user reads and what they paste into a bug report cannot drift.
+// Shared version facts. The About "Version stats" card renders
+// versionStatRows of these values and its Copy diagnostics button emits
+// formatDiagText of the same ones, so a number the card shows can never
+// disagree with the number a bug report carries. The card drops the
+// advanced-only rows in Simple mode; the copy never does.
 // Lives at src/ (like nav.ts) because any shell or workspace can import it.
 import { backend } from './api'
 
@@ -63,10 +65,39 @@ export function formatDiagText(v: DiagVersions): string {
   return [
     `NekoGo ${v.app}`,
     `sing-box ${v.singBox}`,
-    `NekoBox core ${v.nekoBox}`,
+    `NekoBox version ${v.nekoBox}`,
     `Xray ${v.xray}`,
     `mihomo ${v.mihomo}`,
     `OS ${v.os}`,
     `Core ${v.core}`,
   ].join('\n')
+}
+
+export interface StatRow {
+  label: string
+  value: string
+}
+
+/** The rows of the About → Version stats card.
+ *
+ *  Simple mode chooses no engine, installs no second core and shows no
+ *  core path, so the four binary versions and the idle "Engine" read-out
+ *  describe a screen that mode cannot reach — they are the advanced
+ *  statistics the Advanced card already treats as advanced. The card
+ *  hides them; formatDiagText above still carries all of them, because a
+ *  bug report needs the engine facts whether or not the screen shows
+ *  them. */
+export function versionStatRows(v: DiagVersions, advanced: boolean): StatRow[] {
+  const rows: StatRow[] = [{ label: 'NekoGo', value: v.app }]
+  if (advanced) {
+    rows.push(
+      { label: 'sing-box core', value: v.singBox },
+      { label: 'NekoBox version', value: v.nekoBox },
+      { label: 'Xray core', value: v.xray },
+      { label: 'mihomo core', value: v.mihomo },
+      { label: 'Engine', value: v.core },
+    )
+  }
+  rows.push({ label: 'OS', value: v.os })
+  return rows
 }

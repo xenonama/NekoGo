@@ -73,6 +73,7 @@
 import { computed, nextTick, onUnmounted, ref, watch } from 'vue'
 import Icon from './Icon.vue'
 import { backend } from '../api'
+import { useConfirmStore } from '../stores/confirm'
 import type { Profile } from '../types'
 
 const props = defineProps<{
@@ -90,6 +91,8 @@ const initial = ref('')
 const backendError = ref('')
 const saving = ref(false)
 const textRef = ref<HTMLTextAreaElement | null>(null)
+const confirmBox = useConfirmStore()
+const askingDiscard = ref(false)
 
 function snapshot(p: Profile): string {
   return JSON.stringify(p, null, 2)
@@ -120,7 +123,7 @@ watch(
 )
 
 function onEsc(e: KeyboardEvent) {
-  if (e.key === 'Escape' && props.modelValue) requestClose()
+  if (e.key === 'Escape' && props.modelValue) void requestClose()
 }
 
 watch(
@@ -300,8 +303,26 @@ function reset() {
   backendError.value = ''
 }
 
-function requestClose() {
-  if (isDirty.value && !confirm('Discard changes?')) return
+async function requestClose() {
+  if (isDirty.value) {
+    // ConfirmPrompt's window Escape listener runs before this modal's, so
+    // one ESC closes the ask and then lands here with the request already
+    // cleared — asking again would reopen the prompt on the same keypress.
+    if (askingDiscard.value) return
+    askingDiscard.value = true
+    let ok = false
+    try {
+      ok = await confirmBox.ask({
+        title: 'Discard changes?',
+        body: 'This profile has unsaved JSON edits. Closing the editor throws them away.',
+        confirmLabel: 'Discard',
+        danger: true,
+      })
+    } finally {
+      askingDiscard.value = false
+    }
+    if (!ok) return
+  }
   emit('update:modelValue', false)
 }
 

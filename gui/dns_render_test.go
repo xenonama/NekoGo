@@ -176,9 +176,10 @@ func TestDnsRemoteHostnameBootstrap(t *testing.T) {
 
 // TestDnsRemoteEmptyKeepsDefault: an empty field renders no dns block at
 // all in proxy mode (system DNS, byte-for-byte as before) and the exact
-// historical default resolver block in TUN mode.
+// default resolver block in TUN mode — the proxied DoH entry plus the
+// detour-free bootstrap that resolves the proxy's own hostname.
 func TestDnsRemoteEmptyKeepsDefault(t *testing.T) {
-	const goldenTunBlock = `{"final":"remote","servers":[{"detour":"proxy","path":"/dns-query","server":"8.8.8.8","tag":"remote","type":"https"}]}`
+	const goldenTunBlock = `{"final":"remote","servers":[{"detour":"proxy","path":"/dns-query","server":"8.8.8.8","tag":"remote","type":"https"},{"server":"8.8.8.8","tag":"dns-bootstrap","type":"udp"}]}`
 
 	proxy := DefaultSettings()
 	cfg := decodeDNSConfig(t, dnsProxyProfile(), proxy)

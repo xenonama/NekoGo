@@ -46,8 +46,8 @@ func TestSingBoxTunMTUAndDNSHijack(t *testing.T) {
 	if got := tun["mtu"]; got != float64(1350) {
 		t.Fatalf("tun mtu = %v, want 1350", got)
 	}
-	if got := tun["stack"]; got != "system" {
-		t.Fatalf("tun stack = %v, want system", got)
+	if got := tun["stack"]; got != tunStackDefault {
+		t.Fatalf("tun stack = %v, want the default %v", got, tunStackDefault)
 	}
 	if tun["auto_route"] != true || tun["strict_route"] != false {
 		t.Fatalf("tun routes = %v/%v, want true/false", tun["auto_route"], tun["strict_route"])
@@ -67,12 +67,28 @@ func TestSingBoxTunMTUAndDNSHijack(t *testing.T) {
 	if guard["action"] != "reject" || guard["method"] != "drop" {
 		t.Fatalf("first rule = %v, want the TUN self-address reject/drop guard", guard)
 	}
-	first, _ := rules[1].(map[string]any)
-	if first["protocol"] != "dns" || first["action"] != "hijack-dns" {
-		t.Fatalf("DNS rule = %v, want protocol dns + action hijack-dns", first)
+	// The hijack is whichever rule carries it — the TUN leak guards
+	// (tun_pattn_test.go) render between the self-address guard and it,
+	// and the rule itself is a logical-or over port 53 and protocol dns.
+	var hijack map[string]any
+	for _, r := range rules[1:] {
+		m, _ := r.(map[string]any)
+		if m["action"] == "hijack-dns" {
+			hijack = m
+			break
+		}
 	}
-	if _, leaked := first["outbound"]; leaked {
-		t.Fatalf("DNS rule still carries an outbound (leaks outside the tunnel): %v", first)
+	if hijack == nil {
+		t.Fatalf("no DNS rule among %v", rules)
+	}
+	if !hijackRuleCoversPort53(hijack) {
+		t.Fatalf("DNS rule does not catch port 53: %v", hijack)
+	}
+	if hijack["action"] != "hijack-dns" {
+		t.Fatalf("DNS rule = %v, want action hijack-dns", hijack)
+	}
+	if _, leaked := hijack["outbound"]; leaked {
+		t.Fatalf("DNS rule still carries an outbound (leaks outside the tunnel): %v", hijack)
 	}
 
 	dns, ok := cfg["dns"].(map[string]any)
@@ -83,8 +99,8 @@ func TestSingBoxTunMTUAndDNSHijack(t *testing.T) {
 		t.Fatalf("dns.final = %v, want remote", dns["final"])
 	}
 	servers, _ := dns["servers"].([]any)
-	if len(servers) != 1 {
-		t.Fatalf("dns.servers = %v, want exactly the default resolver", servers)
+	if len(servers) != 2 {
+		t.Fatalf("dns.servers = %v, want the default resolver and the detour-free bootstrap", servers)
 	}
 	srv, _ := servers[0].(map[string]any)
 	if srv["tag"] != "remote" || srv["type"] != "https" || srv["server"] != "8.8.8.8" || srv["path"] != "/dns-query" {

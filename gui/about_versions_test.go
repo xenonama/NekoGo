@@ -64,18 +64,21 @@ func TestAboutSingBoxRowReadsTheOfficialCore(t *testing.T) {
 	}
 
 	about := readFrontendSrc(t, filepath.Join("components", "About.vue"))
+	if regexp.MustCompile(`versionStatRows\(\s*[\w.]+\s*,\s*[\w.]*advancedMode\s*\)`).FindString(about) == "" {
+		t.Error("About builds its rows without telling versionStatRows the mode")
+	}
 	for label, field := range map[string]string{
-		"sing-box core": "singBox",
-		"NekoBox core":  "nekoBox",
+		"sing-box core":   "singBox",
+		"NekoBox version": "nekoBox",
 	} {
 		row := regexp.MustCompile(`\{\s*label:\s*'` + regexp.QuoteMeta(label) + `',\s*value:\s*v\.(\w+)\s*\}`)
-		m := row.FindStringSubmatch(about)
+		m := row.FindStringSubmatch(diag)
 		if m == nil {
-			t.Errorf("About has no %q row", label)
+			t.Errorf("versionStatRows has no %q row", label)
 			continue
 		}
 		if m[1] != field {
-			t.Errorf("About row %q reads v.%s, want v.%s", label, m[1], field)
+			t.Errorf("row %q reads v.%s, want v.%s", label, m[1], field)
 		}
 	}
 }
@@ -98,4 +101,99 @@ func TestVersionStatsDropsTheGoRuntime(t *testing.T) {
 	if _, ok := (&App{}).RuntimeInfo()["go"]; ok {
 		t.Error("RuntimeInfo still reports the Go toolchain version nothing displays")
 	}
+}
+
+// TestVersionStatRowsGateEngineFactsToAdvancedMode: Simple mode chooses
+// no core, installs no second engine and shows no core path, so the four
+// binary versions and the idle "Engine" read-out described a screen its
+// user cannot reach — they showed anyway, because the card rendered
+// every field the collector returns. Placement inside the `if (advanced)`
+// branch is what gates a row, so that is what gets checked, braces
+// balanced: reordering the list must not quietly move a row into or out
+// of Simple mode.
+func TestVersionStatRowsGateEngineFactsToAdvancedMode(t *testing.T) {
+	gated, always := versionStatRowPlacement(t, readFrontendSrc(t, "diag.ts"))
+
+	if want := []string{"sing-box core", "NekoBox version", "Xray core", "mihomo core", "Engine"}; !sameLabels(gated, want) {
+		t.Errorf("advanced-only rows = %v, want %v", gated, want)
+	}
+	if want := []string{"NekoGo", "OS"}; !sameLabels(always, want) {
+		t.Errorf("rows Simple mode shows = %v, want %v", always, want)
+	}
+}
+
+// TestVersionStatCopyKeepsEveryFact: hiding a row is a display decision,
+// not a fact the user should lose when they paste diagnostics into a bug
+// report. So the copy path stays ungated — and it is the same rename
+// that took "NekoBox core" out of the card, which is why both live here.
+func TestVersionStatCopyKeepsEveryFact(t *testing.T) {
+	diag := readFrontendSrc(t, "diag.ts")
+
+	for _, rel := range []string{"diag.ts", filepath.Join("components", "About.vue")} {
+		if strings.Contains(readFrontendSrc(t, rel), "NekoBox core") {
+			t.Errorf("%s still says \"NekoBox core\": the row reports a version, not a binary path", rel)
+		}
+	}
+
+	body := regexp.MustCompile(`(?s)export function formatDiagText.*?\n\}`).FindString(diag)
+	if body == "" {
+		t.Fatal("diag.ts no longer exports formatDiagText")
+	}
+	for _, line := range []string{
+		"NekoBox version ${v.nekoBox}", "sing-box ${v.singBox}",
+		"Xray ${v.xray}", "mihomo ${v.mihomo}", "Core ${v.core}",
+	} {
+		if !strings.Contains(body, line) {
+			t.Errorf("Copy diagnostics dropped %q", line)
+		}
+	}
+}
+
+// versionStatRowPlacement splits versionStatRows' labels into the ones
+// behind its `if (advanced)` branch and the ones Simple mode still sees.
+func versionStatRowPlacement(t *testing.T, diag string) (gated, always []string) {
+	t.Helper()
+	fn := regexp.MustCompile(`(?s)export function versionStatRows\(.*?\n\}`).FindString(diag)
+	if fn == "" {
+		t.Fatal("diag.ts no longer exports versionStatRows(...)")
+	}
+	const head = "if (advanced) {"
+	open := strings.Index(fn, head)
+	if open < 0 {
+		t.Fatal("versionStatRows gates no `if (advanced)` branch")
+	}
+	depth := 0
+	for i := open + len(head) - 1; i < len(fn); i++ {
+		switch fn[i] {
+		case '{':
+			depth++
+		case '}':
+			depth--
+		}
+		if depth == 0 {
+			label := regexp.MustCompile(`label: '([^']+)'`)
+			collect := func(src string) []string {
+				var out []string
+				for _, m := range label.FindAllStringSubmatch(src, -1) {
+					out = append(out, m[1])
+				}
+				return out
+			}
+			return collect(fn[open : i+1]), collect(fn[:open] + fn[i+1:])
+		}
+	}
+	t.Fatal("the `if (advanced)` branch never closes")
+	return nil, nil
+}
+
+func sameLabels(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }

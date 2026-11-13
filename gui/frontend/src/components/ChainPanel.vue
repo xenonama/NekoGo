@@ -75,6 +75,130 @@
     </p>
   </div>
 
+  <!-- Chain-level Psiphon options: what both legs above hand aether.exe.
+       Same flags the Aether profile editor writes for one tunnel, here
+       for the chain. -->
+  <div class="nb-card nb-page">
+    <h3>Psiphon options</h3>
+    <p class="muted">
+      Applies to both Psiphon legs above, on every connect. A profile that sets its own Psiphon
+      options in the Aether editor keeps them — these are the chain's, not the tunnel's.
+    </p>
+    <div class="stg-row">
+      <span class="stg-chip"><Icon name="globe" :size="18" /></span>
+      <span class="stg-meta">
+        <span class="stg-title">Egress country</span>
+        <span class="stg-sub">
+          Ask Psiphon to leave through this country. Psiphon only offers a handful at a time; if the
+          one you pick is unavailable it falls back to its own choice.
+        </span>
+      </span>
+      <span class="stg-ctl">
+        <PickSelect
+          v-model="regionChoice"
+          icon="globe"
+          title="Egress country"
+          aria-label="Psiphon egress country"
+          quiet
+          :options="regionOptions"
+        />
+        <input
+          v-if="regionChoice === 'custom'"
+          class="stg-text"
+          type="text"
+          maxlength="2"
+          aria-label="Custom egress country code"
+          placeholder="DE"
+          :value="regionText"
+          @change="setOtherRegion(($event.target as HTMLInputElement).value)"
+        />
+      </span>
+    </div>
+    <div class="stg-row">
+      <span class="stg-chip"><Icon name="cloud" :size="18" /></span>
+      <span class="stg-meta">
+        <span class="stg-title">Fronting mode</span>
+        <span class="stg-sub">
+          <span class="mono">auto</span> lets Psiphon choose, <span class="mono">cdn</span> fronts
+          through CDN edges, <span class="mono">direct</span> dials servers without fronting (and
+          ignores the three fields below).
+        </span>
+      </span>
+      <span class="stg-ctl">
+        <PickSelect
+          v-model="modeChoice"
+          icon="layers"
+          title="Psiphon mode"
+          aria-label="Psiphon fronting mode"
+          quiet
+          :options="modeOptions"
+        />
+      </span>
+    </div>
+    <template v-if="modeChoice === 'cdn'">
+      <div class="stg-row">
+        <span class="stg-chip"><Icon name="tune" :size="18" /></span>
+        <span class="stg-meta">
+          <span class="stg-title">Own CDN IPs</span>
+          <span class="stg-sub">Comma- or space-separated edge addresses to front through</span>
+        </span>
+        <span class="stg-ctl">
+          <input
+            class="stg-text"
+            type="text"
+            aria-label="Psiphon CDN IPs"
+            placeholder="1.1.1.1, 8.8.8.8"
+            :value="s.chainPsiphonCdnIps ?? ''"
+            @change="setChainStr('chainPsiphonCdnIps', ($event.target as HTMLInputElement).value)"
+          />
+        </span>
+      </div>
+      <div class="stg-row">
+        <span class="stg-chip"><Icon name="shield" :size="18" /></span>
+        <span class="stg-meta">
+          <span class="stg-title">CDN SNI names</span>
+          <span class="stg-sub">Host names used beside your own CDN IPs (ignored without them)</span>
+        </span>
+        <span class="stg-ctl">
+          <input
+            class="stg-text"
+            type="text"
+            aria-label="Psiphon CDN SNI"
+            placeholder="www.cloudflare.com"
+            :value="s.chainPsiphonCdnSni ?? ''"
+            @change="setChainStr('chainPsiphonCdnSni', ($event.target as HTMLInputElement).value)"
+          />
+        </span>
+      </div>
+      <div class="stg-row">
+        <span class="stg-chip"><Icon name="layers" :size="18" /></span>
+        <span class="stg-meta">
+          <span class="stg-title">CDN edge sets</span>
+          <span class="stg-sub">
+            Built-in lists to try: <span class="mono">cloudflare, fastly, cloudfront,
+            psiphon-akamai, psiphon-bunny, vercel, github, curated-fronting</span>
+          </span>
+        </span>
+        <span class="stg-ctl">
+          <input
+            class="stg-text"
+            type="text"
+            aria-label="Psiphon CDN edge sets"
+            placeholder="cloudflare,fastly"
+            :value="s.chainPsiphonCdnSets ?? ''"
+            @change="setChainStr('chainPsiphonCdnSets', ($event.target as HTMLInputElement).value)"
+          />
+        </span>
+      </div>
+    </template>
+    <p class="muted">
+      Psiphon fetches its own server list every connect, so there is no bundled-versus-fresh switch
+      to offer: aether takes a path to a list file and NekoGo ships none. The aether log names the
+      countries on offer (<span class="mono">AvailableEgressRegions</span>) when a choice comes back
+      empty.
+    </p>
+  </div>
+
   <!-- Transport: how system traffic reaches the tunnel outside a chain. -->
   <div class="nb-card nb-page">
     <h3>Transport mode</h3>
@@ -114,6 +238,7 @@
 <script setup lang="ts">
 import { computed, ref } from 'vue'
 import Icon from './Icon.vue'
+import PickSelect from './PickSelect.vue'
 import { useSettingsStore } from '../stores/settings'
 import { useConnectionStore } from '../stores/connection'
 
@@ -121,6 +246,81 @@ const settings = useSettingsStore()
 const connection = useConnectionStore()
 const s = computed(() => settings.settings)
 const err = ref('')
+
+/** Psiphon's usual egress regions. It is a convenience list, not a
+ *  guarantee: Psiphon offers a varying subset and says so in the log,
+ *  so "Other" takes any two-letter code the core can read. */
+const psiphonRegions = [
+  'AU', 'CA', 'CH', 'DE', 'DK', 'ES', 'FI', 'FR', 'GB', 'IE', 'IT',
+  'JP', 'NL', 'NO', 'PL', 'PT', 'SE', 'SG', 'TR', 'US',
+]
+const regionOptions = [
+  { value: 'auto', label: 'Any (Psiphon chooses)' },
+  ...psiphonRegions.map((cc) => ({ value: cc, label: cc })),
+  { value: 'custom', label: 'Other (2-letter code)…' },
+]
+const modeOptions = [
+  { value: 'auto', label: 'auto (default)' },
+  { value: 'cdn', label: 'cdn' },
+  { value: 'direct', label: 'direct' },
+]
+
+/** The country select and the free-text code are one value: whatever is
+ *  stored decides both, so a code outside the list reopens in "Other". */
+const regionCustom = ref(false)
+const otherRegion = ref('')
+const regionChoice = computed<string>({
+  get: () => {
+    const cc = (s.value.chainPsiphonRegion ?? '').toUpperCase()
+    if (!cc) return regionCustom.value ? 'custom' : 'auto'
+    return psiphonRegions.includes(cc) ? cc : 'custom'
+  },
+  set: (v) => {
+    if (v === 'custom') {
+      regionCustom.value = true
+      void setChainStr('chainPsiphonRegion', otherRegion.value.toUpperCase())
+      return
+    }
+    regionCustom.value = false
+    otherRegion.value = ''
+    void setChainStr('chainPsiphonRegion', v === 'auto' ? '' : v)
+  },
+})
+/** The code shown in the Other box: what was typed this session, else
+ *  what disk holds (a hand-edited config can name a country the list
+ *  does not carry). */
+const regionText = computed(
+  () => otherRegion.value || (s.value.chainPsiphonRegion ?? '').toUpperCase(),
+)
+const modeChoice = computed<string>({
+  get: () => s.value.chainPsiphonMode || 'auto',
+  set: (v) => void setChainStr('chainPsiphonMode', v),
+})
+
+function setOtherRegion(text: string) {
+  const cc = text.toUpperCase().replace(/[^A-Z]/g, '')
+  otherRegion.value = cc
+  void setChainStr('chainPsiphonRegion', cc)
+}
+
+type ChainStrKey =
+  | 'chainPsiphonRegion' | 'chainPsiphonMode' | 'chainPsiphonCdnIps'
+  | 'chainPsiphonCdnSni' | 'chainPsiphonCdnSets'
+
+/** Same persist path as the toggles: write, save, roll back if the
+ *  backend refused (a bad country code is rejected on save), so the
+ *  panel never shows a value disk did not keep. */
+async function setChainStr(field: ChainStrKey, value: string) {
+  const prev = settings.settings[field]
+  settings.settings[field] = value
+  err.value = ''
+  try {
+    await settings.save()
+  } catch (e) {
+    settings.settings[field] = prev
+    err.value = String(e)
+  }
+}
 
 /** One shared persist path for every toggle: flip optimistically, save,
  *  and roll the UI back if disk did not keep the choice. */

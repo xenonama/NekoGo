@@ -218,6 +218,29 @@ export interface Settings {
   tunEnabled: boolean
   /** sing-box TUN network stack: system | gvisor | mixed. */
   tunStack: string
+  /** Backend-owned, one-time: the stored stack was moved off the OS
+   *  stack, which carries TCP only if the core is allowed through the
+   *  firewall. Sent back untouched, so a later deliberate pick of
+   *  System/Mixed is never rewritten. */
+  tunOSStackMigrated?: boolean
+  /** TUN interface MTU; unset = the 1350 NekoGo has always rendered. */
+  tunMTU?: number
+  /** TUN interface prefixes (CIDR, e.g. 172.19.0.1/24). Unset = default. */
+  tunAddress?: string
+  tunAddress6?: string
+  /** Put an IPv6 prefix on the adapter at all. Off until asked: the
+   *  backend still refuses it on a host that turns IPv6 off for new
+   *  interfaces, unless IPv6 could reach the internet around the tunnel. */
+  tunEnableIPv6?: boolean
+  /** Install the default route into the TUN. null = yes (the historical
+   *  behavior); a TUN that routes nothing captures nothing. */
+  tunAutoRoute?: boolean | null
+  /** Drop traffic that does not come from the TUN. */
+  tunStrictRoute?: boolean
+  /** Routes auto_route must leave alone (CIDR list). */
+  tunRouteExclude?: string[]
+  /** ICMP policy: rule | direct | unreachable | drop | reply. */
+  tunIcmp?: string
   systemProxy: boolean
   activeProfileId: string
   xrayApiAddress: string
@@ -313,6 +336,18 @@ export interface Settings {
    *  core's own chain mode (mirrors gui Settings; omitted by Go when
    *  false). Separate from spoofPsiphon: this rides the Aether tunnel. */
   aetherPsiphon?: boolean
+  /** Chain-level Psiphon options (mirrors gui Settings; Advanced-only).
+   *  They drive the two chain legs above — never a profile's own Aether
+   *  Psiphon fields. Empty means aether's own default. */
+  /** ISO alpha-2 egress country, '' = Psiphon chooses. */
+  chainPsiphonRegion?: string
+  /** Fronting shape: auto | cdn | direct. */
+  chainPsiphonMode?: string
+  /** Own CDN edge IPs / the SNI names used beside them / the built-in
+   *  edge sets to try. */
+  chainPsiphonCdnIps?: string
+  chainPsiphonCdnSni?: string
+  chainPsiphonCdnSets?: string
   /** Loopback-profile endpoint/SNI override (mirrors gui Settings). */
   sniSelectedIp?: string
   /** Loopback-profile decoy SNI override. */
@@ -344,7 +379,10 @@ export const defaultSettings: Settings = {
   mixedPort: 2080,
   tproxyPort: 0,
   tunEnabled: false,
-  tunStack: 'system',
+  tunStack: 'gvisor',
+  // Unset and false mean different things to the renderer, so the mirror
+  // states the default rather than leaving it undefined.
+  tunAutoRoute: true,
   systemProxy: true,
   activeProfileId: '',
   xrayApiAddress: '127.0.0.1:10085',
@@ -382,6 +420,11 @@ export const defaultSettings: Settings = {
   spoofXray: false,
   spoofEnabled: true,
   aetherPsiphon: false,
+  chainPsiphonRegion: '',
+  chainPsiphonMode: 'auto',
+  chainPsiphonCdnIps: '',
+  chainPsiphonCdnSni: '',
+  chainPsiphonCdnSets: '',
 }
 
 export interface LogEntry {

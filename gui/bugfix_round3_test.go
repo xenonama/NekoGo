@@ -217,7 +217,9 @@ func TestLegacyMigrationRewritesOnlyPaths(t *testing.T) {
 }
 
 // TestSingBoxTunDefaultDNSRoutesThroughProxy: the TUN fallback resolver
-// used to dial directly (a leak); it must name the proxy outbound.
+// used to dial directly (a leak); the entry that answers the hijacked
+// queries must name the proxy outbound. The block's second server is the
+// detour-free bootstrap and must not.
 func TestSingBoxTunDefaultDNSRoutesThroughProxy(t *testing.T) {
 	s := DefaultSettings()
 	s.TunEnabled = true
@@ -232,12 +234,23 @@ func TestSingBoxTunDefaultDNSRoutesThroughProxy(t *testing.T) {
 	}
 	dns, _ := cfg["dns"].(map[string]any)
 	servers, _ := dns["servers"].([]any)
-	if len(servers) != 1 {
-		t.Fatalf("dns servers = %v", dns["servers"])
+	if len(servers) != 2 {
+		t.Fatalf("dns servers = %v, want the proxied resolver and the bootstrap", dns["servers"])
 	}
-	entry, _ := servers[0].(map[string]any)
-	if entry["detour"] != "proxy" {
-		t.Fatalf("tun default dns = %v, want detour proxy", entry)
+	for _, raw := range servers {
+		entry, _ := raw.(map[string]any)
+		switch entry["tag"] {
+		case "remote":
+			if entry["detour"] != "proxy" {
+				t.Fatalf("tun default dns = %v, want detour proxy", entry)
+			}
+		case "dns-bootstrap":
+			if _, leaked := entry["detour"]; leaked {
+				t.Fatalf("the bootstrap rides the proxy it must resolve: %v", entry)
+			}
+		default:
+			t.Fatalf("unexpected dns server tag %v in %v", entry["tag"], servers)
+		}
 	}
 }
 

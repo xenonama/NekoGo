@@ -26,6 +26,7 @@
       <span class="stg-head-text">
         <span class="stg-head-title">Section editors</span>
         <span class="stg-head-sub">{{ cfgDesc }}</span>
+        <span v-if="targetLabel" class="stg-head-sub">Editing {{ targetLabel }}</span>
       </span>
     </div>
     <div v-if="!activeProfile" class="nb-adv-blank">
@@ -63,7 +64,7 @@
       <span class="stg-head-chip"><Icon name="code" :size="22" /></span>
       <span class="stg-head-text">
         <span class="stg-head-title">Raw config</span>
-        <span class="stg-head-sub">The entire rendered config for the active profile</span>
+        <span class="stg-head-sub">The entire rendered config for {{ targetLabel || 'the active profile' }}</span>
       </span>
     </div>
     <div v-if="!activeProfile" class="nb-adv-blank">
@@ -90,6 +91,8 @@ import CoreConfigEditor from '../CoreConfigEditor.vue'
 import { useSettingsStore } from '../../stores/settings'
 import { useProfilesStore } from '../../stores/profiles'
 import { useConnectionStore } from '../../stores/connection'
+import { useConfirmStore } from '../../stores/confirm'
+import { configTargetProfile } from '../../configTarget'
 
 defineEmits<{
   (e: 'goto', view: 'proxies'): void
@@ -98,6 +101,7 @@ defineEmits<{
 const settings = useSettingsStore()
 const profiles = useProfilesStore()
 const connection = useConnectionStore()
+const confirmBox = useConfirmStore()
 
 const cfgSections = [
   { key: 'route', label: 'Route Rules', desc: 'Route rules decide which outbound each connection uses. Edits sing-box "route" (xray "routing").' },
@@ -115,23 +119,34 @@ function isDirty(): boolean {
   return cfgEditor.value?.isDirty() === true || rawEditor.value?.isDirty() === true
 }
 
-function switchCfgTab(key: string) {
+async function switchCfgTab(key: string) {
   if (key === cfgTab.value) return
-  if (isDirty() && !confirm('Discard changes?')) return
+  if (
+    isDirty() &&
+    !(await confirmBox.ask({
+      title: 'Discard changes?',
+      body: 'The editor holds unsaved JSON. Switching sections throws it away.',
+      confirmLabel: 'Discard',
+      danger: true,
+    }))
+  )
+    return
   cfgTab.value = key
 }
 
-function switchTo(sub: string) {
-  if (cfgSections.some((st) => st.key === sub)) {
-    if (isDirty() && sub !== cfgTab.value && !confirm('Discard changes?')) return
-    cfgTab.value = sub
-  }
-}
-defineExpose({ switchTo, isDirty })
+defineExpose({ isDirty })
 
-const activeProfile = computed(() => {
-  const id = settings.settings.activeProfileId
-  return profiles.profiles.find((p) => p.id === id) ?? profiles.profiles[0] ?? null
+const activeProfile = computed(() =>
+  configTargetProfile(connection.status, settings.settings.activeProfileId, profiles.profiles),
+)
+
+/** Names the profile the backend actually renders, so a running core
+ *  that differs from the stored selection is visible instead of silent. */
+const targetLabel = computed(() => {
+  const p = activeProfile.value
+  if (!p) return ''
+  const core = p.core === 1 ? 'Xray' : p.core === 3 ? 'Mihomo' : 'sing-box'
+  return `${p.name} (${core})`
 })
 
 // The backend refuses both editors for a mihomo profile: it renders its
@@ -161,7 +176,10 @@ const overrideKeys = computed(() => Object.keys(settings.settings.coreOverrides 
 
 function overrideSize(k: string): string {
   const v = (settings.settings.coreOverrides ?? {})[k]
-  const n = v === undefined || v === null ? 0 : String(v).length
+  // The wire value is parsed JSON (Go json.RawMessage), so String(v) on
+  // an object is "[object Object]" — 15 chars for every section. Measure
+  // the JSON text: that is what the editor loads and the core is given.
+  const n = v === undefined || v === null ? 0 : JSON.stringify(v).length
   return `${n} chars stored`
 }
 </script>

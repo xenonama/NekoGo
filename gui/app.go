@@ -582,6 +582,13 @@ func (a *App) SaveSettings(s Settings) error {
 		return fmt.Errorf("tunStack must be one of system, gvisor, mixed")
 	}
 	s.TunStack = normalizeTunStack(s.TunStack)
+	// The rest of the TUN group (tun_config.go): same discipline — a
+	// prefix sing-box cannot decode or an MTU it cannot set is refused
+	// here, where the GUI can show why, rather than at connect.
+	if err := validateTunSettings(&s); err != nil {
+		return err
+	}
+	normalizeTunSettings(&s)
 	// Throne parity fields: fail fast on unbindable listen
 	// addresses and malformed DNS upstreams (same BUG-019
 	// discipline as MixedPort); the listen address normalizes
@@ -636,6 +643,12 @@ func (a *App) SaveSettings(s Settings) error {
 	}
 	if p := strings.TrimSpace(s.UpstreamCorePath); p != "" && coreImageOwner(p) == "nekobox" {
 		return fmt.Errorf("upstreamCorePath points at nekobox_core.exe; the official CLI belongs there — use corePath for the custom core")
+	}
+	// Chain Psiphon options (Chain tab, advanced mode): same BUG-019
+	// discipline — a country aether cannot read is refused at save time,
+	// not silently dropped at connect.
+	if err := normalizeChainPsiphon(&s); err != nil {
+		return err
 	}
 	old := a.store.GetSettings()
 	if err := a.store.SaveSettings(s); err != nil {
@@ -732,11 +745,7 @@ func (a *App) Connect(id string) error {
 	// handoff, so persist the requested profile first: the elevated child
 	// resumes it through --connect. Xray ignores both, so proxy-only users
 	// are never gated.
-	if tunNeedsElevation(&p, settings) || spoofNeedsElevation(&p, settings) {
-		msg := spoofRequiresAdminMessage
-		if tunNeedsElevation(&p, settings) {
-			msg = tunRequiresAdminMessage
-		}
+	if msg := elevationMessage(&p, settings); msg != "" {
 		if err := a.store.SetActiveProfileID(id); err != nil {
 			a.emitLog("gui", "error", fmt.Sprintf("Connect: persist elevation target: %v", err))
 		}
@@ -848,7 +857,7 @@ func tunNeedsElevation(p *Profile, settings Settings) bool {
 	// Xray and mihomo never render a TUN inbound, so neither ever needs
 	// the Wintun adapter — asking for admin there would gate proxy-only
 	// users on a driver they will not use.
-	if runtime.GOOS != "windows" || p == nil || p.Core.IsXray() || p.Core.IsMihomo() || !tunRequiredFor(p, settings) {
+	if p == nil || p.Core.IsXray() || p.Core.IsMihomo() || !tunRequiredFor(p, settings) || !guiUnelevated() {
 		return false
 	}
 	// A stored full raw config replaces the rendered config (and the
@@ -856,8 +865,7 @@ func tunNeedsElevation(p *Profile, settings Settings) bool {
 	if _, full, err := rawCoreOverride(settings.CoreOverrides); err == nil && full {
 		return false
 	}
-	elevated, err := guiElevated()
-	return err == nil && !elevated
+	return true
 }
 
 // spoofRequiresAdminMessage is the Connect error shown when the SNI spoof
@@ -878,11 +886,45 @@ const spoofRequiresAdminMessage = "SNI spoofing requires administrator rights (t
 // with no admin remedy attached. Probe failures are not treated as
 // unelevated, matching tunNeedsElevation.
 func spoofNeedsElevation(p *Profile, settings Settings) bool {
-	if runtime.GOOS != "windows" || !spoofConnectEnabled(p, settings) {
+	return spoofConnectEnabled(p, settings) && guiUnelevated()
+}
+
+// guiUnelevated reports that this process is KNOWN to be unelevated. Off
+// Windows there is no driver to load, and a probe failure is never
+// reported as unelevated: the operation proceeds and a real permission
+// failure surfaces on its own. Every elevation gate uses this so the
+// same rule cannot drift between them.
+func guiUnelevated() bool {
+	if runtime.GOOS != "windows" {
 		return false
 	}
 	elevated, err := guiElevated()
 	return err == nil && !elevated
+}
+
+// bothRequiresAdminMessage is the SNI spoof → Psiphon chain's refusal:
+// the engine loads WinDivert and the chain forces the TUN inbound, so it
+// needs Wintun too. Naming only one of the two drivers described only
+// half of what the connect cannot do. The phrase "requires administrator
+// rights" is what the frontend matches, so it stays verbatim.
+const bothRequiresAdminMessage = "This connect requires administrator rights for both drivers " +
+	"(WinDivert for SNI spoofing, Wintun for TUN). Relaunch NekoGo as administrator?"
+
+// elevationMessage reports which elevation a connect is missing, or ""
+// when it needs none. Connect refuses with it before spawning anything,
+// so the three cases cannot be reported inconsistently.
+func elevationMessage(p *Profile, settings Settings) string {
+	tun := tunNeedsElevation(p, settings)
+	spoof := spoofNeedsElevation(p, settings)
+	switch {
+	case tun && spoof:
+		return bothRequiresAdminMessage
+	case tun:
+		return tunRequiresAdminMessage
+	case spoof:
+		return spoofRequiresAdminMessage
+	}
+	return ""
 }
 
 // tunStartHint annotates a permission-shaped TUN start failure with
@@ -1192,6 +1234,14 @@ func (a *App) SpoofStart(profileID string) error {
 	}
 	if !spoofEnabled(a.store.GetSettings()) {
 		return fmt.Errorf("SNI spoofing is disabled in Settings → Connection")
+	}
+	// WinDivert is a kernel driver, so an unelevated process cannot load
+	// it. The engine used to answer "Access is denied (code 5)" and the SNI
+	// tab reported a driver fault with no route to the remedy the app
+	// already has; this is Connect's gate, with the message the dialog
+	// keys on.
+	if guiUnelevated() {
+		return errors.New(spoofRequiresAdminMessage)
 	}
 	if err := a.spoofMgr.Start(&p, a.store.GetSettings()); err != nil {
 		return err

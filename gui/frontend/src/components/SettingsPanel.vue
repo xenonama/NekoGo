@@ -6,7 +6,7 @@
       <span class="stg-hero-chip"><Icon name="gear" :size="34" /></span>
       <div class="stg-hero-text">
         <h2>Settings</h2>
-        <p>Customize your NekoBox experience</p>
+        <p>How NekoGo starts, listens and connects</p>
       </div>
       <Icon name="cloud" :size="28" class="stg-hero-cloud" />
       <img class="stg-hero-cat" :src="appIcon" alt="" />
@@ -42,7 +42,7 @@
         </span>
       </div>
       <div
-        v-for="r in activeTab.rows"
+        v-for="r in visibleRows"
         :key="r.key"
         class="stg-row"
       >
@@ -82,7 +82,7 @@
             max="65534"
             :aria-label="r.title"
             :value="Number(s[r.field as NumKey])"
-            @change="setNum(r.field as NumKey, ($event.target as HTMLInputElement).value)"
+            @change="setNum(r.field as NumKey, $event.target as HTMLInputElement)"
           />
           <input
             v-else
@@ -96,14 +96,168 @@
       </div>
       <div v-if="(tab === 'general' || tab === 'connection') && bootMsg" class="nb-json-error" style="padding: 4px 0 8px">{{ bootMsg }}</div>
       <div v-if="saveErr" class="nb-json-error" style="padding: 4px 0 8px">{{ saveErr }}</div>
-      <!-- TUN diagnostics: traffic can stall with no core error at all
-           (poisoned DNS, oversized packets), so the TUN group carries
-           its own hint. MTU is rendered at 1400 (tunMTU in
-           singbox_manager.go) and Advanced -> Config -> Inbound
-           overrides it for unusual links. -->
-      <div v-if="tab === 'connection'" class="stg-sub" style="padding: 4px 0 10px">
-        If YouTube or heavy sites fail in TUN mode, try lowering the MTU to 1400 or 1350 — NekoGo renders 1400; override it under Advanced → Config → Inbound.
-      </div>
+      <!-- TUN diagnostics + the field group the core reads
+           (gui/tun_config.go). Traffic can stall with no core error at
+           all — poisoned DNS, oversized packets — so the advice sits
+           with the control that fixes it, and the MTU it names is the
+           row below rather than a constant in a Go file. -->
+      <template v-if="tab === 'connection' && s.tunEnabled">
+        <div class="stg-sub" style="padding: 4px 0 10px">
+          If heavy pages stall in TUN mode while search still works, the packets are too big
+          for the link: try lowering the MTU below and reconnecting. If nothing reaches the
+          tunnel at all, check Auto route.
+        </div>
+        <div class="stg-row">
+          <span class="stg-chip"><Icon name="tune" :size="18" /></span>
+          <span class="stg-meta">
+            <span class="stg-title">MTU</span>
+            <span class="stg-sub">Packet size the adapter is given · 1280-65535, 1350 when unset (applies on reconnect)</span>
+          </span>
+          <span class="stg-ctl">
+            <input
+              class="stg-num"
+              type="number"
+              min="1280"
+              max="65535"
+              step="1"
+              aria-label="MTU"
+              :value="Number(s.tunMTU || TUN_MTU_DEFAULT)"
+              @change="setTunMTU($event.target as HTMLInputElement)"
+            />
+          </span>
+        </div>
+        <div class="stg-row">
+          <span class="stg-chip"><Icon name="layers" :size="18" /></span>
+          <span class="stg-meta">
+            <span class="stg-title">Auto route</span>
+            <span class="stg-sub">Point the default route at the adapter. Off leaves the tunnel up with nothing in it — for setups that install their own routes (applies on reconnect)</span>
+          </span>
+          <span class="stg-ctl">
+            <button
+              class="stg-toggle"
+              :class="{ on: s.tunAutoRoute !== false }"
+              role="switch"
+              :aria-checked="s.tunAutoRoute !== false"
+              aria-label="Auto route"
+              title="Auto route"
+              @click="setTunBool('tunAutoRoute')"
+            >
+              <span class="knob" />
+            </button>
+          </span>
+        </div>
+        <div class="stg-row">
+          <span class="stg-chip"><Icon name="shield" :size="18" /></span>
+          <span class="stg-meta">
+            <span class="stg-title">Strict route</span>
+            <span class="stg-sub">Drop traffic that did not come from the adapter — nothing leaks around the tunnel, and local discovery can go with it (applies on reconnect)</span>
+          </span>
+          <span class="stg-ctl">
+            <button
+              class="stg-toggle"
+              :class="{ on: !!s.tunStrictRoute }"
+              role="switch"
+              :aria-checked="!!s.tunStrictRoute"
+              aria-label="Strict route"
+              title="Strict route"
+              @click="setTunBool('tunStrictRoute')"
+            >
+              <span class="knob" />
+            </button>
+          </span>
+        </div>
+        <div class="stg-row">
+          <span class="stg-chip"><Icon name="globe" :size="18" /></span>
+          <span class="stg-meta">
+            <span class="stg-title">Adapter network (IPv4)</span>
+            <span class="stg-sub">Move it when this range is already routed on your machine (applies on reconnect)</span>
+          </span>
+          <span class="stg-ctl">
+            <PickSelect
+              :model-value="s.tunAddress || '172.19.0.1/24'"
+              icon="globe"
+              title="Adapter network (IPv4)"
+              aria-label="Adapter network IPv4"
+              quiet
+              :options="tunV4Options"
+              @update:model-value="setTunStr('tunAddress', $event)"
+            />
+          </span>
+        </div>
+        <div class="stg-row">
+          <span class="stg-chip"><Icon name="globe" :size="18" /></span>
+          <span class="stg-meta">
+            <span class="stg-title">IPv6 on the adapter</span>
+            <span class="stg-sub">NekoGo asks only when Windows still gives new interfaces IPv6 — or when a global IPv6 address elsewhere could reach the internet around the tunnel (applies on reconnect)</span>
+          </span>
+          <span class="stg-ctl">
+            <button
+              class="stg-toggle"
+              :class="{ on: !!s.tunEnableIPv6 }"
+              role="switch"
+              :aria-checked="!!s.tunEnableIPv6"
+              aria-label="IPv6 on the adapter"
+              title="IPv6 on the adapter"
+              @click="setTunBool('tunEnableIPv6')"
+            >
+              <span class="knob" />
+            </button>
+          </span>
+        </div>
+        <div v-if="s.tunEnableIPv6" class="stg-row">
+          <span class="stg-chip"><Icon name="globe" :size="18" /></span>
+          <span class="stg-meta">
+            <span class="stg-title">Adapter network (IPv6)</span>
+            <span class="stg-sub">Needs room for a peer address (/126 or shorter) — a single-address prefix is one the core refuses (applies on reconnect)</span>
+          </span>
+          <span class="stg-ctl">
+            <PickSelect
+              :model-value="s.tunAddress6 || 'fc00::172:19:0:1/126'"
+              icon="globe"
+              title="Adapter network (IPv6)"
+              aria-label="Adapter network IPv6"
+              quiet
+              :options="tunV6Options"
+              @update:model-value="setTunStr('tunAddress6', $event)"
+            />
+          </span>
+        </div>
+        <div class="stg-row">
+          <span class="stg-chip"><Icon name="layers" :size="18" /></span>
+          <span class="stg-meta">
+            <span class="stg-title">Routes to leave alone</span>
+            <span class="stg-sub">Comma-separated CIDRs auto route must not take, e.g. 192.168.1.0/24 for a LAN printer (applies on reconnect)</span>
+          </span>
+          <span class="stg-ctl">
+            <input
+              class="stg-text"
+              type="text"
+              aria-label="Routes to leave alone"
+              placeholder="192.168.1.0/24, 10.0.0.0/8"
+              :value="(s.tunRouteExclude || []).join(', ')"
+              @change="setTunExclude(($event.target as HTMLInputElement).value)"
+            />
+          </span>
+        </div>
+        <div class="stg-row">
+          <span class="stg-chip"><Icon name="bolt" :size="18" /></span>
+          <span class="stg-meta">
+            <span class="stg-title">Ping (ICMP)</span>
+            <span class="stg-sub">What answers a ping while the tunnel is up. “Rule” leaves it to the routing rules, which is how it has always run (applies on reconnect)</span>
+          </span>
+          <span class="stg-ctl">
+            <PickSelect
+              :model-value="s.tunIcmp || 'rule'"
+              icon="bolt"
+              title="Ping (ICMP)"
+              aria-label="ICMP policy"
+              quiet
+              :options="TUN_ICMP_OPTIONS"
+              @update:model-value="setTunStr('tunIcmp', $event)"
+            />
+          </span>
+        </div>
+      </template>
       <!-- GeoIP extras: status readout + manual actions (auto-persist rows above). -->
       <template v-if="tab === 'geoip'">
         <div class="stg-row">
@@ -296,7 +450,9 @@ import { useConnectionStore } from '../stores/connection'
 import UpdatesPanel from './UpdatesPanel.vue'
 import PickSelect from './PickSelect.vue'
 import { backend } from '../api'
-import type { GeoIPStatus } from '../types'
+import { parsePortInput } from '../ports'
+import { useConfirmStore } from '../stores/confirm'
+import type { GeoIPStatus, Settings } from '../types'
 
 type BoolKey = 'startOnBoot' | 'closeToTray' | 'tunEnabled' | 'autoConnect' | 'sidebarLabels' | 'geoIPAutoDetect' | 'fragmentEnabled' | 'fingerprintEnabled' | 'systemProxy' | 'spoofXray' | 'spoofEnabled'
 // 'systemProxy' keeps its member and its row: Connect auto-ensures the
@@ -305,7 +461,10 @@ type BoolKey = 'startOnBoot' | 'closeToTray' | 'tunEnabled' | 'autoConnect' | 's
 // the Quick Actions tile read that from the OS.
 // No 'notifications' member: the toggle was dead (nothing reads the
 // flag; Wails beta.20 has no desktop-notify API), so the row is gone.
-type StrKey = 'language' | 'theme' | 'windowStyle' | 'xrayApiAddress' | 'testUrl' | 'geoIPDBPath' | 'logLevel' | 'logOutputPath' | 'inboundAddress' | 'dnsRemote' | 'dnsDirect' | 'fragmentMode' | 'fragmentLength' | 'fingerprintValue' | 'tunStack' | 'coreEngine'
+// Only the fields this tab renders. windowStyle is a stored setting no
+// control edits, and the log fields belong to the Console tab — a name in
+// this union reads like a knob that exists here.
+type StrKey = 'language' | 'theme' | 'xrayApiAddress' | 'testUrl' | 'geoIPDBPath' | 'inboundAddress' | 'dnsRemote' | 'dnsDirect' | 'fragmentMode' | 'fragmentLength' | 'fingerprintValue' | 'tunStack' | 'coreEngine'
 type NumKey = 'mixedPort'
 
 interface SelectOpt { value: string; label: string }
@@ -317,6 +476,10 @@ interface RowDef {
   kind: 'toggle' | 'select' | 'number' | 'text'
   field: BoolKey | StrKey | NumKey
   options?: SelectOpt[]
+  /** Rows the current settings make irrelevant — a TUN stack with TUN off
+   *  configures an inbound that is not rendered. Hidden, not greyed: the
+   *  value still applies the moment TUN comes back. */
+  show?: (s: Settings) => boolean
 }
 interface TabDef {
   key: string
@@ -335,8 +498,9 @@ const store = useSettingsStore()
 // s.* (auto-unwrapped); the script below goes through store.settings.
 const s = computed(() => store.settings)
 const tab = ref('general')
-// Last backend rejection of a settings save; the row now snaps back, so
-// this explains why.
+// Why the last edit did not stick: either the backend rejected it
+// (validation of ports, DNS, paths) or the field held text that is not a
+// number. The row snaps back either way, so this says what happened.
 const saveErr = ref('')
 
 // Persist and report success: the generic rows used to keep an
@@ -361,11 +525,14 @@ async function flip(field: BoolKey) {
   // local value is left untouched so the toggle snaps back.
   if (field === 'closeToTray') {
     const next = !store.settings[field]
+    saveErr.value = ''
     try {
       await backend.setCloseToTray(next)
       store.settings[field] = next
     } catch (e) {
-      console.error(e)
+      // A console line is invisible here: the switch just flips back on
+      // its own, which reads as the app ignoring the user.
+      saveErr.value = String(e)
     }
     return
   }
@@ -398,11 +565,29 @@ async function setStr(field: StrKey, value: string) {
   if (!(await persist())) store.settings[field] = prev
 }
 
-async function setNum(field: NumKey, raw: string) {
-  const v = Math.min(65534, Math.max(1, parseInt(raw, 10) || 0))
+async function setNum(field: NumKey, el: HTMLInputElement) {
+  // Nothing is invented out of text that is not a number: the previous
+  // port stays in force, the box is rewritten to show it, and the reason
+  // goes where the other refused edits surface. mixedPort is the only
+  // numeric row, so the label is its own.
+  const { value, error } = parsePortInput(
+    el.value,
+    'Mixed port',
+    store.settings[field],
+    el.validity.badInput,
+  )
+  saveErr.value = error
+  if (error) {
+    el.value = String(store.settings[field])
+    return
+  }
+  if (value === store.settings[field]) return
   const prev = store.settings[field]
-  store.settings[field] = v
-  if (!(await persist())) store.settings[field] = prev
+  store.settings[field] = value
+  if (!(await persist())) {
+    store.settings[field] = prev
+    el.value = String(prev)
+  }
 }
 
 // Transport tab extras: option sources + error-surfacing persist.
@@ -467,12 +652,111 @@ async function setTransportInterval(raw: string) {
   }
 }
 
+// TUN group: the values the sing-box inbound reads (gui/tun_config.go
+// holds the same pools, and the backend is what refuses a bad one).
+// Kept in one place so the row copy, the option list and the bounds the
+// engine enforces cannot each remember something different.
+const TUN_MTU_MIN = 1280
+const TUN_MTU_DEFAULT = 1350 // tunMTU in gui/singbox_manager.go
+const TUN_MTU_MAX = 65535
+const TUN_V4 = [
+  '172.19.0.1/24',
+  '172.18.0.1/30',
+  '172.31.0.1/30',
+  '172.20.0.1/30',
+  '172.16.0.1/30',
+  '192.168.100.1/30',
+  '10.10.14.1/30',
+  '10.1.0.1/30',
+]
+const TUN_V6 = [
+  'fc00::172:19:0:1/126',
+  'fc00::172:18:0:1/126',
+  'fc00::172:31:0:1/126',
+  'fc00::172:20:0:1/126',
+  'fc00::172:16:0:1/126',
+  'fc00::192:168:100:1/126',
+  'fc00::10:10:14:1/126',
+  'fc00::10:1:0:1/126',
+]
+const TUN_ICMP_OPTIONS = [
+  { value: 'rule', label: 'Rule (default)' },
+  { value: 'direct', label: 'Direct — ping outside the tunnel' },
+  { value: 'reply', label: 'Reply — answer from the tunnel' },
+  { value: 'unreachable', label: 'Unreachable' },
+  { value: 'drop', label: 'Drop — no answer at all' },
+]
+
+// An address hand-edited into config.json is still the address in use,
+// so it leads the list rather than vanishing from the dropdown.
+function tunAddrOptions(pool: string[], current?: string) {
+  const list = current && !pool.includes(current) ? [current, ...pool] : pool
+  return list.map((v) => ({ value: v, label: v }))
+}
+const tunV4Options = computed(() => tunAddrOptions(TUN_V4, store.settings.tunAddress))
+const tunV6Options = computed(() => tunAddrOptions(TUN_V6, store.settings.tunAddress6))
+
+type TunBoolKey = 'tunAutoRoute' | 'tunStrictRoute' | 'tunEnableIPv6'
+
+async function setTunBool(field: TunBoolKey) {
+  // Auto route has three stored states and unset means yes, so the row
+  // reads "off only when explicitly false" and writes the opposite of
+  // what it showed. Writing the read itself would set true every time it
+  // was already on, and the toggle could never be turned off.
+  const prev = store.settings[field]
+  const effective = field === 'tunAutoRoute' ? prev !== false : prev === true
+  store.settings[field] = !effective
+  if (!(await persist())) (store.settings as Record<string, unknown>)[field] = prev
+}
+
+type TunStrKey = 'tunAddress' | 'tunAddress6' | 'tunIcmp'
+
+async function setTunStr(field: TunStrKey, value: string) {
+  const prev = store.settings[field] ?? ''
+  store.settings[field] = value
+  if (!(await persist())) store.settings[field] = prev
+}
+
+// An MTU is not a port: 576 is a legal port and a size sing-box will not
+// put on an interface, and 65535 is a legal MTU the port row refuses.
+// So the bounds come from the engine's own and the message names MTU.
+async function setTunMTU(el: HTMLInputElement) {
+  const prev = Number(store.settings.tunMTU || TUN_MTU_DEFAULT)
+  const v = Number(el.value)
+  if (!Number.isInteger(v) || v < TUN_MTU_MIN || v > TUN_MTU_MAX) {
+    saveErr.value = `MTU must be a whole number ${TUN_MTU_MIN}-${TUN_MTU_MAX}. It stays ${prev}.`
+    el.value = String(prev)
+    return
+  }
+  saveErr.value = ''
+  if (v === Number(store.settings.tunMTU)) return
+  store.settings.tunMTU = v
+  if (!(await persist())) {
+    store.settings.tunMTU = prev
+    el.value = String(prev)
+  }
+}
+
+// The excluded-routes box is one string; the engine wants a list. The
+// backend refuses an entry that is not a CIDR, and a refusal must not
+// cost the entries that were fine — so the box keeps what it had.
+async function setTunExclude(raw: string) {
+  const prev = store.settings.tunRouteExclude ?? []
+  const next = raw
+    .split(/[,\s]+/)
+    .map((x) => x.trim())
+    .filter((x) => x !== '')
+  store.settings.tunRouteExclude = next
+  if (!(await persist())) store.settings.tunRouteExclude = prev
+}
+
 // Launch-at-login note (e.g. non-Windows backend rejection).
 const bootMsg = ref('')
 
 // GeoIP extras (status + manual actions live outside the generic row kinds).
 const profiles = useProfilesStore()
 const connection = useConnectionStore()
+const confirmBox = useConfirmStore()
 const geoStatus = ref<GeoIPStatus | null>(null)
 const geoMsg = ref('')
 const geoBusy = ref(false)
@@ -548,7 +832,16 @@ async function geoCancel() {
 }
 
 async function geoClear() {
-  if (!confirm('Clear all detected countries?')) return
+  // The app's own dialog, not window.confirm: in WebView2 the browser box
+  // is un-themed chrome, and this is the one button in the tab that
+  // destroys data.
+  const ok = await confirmBox.ask({
+    title: 'Clear all countries?',
+    body: 'Every detected flag is removed from all profiles. Re-detect them with Refresh; the profiles themselves are untouched.',
+    confirmLabel: 'Clear',
+    danger: true,
+  })
+  if (!ok) return
   geoBusy.value = true
   try {
     await backend.clearCountries()
@@ -603,7 +896,7 @@ const tabs: TabDef[] = [
     key: 'proxy', label: 'Proxy', icon: 'layers',
     head: 'Proxy', headSub: 'Local inbound ports and DNS',
     rows: [
-      { key: 'mixed', icon: 'globe', title: 'Mixed port', sub: 'HTTP proxy on this port · SOCKS proxy on port + 1 (applies on reconnect)', kind: 'number', field: 'mixedPort' },
+      { key: 'mixed', icon: 'globe', title: 'Mixed port', sub: 'Both HTTP and SOCKS share this one port on the sing-box cores; an Xray profile puts SOCKS on port + 1 · 1-65534 (applies on reconnect)', kind: 'number', field: 'mixedPort' },
       { key: 'bind', icon: 'wifi', title: 'Listen address', sub: 'Empty = loopback only · 0.0.0.0 shares on the LAN (applies on reconnect)', kind: 'text', field: 'inboundAddress' },
       { key: 'dnsremote', icon: 'cloud', title: 'Remote DNS', sub: 'DoH: https://1.1.1.1/dns-query  ·  DoT: tls://8.8.8.8  ·  IP: 8.8.8.8  ·  empty = system default', kind: 'text', field: 'dnsRemote' },
       { key: 'dnsdirect', icon: 'cloud', title: 'Direct DNS', sub: 'Lookups that bypass the proxy — same shapes, empty = system default', kind: 'text', field: 'dnsDirect' },
@@ -612,7 +905,7 @@ const tabs: TabDef[] = [
   },
   {
     key: 'connection', label: 'Connection', icon: 'wifi',
-    head: 'Connection', headSub: 'TUN and auto-connect (the OS proxy is set on every connect)',
+    head: 'Connection', headSub: 'Core engine, TUN, auto-connect and the probe',
     rows: [
       // Opt-in backend switch: "custom" is the bundled NekoBox core
       // (Thrift RPC, full protocol set); "upstream" spawns the official
@@ -626,10 +919,14 @@ const tabs: TabDef[] = [
           { value: 'upstream', label: 'sing-box' },
         ],
       },
-      { key: 'tun', icon: 'shield', title: 'TUN mode', sub: 'Route all traffic (sing-box, applies on reconnect)', kind: 'toggle', field: 'tunEnabled' },
-      // CPU: system hands packets to the OS stack; gVisor keeps them in
-      // user space and costs ~2-5x the CPU per byte on Windows.
-      { key: 'tunstack', icon: 'tune', title: 'TUN stack', sub: 'System is fastest on Windows · gVisor costs more CPU per byte (applies on reconnect)', kind: 'select', field: 'tunStack', options: [{ value: 'system', label: 'System' }, { value: 'gvisor', label: 'gVisor' }, { value: 'mixed', label: 'Mixed' }] },
+      { key: 'tun', icon: 'shield', title: 'TUN mode', sub: 'Route all traffic through a virtual adapter — sing-box profiles only: an Xray or mihomo profile connects without it however this reads (applies on reconnect)', kind: 'toggle', field: 'tunEnabled' },
+      // gVisor terminates TCP inside the core, so it carries traffic with
+      // no OS involvement. System and Mixed hand TCP to Windows, which
+      // sees the tunnel's own handshake as a NEW INBOUND connection to
+      // the core binary: without a firewall allow for it, DNS through the
+      // tunnel answers and every TCP dial times out. So the cheap stack is
+      // opt-in, not the default.
+      { key: 'tunstack', icon: 'tune', title: 'TUN stack', sub: 'gVisor (default) carries TCP in the core · System and Mixed hand TCP to Windows and need the core allowed through the firewall, or TCP times out (applies on reconnect)', kind: 'select', field: 'tunStack', show: (v) => !!v.tunEnabled, options: [{ value: 'gvisor', label: 'gVisor (default)' }, { value: 'system', label: 'System' }, { value: 'mixed', label: 'Mixed' }] },
       { key: 'auto', icon: 'power', title: 'Auto-connect', sub: 'Connect last profile on launch', kind: 'toggle', field: 'autoConnect' },
       { key: 'sysproxy', icon: 'globe', title: 'System proxy on connect', sub: 'Point the OS proxy at NekoGo in proxy mode — ignored in TUN mode (including the SNI spoof + Psiphon chain), where TUN carries all traffic', kind: 'toggle', field: 'systemProxy' },
       { key: 'spoof', icon: 'shield', title: 'SNI spoofing', sub: 'Run the spoof engine for SNI Spoofing profiles. Off = dial their own address with the normal transport (e.g. your own 127.0.0.1 tunnel).', kind: 'toggle', field: 'spoofEnabled' },
@@ -644,7 +941,7 @@ const tabs: TabDef[] = [
   },
   {
     key: 'appearance', label: 'Appearance', icon: 'palette',
-    head: 'Appearance', headSub: 'Theme, window and sidebar',
+    head: 'Appearance', headSub: 'Theme and sidebar',
     rows: [
       { key: 'theme', icon: 'sun', title: 'Theme', sub: 'Light or dark interface', kind: 'select', field: 'theme', options: [{ value: 'light', label: 'Light' }, { value: 'dark', label: 'Dark' }] },
       { key: 'labels', icon: 'list', title: 'Show sidebar labels', sub: 'Icons only when off', kind: 'toggle', field: 'sidebarLabels' },
@@ -666,4 +963,7 @@ const tabs: TabDef[] = [
 ]
 
 const activeTab = computed(() => tabs.find((t) => t.key === tab.value))
+const visibleRows = computed(() =>
+  (activeTab.value?.rows ?? []).filter((r) => !r.show || r.show(store.settings)),
+)
 </script>

@@ -1,6 +1,7 @@
 import { defineStore } from 'pinia'
 import { ref, shallowRef } from 'vue'
 import { backend } from '../api'
+import { useElevationStore } from './elevation'
 import type { ConnStatus, LogEntry, Stats } from '../types'
 
 export const useConnectionStore = defineStore('connection', () => {
@@ -42,6 +43,9 @@ export const useConnectionStore = defineStore('connection', () => {
   // every 2s instead — half the traffic, same window.
   const logPollMs = 2000
   let lastLogFetch = 0
+  // The elevation store owns the relaunch dialog's state; this store only
+  // asks, so the dialog can live in the shell rather than in a caller.
+  const elevation = useElevationStore()
 
   function noteError(e: unknown) {
     if (backend.available()) error.value = String(e)
@@ -131,8 +135,9 @@ export const useConnectionStore = defineStore('connection', () => {
       // the TUN one left a spoof connect failing on a driver error with no
       // way to fix it from the UI.
       if (msg.includes('requires administrator rights') && backend.available()) {
-        const relaunch = confirm(`${msg}\n\nThe app will restart and resume the connection.`)
-        if (relaunch) {
+        // The app's own dialog: window.confirm renders as a browser box
+        // in WebView2, and this is the ask that restarts the process.
+        if (await elevation.ask(msg)) {
           try {
             await backend.relaunchAsAdmin()
           } catch (re) {

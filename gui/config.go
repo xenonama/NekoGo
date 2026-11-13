@@ -225,6 +225,33 @@ func NewConfigStore(dir string) (*ConfigStore, error) {
 			}
 		}
 	}
+	// TUN stack migration (one-time). NekoGo hardcoded the OS stack until
+	// tunStack became a setting, and the first save after that wrote the
+	// hardcode into config.json as though it had been chosen. The OS
+	// stack terminates TCP inside Windows, which then needs an inbound
+	// firewall allow for the core; sing-tun asks for that allow and
+	// discards the error, so on a machine without the rule the tunnel
+	// carries DNS and times out every TCP dial - it connects and nothing
+	// loads. Move the stored value to the stack that needs nothing from
+	// the firewall. The marker is what makes this one-time: after it,
+	// System and Mixed are honored as deliberate choices.
+	if !c.settings.TunOSStackMigrated {
+		stored := c.settings.TunStack
+		switch stored {
+		case "system", "mixed":
+			c.settings.TunStack = tunStackDefault
+		}
+		c.settings.TunOSStackMigrated = true
+		if loaded {
+			if err := c.saveLocked(); err != nil {
+				log.Printf("[config] tun stack migration: save failed: %v", err)
+			} else if c.settings.TunStack != stored {
+				log.Printf("[config] tun stack migration: stored tunStack %q needs the core allowed"+
+					" through the firewall to carry TCP, using %q instead (Settings → Connection → TUN stack)",
+					stored, tunStackDefault)
+			}
+		}
+	}
 	return c, nil
 }
 
@@ -548,6 +575,15 @@ func (c *ConfigStore) GetSettings() Settings {
 	// existed (and backups that omit it) report "system" everywhere
 	// without rewriting the file on disk.
 	s.TunStack = normalizeTunStack(s.TunStack)
+	// The rest of the TUN group, same read-time treatment: prefixes are
+	// canonicalized (and junk dropped) so the rows show what will render,
+	// and an unset auto-route reports the effective true rather than an
+	// unchecked box that would turn routing off if saved back.
+	normalizeTunSettings(&s)
+	if s.TunAutoRoute == nil {
+		v := true
+		s.TunAutoRoute = &v
+	}
 	// Core engine: configs saved before the setting existed omit it.
 	// Report the default ("custom", the Thrift/RPC core) instead of an
 	// empty string so the settings select and the tray never read blank.

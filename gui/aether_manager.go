@@ -293,13 +293,18 @@ func pruneChainPsiphonDirs(base string) {
 // loopback inbound that routes into the spoof front. A non-empty
 // [dataDir] pins Psiphon's datastore there instead of the shared
 // default, so no other process can hold its lock.
-func psiphonOnlyArgs(port, upstreamPort int, logLevel, dataDir string) []string {
+// The Chain tab's Psiphon options are rendered through the same
+// psiphonOptionArgs an Aether profile uses, so a country or fronting
+// list picked on that tab applies to this leg too.
+func psiphonOnlyArgs(port, upstreamPort int, logLevel, dataDir string, settings Settings) []string {
 	args := []string{
 		"--bind", fmt.Sprintf("%s:%d", aetherLoopback, port),
 		"--psiphon-only",
 		"--upstream", fmt.Sprintf("socks5://%s:%d", aetherLoopback, upstreamPort),
 		"--log-level", logLevel,
 	}
+	args = append(args, psiphonOptionArgs(settings.ChainPsiphonMode, settings.ChainPsiphonCDN,
+		settings.ChainPsiphonSNI, settings.ChainPsiphonSets, settings.ChainPsiphonRegion)...)
 	if dataDir != "" {
 		args = append(args, "--psiphon-dir", dataDir)
 	}
@@ -320,7 +325,7 @@ func (m *AetherManager) StartPsiphonOnly(settings Settings, port, upstreamPort i
 		return 0, err
 	}
 	dataDir := newChainPsiphonDir()
-	args := psiphonOnlyArgs(port, upstreamPort, aetherLogLevel(settings.LogLevel), dataDir)
+	args := psiphonOnlyArgs(port, upstreamPort, aetherLogLevel(settings.LogLevel), dataDir, settings)
 	m.log("info", fmt.Sprintf("psiphon chain: plain psiphon on %s:%d, dialling through %s:%d (data dir %s)",
 		aetherLoopback, port, aetherLoopback, upstreamPort, dataDir))
 	listen, _, err := m.runProcess(exe, args, port, warmup, "", dataDir, probePsiphonTunnel)

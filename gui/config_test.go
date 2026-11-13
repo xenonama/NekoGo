@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
@@ -197,8 +198,8 @@ func TestSpoofAutoDetectRevert(t *testing.T) {
 	}
 }
 
-// CPU audit #1: a config.json written before tunStack existed reports
-// the effective default ("system") on read, without rewriting the file.
+// A config.json written before tunStack existed reports the effective
+// default (tunStackDefault) on read, without rewriting the file.
 func TestLegacyConfigDefaultsTunStack(t *testing.T) {
 	dir := t.TempDir()
 	legacy := `{"profiles":[],"settings":{"mixedPort":2080}}`
@@ -211,6 +212,71 @@ func TestLegacyConfigDefaultsTunStack(t *testing.T) {
 	}
 	if got := store.GetSettings().TunStack; got != tunStackDefault {
 		t.Fatalf("legacy tunStack = %q, want %q", got, tunStackDefault)
+	}
+}
+
+// A config.json holding tunStack "system" is the case that broke TUN for
+// real users. The value was not chosen by them: NekoGo hardcoded the OS
+// stack until the setting existed, and its own first save persisted it —
+// so a config from before the row still says "system", and the new
+// default never gets a chance to apply. The OS stack terminates TCP in
+// Windows, which needs an inbound firewall allow for the core that
+// sing-tun asks for and discards the error of, so the tunnel carries DNS
+// and every TCP dial times out ("connects, nothing loads"). One-time
+// migration moves that stored value to the stack that works and marks
+// the file, so a LATER deliberate choice of System/Mixed is honored from
+// then on and is not quietly reverted on the next launch.
+func TestMigrateStoredOSStackTunStack(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.json")
+	stored := `{"profiles":[],"settings":{"mixedPort":2080,"tunEnabled":true,"tunStack":"system"}}`
+	if err := os.WriteFile(path, []byte(stored), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	store, err := NewConfigStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := store.GetSettings().TunStack; got != tunStackDefault {
+		t.Fatalf("stored system stack = %q, want it migrated to %q", got, tunStackDefault)
+	}
+
+	// The marker must reach the disk, or every launch re-migrates and
+	// eventually overwrites a user's own pick.
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var onDisk struct {
+		Settings struct {
+			TunStack           string `json:"tunStack"`
+			TunOSStackMigrated bool   `json:"tunOSStackMigrated"`
+		} `json:"settings"`
+	}
+	if err := json.Unmarshal(raw, &onDisk); err != nil {
+		t.Fatal(err)
+	}
+	if !onDisk.Settings.TunOSStackMigrated {
+		t.Fatal("migration marker was not persisted")
+	}
+	if onDisk.Settings.TunStack != tunStackDefault {
+		t.Fatalf("tunStack on disk = %q, want %q", onDisk.Settings.TunStack, tunStackDefault)
+	}
+
+	// A deliberate later choice survives a restart: the marker is set, so
+	// nothing rewrites the stack any more.
+	s := store.GetSettings()
+	s.TunStack = "system"
+	if err := store.SaveSettings(s); err != nil {
+		t.Fatal(err)
+	}
+	again, err := NewConfigStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := again.GetSettings().TunStack; got != "system" {
+		t.Fatalf("explicit system stack after restart = %q, want it honored", got)
 	}
 }
 

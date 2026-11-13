@@ -339,7 +339,9 @@ func stubExeVersion(t *testing.T, out string) {
 }
 
 // TestCheckCoreForkRelease — fork assets resolve Latest + UpdateAvail
-// for singbox/xray without touching upstream or the real network.
+// for the fork-published core without touching upstream or the real
+// network. xray is not one of them any more (it follows XTLS/Xray-core;
+// see xray_update_test.go), so only the nekobox row is read here.
 func TestCheckCoreForkRelease(t *testing.T) {
 	saveUpdateBaseURL(t)
 	srv := fakeForkServer(t, "v9.9.9", map[string][]byte{
@@ -355,31 +357,28 @@ func TestCheckCoreForkRelease(t *testing.T) {
 	if err != nil {
 		t.Fatalf("CheckUpdates: %v", err)
 	}
-	seen := map[string]bool{}
-	for _, r := range rows {
-		if r.ID != "nekobox" && r.ID != "xray" {
-			continue
-		}
-		seen[r.ID] = true
-		if r.Latest != "v9.9.9" {
-			t.Fatalf("%s: Latest=%q, want v9.9.9", r.ID, r.Latest)
-		}
-		if !r.UpdateAvail {
-			t.Fatalf("%s: UpdateAvail=false, want true (nothing installed)", r.ID)
-		}
-		if r.LastError != "" {
-			t.Fatalf("%s: LastError=%q, want empty", r.ID, r.LastError)
+	var got *UpdatableComponent
+	for i := range rows {
+		if rows[i].ID == "nekobox" {
+			got = &rows[i]
 		}
 	}
-	for _, id := range []string{"nekobox", "xray"} {
-		if !seen[id] {
-			t.Fatalf("missing %s row", id)
-		}
+	if got == nil {
+		t.Fatal("missing nekobox row")
+	}
+	if got.Latest != "v9.9.9" {
+		t.Fatalf("Latest=%q, want v9.9.9", got.Latest)
+	}
+	if !got.UpdateAvail {
+		t.Fatalf("UpdateAvail=false, want true (nothing installed)")
+	}
+	if got.LastError != "" {
+		t.Fatalf("LastError=%q, want empty", got.LastError)
 	}
 }
 
 // TestCheckCoreNoAsset — a fork release without core assets keeps the
-// rows manual-only (honest note, no Update button) instead of failing.
+// row manual-only (honest note, no Update button) instead of failing.
 func TestCheckCoreNoAsset(t *testing.T) {
 	saveUpdateBaseURL(t)
 	srv := fakeForkServer(t, "v9.9.9", map[string][]byte{
@@ -394,21 +393,20 @@ func TestCheckCoreNoAsset(t *testing.T) {
 	if err != nil {
 		t.Fatalf("CheckUpdates: %v", err)
 	}
-	seen := 0
-	for _, r := range rows {
-		if r.ID != "nekobox" && r.ID != "xray" {
-			continue
-		}
-		seen++
-		if r.UpdateAvail {
-			t.Fatalf("%s: UpdateAvail=true, want false (no asset published)", r.ID)
-		}
-		if !strings.Contains(strings.ToLower(r.Notes), "manual") {
-			t.Fatalf("%s: Notes=%q, want manual-only note", r.ID, r.Notes)
+	var got *UpdatableComponent
+	for i := range rows {
+		if rows[i].ID == "nekobox" {
+			got = &rows[i]
 		}
 	}
-	if seen != 2 {
-		t.Fatalf("saw %d core rows, want 2", seen)
+	if got == nil {
+		t.Fatal("missing nekobox row")
+	}
+	if got.UpdateAvail {
+		t.Fatalf("UpdateAvail=true, want false (no asset published)")
+	}
+	if !strings.Contains(strings.ToLower(got.Notes), "manual") {
+		t.Fatalf("Notes=%q, want manual-only note", got.Notes)
 	}
 }
 
@@ -430,19 +428,23 @@ func TestCheckCoreNoReleases(t *testing.T) {
 	if err != nil {
 		t.Fatalf("CheckUpdates: %v", err)
 	}
-	for _, r := range rows {
-		if r.ID != "nekobox" && r.ID != "xray" {
-			continue
+	var got *UpdatableComponent
+	for i := range rows {
+		if rows[i].ID == "nekobox" {
+			got = &rows[i]
 		}
-		if r.UpdateAvail {
-			t.Fatalf("%s: UpdateAvail=true, want false", r.ID)
-		}
-		if r.LastError != "" {
-			t.Fatalf("%s: LastError=%q, want empty", r.ID, r.LastError)
-		}
-		if !strings.Contains(r.Notes, "No core release") {
-			t.Fatalf("%s: Notes=%q, want no-release note", r.ID, r.Notes)
-		}
+	}
+	if got == nil {
+		t.Fatal("missing nekobox row")
+	}
+	if got.UpdateAvail {
+		t.Fatalf("UpdateAvail=true, want false")
+	}
+	if got.LastError != "" {
+		t.Fatalf("LastError=%q, want empty", got.LastError)
+	}
+	if !strings.Contains(got.Notes, "No core release") {
+		t.Fatalf("Notes=%q, want no-release note", got.Notes)
 	}
 }
 
@@ -512,23 +514,24 @@ func TestUpdateCoreInstallsFromFork(t *testing.T) {
 
 // TestUpdateCoreRollbackKeepsPrevious — a downloaded binary that fails
 // the smoke probe must not replace the working one: the backup is
-// restored and the error says so.
+// restored and the error says so. The fork's raw-exe asset (the
+// nekobox row); the xray archive is covered in xray_update_test.go.
 func TestUpdateCoreRollbackKeepsPrevious(t *testing.T) {
 	saveUpdateBaseURL(t)
 	// Real probe (no stub): junk bytes cannot execute, so verify fails.
 	payload := []byte("not-an-executable")
-	srv := fakeForkServer(t, "v9.9.9", map[string][]byte{"xray.exe": payload})
+	srv := fakeForkServer(t, "v9.9.9", map[string][]byte{"nekobox_core.exe": payload})
 	defer srv.Close()
 	updateBaseURL["github-api"] = srv.URL
 
 	a := newUpdaterTestApp(t)
-	dest := filepath.Join(t.TempDir(), "xray.exe")
-	before := []byte("working-xray")
+	dest := filepath.Join(t.TempDir(), "nekobox_core.exe")
+	before := []byte("working-core")
 	if err := os.WriteFile(dest, before, 0o644); err != nil {
 		t.Fatal(err)
 	}
-	a.xray.setXrayPath(dest)
-	_, err := a.UpdateComponent("xray")
+	a.singbox.setCorePath(dest)
+	_, err := a.UpdateComponent("nekobox")
 	if err == nil || !strings.Contains(err.Error(), "failed to run") {
 		t.Fatalf("err = %v, want failed-to-run rollback", err)
 	}
@@ -1253,7 +1256,7 @@ func TestCoreUpdateNeededHashStamp(t *testing.T) {
 	}
 }
 
-// TestCheckUpdatesFetchesTheForkOnce — nekobox, xray and gui all read the
+// TestCheckUpdatesFetchesTheForkOnce — nekobox and gui both read the
 // fork's newest release. GitHub allows 60 unauthenticated calls an hour
 // and the panel's per-row Check button runs a whole pass, so one lookup
 // per repo is the budget, not one per row.

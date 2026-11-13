@@ -332,6 +332,7 @@
 import { computed, onMounted, onUnmounted, reactive, ref, watch } from 'vue'
 import { backend } from '../api'
 import { useConnectionStore } from '../stores/connection'
+import { useElevationStore } from '../stores/elevation'
 import { useProfilesStore } from '../stores/profiles'
 import { useSettingsStore } from '../stores/settings'
 import SniListCard from './SniListCard.vue'
@@ -342,6 +343,7 @@ import type { LogEntry, Profile, SNIConfig, SNIIP, SNISNI, SniListRow, SpoofRank
 const profiles = useProfilesStore()
 const settings = useSettingsStore()
 const connection = useConnectionStore()
+const elevation = useElevationStore()
 const msg = ref('')
 const err = ref('')
 const busy = ref(false)
@@ -550,7 +552,10 @@ const elevationText = computed(() => {
 
 async function relaunchElevated() {
   if (relaunching.value) return
-  if (!confirm('Restart NekoGo as administrator? The app will relaunch and resume the connection.')) return
+  const ok = await elevation.ask(
+    'The SNI spoof engine needs administrator rights to load its WinDivert driver.',
+  )
+  if (!ok) return
   relaunching.value = true
   err.value = ''
   try {

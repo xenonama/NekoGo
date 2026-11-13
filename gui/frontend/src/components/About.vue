@@ -17,7 +17,10 @@
          neither place can drift from the running build. sing-box and
          NekoBox are separate rows because they are separate binaries:
          the fork is stamped with the NekoGo build version, so only the
-         official sing-box.exe reports a sing-box version. -->
+         official sing-box.exe reports a sing-box version. The engine
+         rows are Advanced-mode only — Simple mode picks no core and
+         shows no core path, so four binary versions would describe a
+         screen its user cannot reach. -->
     <div class="about-card">
       <div class="about-title">Version stats</div>
       <dl v-if="statRows.length" class="about-stats">
@@ -91,7 +94,7 @@ import appIcon from '../assets/app.png'
 import { backend } from '../api'
 import { useSettingsStore } from '../stores/settings'
 import { useConnectionStore } from '../stores/connection'
-import { collectVersions, formatDiagText, type DiagVersions } from '../diag'
+import { collectVersions, formatDiagText, versionStatRows, type DiagVersions } from '../diag'
 import { copyText } from '../clipboard'
 
 const props = defineProps<{ version: string }>()
@@ -117,15 +120,7 @@ const coreText = computed(() =>
 const statRows = computed(() => {
   const v = versions.value
   if (!v) return []
-  return [
-    { label: 'NekoGo', value: v.app },
-    { label: 'sing-box core', value: v.singBox },
-    { label: 'NekoBox core', value: v.nekoBox },
-    { label: 'Xray core', value: v.xray },
-    { label: 'mihomo core', value: v.mihomo },
-    { label: 'Engine', value: v.core },
-    { label: 'OS', value: v.os },
-  ]
+  return versionStatRows(v, settings.settings.advancedMode)
 })
 
 async function loadVersions() {

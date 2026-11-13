@@ -324,6 +324,234 @@ procedure and the asset-name rules the updater matches on.
   the GUI's Go toolchain is not a version a user can act on, and every
   core reports its own. Copy diagnostics emits the same facts, so the
   paste matches the card.
+- Settings → Updates downloaded the wrong Xray. The Xray row read NekoGo's
+  own app releases, so it compared an Xray banner (`Xray 25.9.11`) against a
+  NekoGo tag (`1.0.0-beta.3`) — an ordering nobody can win, which meant the
+  row never offered an update and installed the `xray.exe` bundled with the
+  app. It now follows [XTLS/Xray-core](https://github.com/XTLS/Xray-core)
+  like the sing-box row follows SagerNet and the mihomo row follows
+  MetaCubeX: the arch's archive is matched by its exact release name (so the
+  `.dgst` sidecars cannot be picked), the published digest is verified, and
+  `xray.exe` is unpacked from it into the path the Xray engine actually
+  resolves — the `xrayPath` override, or `bin\xray.exe` beside the GUI — with
+  the same backup, smoke-verify and rollback as the other cores. An install
+  that would land on another row's binary is refused and says which setting
+  to fix.
+- Settings → Chain grew the Psiphon options the two chain legs always
+  ignored (Advanced mode only): the egress country, the fronting mode, and
+  the CDN edge IPs, SNI names and built-in edge sets. A country picked there
+  reached neither leg — the SNI-spoof→Psiphon run passed no Psiphon flags at
+  all, and the Aether→Psiphon run used the profile's own. Both legs now
+  render their flags through one shared builder, so a Chain-tab choice
+  cannot apply to one leg and silently not the other. The country is a
+  curated list plus a free two-letter code, validated on save (a value
+  aether cannot read is refused there rather than ignored at Connect), and
+  it drives the chain legs only: a profile that sets its own Psiphon options
+  keeps running its own tunnel exactly as before.
+- The "relaunch NekoGo as administrator" prompt is now one of NekoGo's own
+  dialogs. It used WebView2's browser `confirm()` box — a window that matches
+  no part of the app, cannot be themed and ignores the app's keyboard
+  shortcuts. Escape and Cancel both leave the current instance running
+  untouched; Relaunch restarts elevated and reconnects to the profile the
+  refused connect had already remembered.
+- The SNI spoof → Psiphon chain refused an unelevated connect by naming only
+  TUN. That chain needs both drivers — WinDivert for the spoofing engine and
+  Wintun for the forced TUN inbound — and the message named one, so a user
+  reading it had no way to tell why the spoofing itself had not started. It
+  now names both. A connect that needs only one still gets only that one, and
+  every refusal still arrives before any driver is loaded or core spawned.
+- `SpoofStart` (the standalone engine start, reachable through the same API
+  the SNI tab uses) went straight to WinDivert and returned the driver's own
+  `Access is denied (code 5)`, with no admin offer attached. It now refuses
+  with the same message Connect uses. Disabling SNI spoofing in
+  Settings → Connection keeps saying "disabled" rather than asking for
+  elevation, and an already-elevated process is never refused on this ground.
+- Connect no longer needs to be clicked repeatedly. Both sing-box engines
+  bind a fixed inbound port, so a port already held made every attempt fail
+  the same way — the clicks were never fixing anything, they were the waiting
+  for whatever held the port to let go. The two engines now pre-flight their
+  ports the way the Xray and mihomo paths always did, and they check the ports
+  the config is about to render (a raw-config override included, a TUN inbound
+  skipped, since it binds no TCP port). A collision is waited out for two
+  seconds — the gap a previous connect's teardown can still leave — and then
+  refused by port number, naming what typically owns it. The check runs before
+  any config is written or process spawned, so a refused connect leaves no
+  orphan behind, and it never shows the "port in use" line for a port the
+  config does not bind.
+- About → Version stats labelled the NekoBox core row "NekoBox core" while
+  displaying a version; it reads "NekoBox version" now. Its four engine
+  versions and the idle "Engine" read-out are Advanced-mode rows: Simple mode
+  chooses no core, installs no second engine and shows no core path, so those
+  rows described a screen its user cannot reach. Copy diagnostics still
+  carries every one of them — a bug report needs the engine facts whether or
+  not the card shows them.
+- The Settings tab said things the app does not do, and one of them could
+  cost a connect. The Mixed port row promised "HTTP proxy on this port ·
+  SOCKS proxy on port + 1" for every core; that is the Xray shape, while the
+  sing-box cores serve both protocols from the one port — so the row now says
+  which core does what, and states the 1-65534 range the field enforces.
+  Clearing or mistyping that field used to parse to nothing, fall through
+  `|| 0` and get clamped to **port 1**, which the backend accepts as a valid
+  port: the app saved a listener nobody asked for. A refused edit now keeps
+  the previous port, redraws it in the box, and says which number is in
+  force.
+- Minimize-to-tray was the one control that failed silently — a refused
+  `SetCloseToTray` went to the console while the switch flipped back on its
+  own, which reads as the app ignoring the click. It reports like every other
+  control now. The TUN stack row and the MTU hint stayed on screen with TUN
+  off, describing an adapter that is not created; both appear in TUN mode.
+  The Connection and Appearance card headers advertised controls the cards do
+  not contain ("the OS proxy is set on every connect", next to the switch
+  that decides whether it is, and a "window" setting nothing edits), and the
+  hero line still invited the user to "customize your NekoBox experience" —
+  NekoBox is the core this GUI drives, not the app. A row's **Check** in
+  Settings → Updates runs the whole list, so the header's "Last global check"
+  now moves with it instead of insisting "never".
+- "Clear all countries" asked through `window.confirm`, a browser box in a
+  window that has none — the same defect that took the relaunch prompt onto
+  the app's own dialog. Destructive actions in Settings now use a themed
+  confirmation card with the accept button styled as the danger it is;
+  Cancel and ESC leave every profile untouched. The native boxes still in
+  use for deleting profiles are unchanged.
+- TUN mode is a settings group, after PattN's. It had a switch and a stack
+  and hardcoded the rest — interface address (`172.19.0.1/24`), MTU (1350),
+  auto/strict route, the excluded routes, the ICMP answer — so a range
+  already routed on the machine had no way out except hand-editing
+  `config.json`, and a link that needed a smaller packet could not have one.
+  Settings → Connection, with TUN on, now offers every one of them, plus an
+  IPv6 adapter address behind PattN's OS check (Windows can have IPv6 off
+  for new interfaces, and asking a TUN for an address it cannot have kills
+  the whole connect; a global IPv6 address elsewhere could leave the tunnel
+  around it). Each field is optional in `config.json` and unset renders
+  exactly what NekoGo rendered before, so upgrading changes nobody's tunnel.
+- The TUN route rules the core is handed grew the guards that were missing:
+  the drop rule for the interface's own address is now derived from whatever
+  address is actually on it (it was a second constant restating the first,
+  so it went stale the moment the address became a setting), UDP
+  135/137/138/139/5353 and the `224.0.0.0/3` + `ff00::/8` multicast ranges
+  are rejected instead of dialled at the proxy or looped back into the
+  interface `auto_route` just pointed at the tunnel, and the ICMP policy can
+  answer, drop or forward a ping.
+- A TUN value the core would refuse at start time is refused at save time,
+  naming the field: a bare IP where a CIDR prefix is required (sing-box
+  decodes these into `netip.Prefix`, which has no address-only form), an
+  IPv6 prefix longer than /126 (the system stack derives its gateway from a
+  peer address), an MTU outside 1280-65535, an unknown ICMP policy. The MTU
+  box in the panel is checked as an MTU, not as a port — 576 is a legal port
+  and a size no interface will carry, and 65535 is a legal MTU the port field
+  refuses.
+- Not ported from PattN: its "legacy protect" mode runs a second core under
+  the SOCKS listener, and NekoGo's Xray and mihomo paths render no TUN
+  inbound at all, so there is nothing for it to protect here. PattN's TUN
+  template also sets inbound `sniff`, deprecated in sing-box 1.11 and removed
+  in 1.13 — with it the shipped core rejects the entire config at startup
+  (`legacy inbound fields are deprecated`), so NekoGo does not set it.
+- Advanced mode asks its questions in NekoGo's own dialog instead of the
+  webview's native `confirm`/`prompt` boxes: discarding a config draft
+  (section switch, leaving Settings, leaving the mode), closing the raw
+  profile editor with unsaved JSON, applying a saved config with a
+  reconnect, and naming a new remark group in Profile tools. The group
+  name in particular used to go through `prompt()`, which WebView2 can
+  refuse outright — "New group…" then did nothing at all. Escape cancels
+  every one of them, including the JSON editor's, which previously
+  reopened its own discard prompt on the same keypress.
+- The "Active overrides" card reports the real size of a stored override.
+  Overrides arrive as parsed JSON, so the old character count printed
+  `[object Object]`'s length — 15 chars for every section, whatever it
+  held. The raw-config warning follows the same rule as the core: an
+  override holding `{}` or `[]` carries no setting, so it is not something
+  a raw save would destroy.
+- The config editors follow the profile the backend actually renders —
+  the live connection first, then the stored selection, then the first
+  profile — and name it in the card head. They used to resolve the stored
+  selection while the backend resolved the running core, so with a mihomo
+  profile connected and a sing-box profile selected the card offered
+  editors the backend refuses, under the wrong profile's name.
+- The sidebar mode switch is named "Advanced Mode" in both states, with
+  the destination in its tooltip. It is a switch reporting whether
+  Advanced is on, and it used to announce the mode it would switch *to*:
+  a screen reader read "Simple Mode, switch, on" while Advanced was
+  running, and the visible text disagreed with the accessible name.
+- The Backup & reset cards no longer inherit the Proxies table's sticky
+  action bar. Both use `.nb-px-bar`, and the rule pinning the bulk-action
+  bar to the bottom of the proxy list was unscoped, so every Backup card
+  bar stuck to the viewport and rode up over its own card head — 32px of
+  the title hidden beneath the buttons that belong to it. Stickiness is
+  now `.nb-px-bar--sticky`, worn only by the Proxies table.
+- Each Backup card reports its own result. A single message sat after the
+  last card, so Export printed "Exported to …" 510px below the button that
+  caused it, off screen: the click looked like it did nothing, and a
+  failure read as though Reset had produced it. Export, Import, View raw
+  config and Reset each carry their own line now.
+- "View raw config" re-reads when the config it shows changes. It fetched
+  once per click and then froze, so saving an override or connecting a
+  different profile left the old document on screen under a heading
+  promising the current one. It follows the same target rule as the
+  editors and refreshes on a target or override change — quietly, without
+  disabling the other three cards while it reads.
+- Importing a backup asks first. It replaces settings and profiles
+  wholesale, destroying as much as the Reset card beside it — which
+  demands a typed `RESET-ALL` — yet one click on "Replace current data"
+  did it unconfirmed. It now uses the themed danger dialog; Cancel and
+  ESC leave the data untouched and the chosen file still loaded.
+  Disarming Reset also clears the typed token, which used to survive the
+  disarm: re-arming offered a filled-in box and a live Confirm button.
+- TUN mode connected but loaded nothing. Two defects in what the tunnel
+  asks the DNS module to do, both fixed by porting PattN's TUN config.
+  First, the hijack matched only the sniffed `protocol: dns`, and the TUN
+  inbound sets that protocol for one destination — the hijack address it
+  derives beside the interface address. A query sent to the resolver the
+  OS already had was not recognised as DNS and fell through to the proxy.
+  The hijack now matches port 53 as well, so a query is caught whichever
+  resolver it was sent to.
+  Second, and the reason nothing loaded: the TUN DNS block was a single
+  server, DNS-over-HTTPS with `detour: proxy`. When the profile's address
+  is a hostname, sing-box must resolve it before the proxy can be dialed,
+  and with no `route.default_domain_resolver` it asks the DNS block's
+  default transport — the same proxied DoH server. The lookup waits on
+  the connection it exists to make, so no name ever resolves while the
+  adapter is up and the core logs nothing wrong. TUN now keeps a
+  detour-free bootstrap server beside the proxied resolver and names it
+  in `default_domain_resolver`, exactly PattN's `local-local` /
+  `direct-dns-1` shape, for the fallback block and for a user-configured
+  block that holds only one proxied server. The hijacked queries still
+  ride the proxy, so nothing about the leak protection changed, and proxy
+  mode renders byte-for-byte what it rendered before.
+- TUN mode still connected and still loaded nothing, and this time the
+  stack was the reason. NekoGo defaulted it to `system`, deliberately, to
+  save CPU; PattN defaults to `gvisor`. The OS stack terminates TCP
+  inside Windows: the tunnel rewrites an app's SYN into a new connection
+  addressed to the core's own endpoint on the adapter, so the handshake is
+  completed by the OS and handed up afterwards — which makes it an inbound
+  connection to the core binary, and Windows filters inbound connections.
+  sing-tun tries to allow that itself and throws the error away, so the
+  missing permission is silent. An elevated connect on the traced machine
+  showed no `sing-tun` firewall rule before or after the start, and the
+  same run answered every DNS query — UDP never reaches the OS listener —
+  in about 200 ms while a TCP dial to the host those answers named timed
+  out after 15 s. That is the exact shape of "connected, nothing loads".
+  A/B runs over both stacks and both `strict_route` values settle it:
+  `system` failed the TCP probe with strict routing on and off, `gvisor`
+  passed both, so strict routing was never the suspect and `strict_route`
+  is unchanged. The default is now `gvisor`, which finishes TCP inside the
+  core and needs nothing from the firewall; `system` and `mixed` stay
+  selectable for their CPU and NAT behaviour, and the Settings row now
+  says what they cost — `mixed` embeds the same OS listener for TCP, so it
+  inherits the same requirement. Changing the default, though, did not
+  fix the install it was traced on, and the reason is worth recording:
+  NekoGo had hardcoded the stack before the setting existed, so its first
+  save wrote `"tunStack": "system"` into `config.json` as if the user had
+  picked it. A stored value beats a default, and checking for one with a
+  pattern that required `"tunStack":"system"` — no space, while Go writes
+  `"tunStack": "system"` — reported the key as absent. So the config
+  carried the broken stack all along and the default change never landed.
+  Loading now migrates a stored `system`/`mixed` to the working stack
+  once, logs what it did and why, and marks the file so a later deliberate
+  pick of System or Mixed is honored from then on instead of being
+  quietly reverted at the next start. Verified here by driving the real
+  engine: under `gvisor` the TCP probe reaches the peer (`read: EOF` — a
+  plaintext request on port 443 closed by Google, i.e. the handshake
+  completed) where under `system` it had timed out.
 
 ### Earlier releases
 

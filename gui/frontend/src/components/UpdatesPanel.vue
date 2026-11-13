@@ -130,6 +130,9 @@ async function checkOne(id: string) {
   cardMsg.value = { ...cardMsg.value, [id]: '' }
   try {
     const rows = (await backend.checkUpdates()) ?? []
+    // The endpoint has no per-component form: this re-checked everything
+    // and re-stamped every lastCheck, so the header's own timestamp moves.
+    lastGlobalCheck.value = new Date().toISOString()
     const row = rows.find((r) => r.id === id)
     if (row) {
       items.value = items.value.map((c) => (c.id === id ? row : c))

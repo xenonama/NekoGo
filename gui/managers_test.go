@@ -225,10 +225,15 @@ func TestBuildSingBoxConfig(t *testing.T) {
 	}
 }
 
-// TestBuildSingBoxTunStack: the TUN stack is a setting that defaults
-// to the cheap OS stack (CPU audit #1). gVisor stays opt-in, and an
-// unknown value falls back to the default instead of rendering a
-// config sing-tun would reject.
+// TestBuildSingBoxTunStack: the TUN stack defaults to the one that does
+// not need an inbound firewall allow for the core. "system" terminates
+// TCP inside the OS: sing-tun rewrites the app's SYN to come from the
+// tunnel's peer address to the engine's own listener, which Windows
+// Firewall treats as a new inbound connection. sing-tun tries to add the
+// allow rule and discards the error, and the live probe saw no rule and
+// a 15s TCP timeout through a tunnel whose DNS leg answered in 200ms.
+// gVisor keeps TCP in user space, so it carries traffic with no firewall
+// change at all - which is also PattN's default (Global.TunStacks.First).
 func TestBuildSingBoxTunStack(t *testing.T) {
 	stackFor := func(s Settings) string {
 		t.Helper()
@@ -256,16 +261,19 @@ func TestBuildSingBoxTunStack(t *testing.T) {
 		t.Fatal("no tun inbound rendered")
 		return ""
 	}
-	if got := stackFor(DefaultSettings()); got != "system" {
-		t.Fatalf("default TUN stack = %q, want system", got)
+	if got := stackFor(DefaultSettings()); got != tunStackDefault {
+		t.Fatalf("default TUN stack = %q, want %q", got, tunStackDefault)
+	}
+	if tunStackDefault != "gvisor" {
+		t.Fatalf("tunStackDefault = %q: the OS stack needs a Windows Firewall inbound allow for the core, so it must not be the default", tunStackDefault)
 	}
 	for _, tc := range []struct{ in, want string }{
-		{"", "system"},
+		{"", "gvisor"},
 		{"system", "system"},
 		{"gvisor", "gvisor"},
 		{" GVISOR ", "gvisor"},
 		{"mixed", "mixed"},
-		{"bogus", "system"},
+		{"bogus", "gvisor"},
 	} {
 		s := DefaultSettings()
 		s.TunStack = tc.in

@@ -124,9 +124,9 @@ func TestSaveSettingsLogLevel(t *testing.T) {
 	}
 }
 
-// CPU audit #1: the TUN stack setting rejects values sing-tun cannot
-// load, accepts the three real stacks, and normalizes empty to the
-// default so pre-setting configs converge on "system".
+// The TUN stack setting rejects values sing-tun cannot load, accepts the
+// three real stacks, and normalizes empty to the default so pre-setting
+// configs converge on the stack that carries TCP without a firewall rule.
 func TestSaveSettingsTunStack(t *testing.T) {
 	dir := t.TempDir()
 	store, err := NewConfigStore(dir)
@@ -152,8 +152,8 @@ func TestSaveSettingsTunStack(t *testing.T) {
 	if err := app.SaveSettings(s); err != nil {
 		t.Fatal(err)
 	}
-	if got := store.GetSettings().TunStack; got != "system" {
-		t.Fatalf("empty tunStack = %q, want system", got)
+	if got := store.GetSettings().TunStack; got != tunStackDefault {
+		t.Fatalf("empty tunStack = %q, want the default %q", got, tunStackDefault)
 	}
 }
 

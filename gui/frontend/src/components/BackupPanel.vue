@@ -1,7 +1,8 @@
 <!-- Advanced Mode Phase F: Backup & Reset cards (export, import,
      raw config viewer, two-step reset). Zero new deps; stg-* styles
      and var() tokens only. One shared busy flag covers all four
-     cards; the parent sub-tab guard reads isBusy(). -->
+     cards, and each card reports its own result: a single message
+     after the last card sat off-screen from the button that caused it. -->
 <template>
   <div class="nb-backup">
     <!-- A) Export all data -->
@@ -16,6 +17,7 @@
           <Icon name="download" :size="14" />Export to file
         </button>
       </div>
+      <div v-if="toast && toastCard === 'export'" class="muted">{{ toast }}</div>
     </div>
     <!-- B) Import data -->
     <div v-if="show('import')" class="stg-card">
@@ -36,6 +38,7 @@
         </button>
       </div>
       <div v-if="importError" class="nb-json-error">{{ importError }}</div>
+      <div v-if="toast && toastCard === 'import'" class="muted">{{ toast }}</div>
     </div>
     <!-- C) View raw config -->
     <div v-if="show('raw')" class="stg-card">
@@ -56,6 +59,7 @@
           <Icon name="copy" :size="13" />{{ copied ? 'Copied' : 'Copy' }}
         </button>
       </div>
+      <div v-if="toast && toastCard === 'raw'" class="muted">{{ toast }}</div>
     </div>
     <!-- D) Reset to defaults -->
     <div v-if="show('reset')" class="stg-card stg-card-danger">
@@ -65,7 +69,7 @@
           <span class="stg-head-title">Reset to defaults</span>
           <span class="stg-head-sub">Wipes settings, profiles, subscriptions and overrides. This cannot be undone.</span>
         </span>
-        <button class="nb-act nb-act--danger" :disabled="busy" @click="resetArmed = !resetArmed">
+        <button class="nb-act nb-act--danger" :disabled="busy" @click="toggleReset">
           <Icon name="trash" :size="14" />Reset to defaults
         </button>
       </div>
@@ -76,25 +80,28 @@
           <Icon name="warn" :size="14" />Confirm reset
         </button>
       </div>
+      <div v-if="toast && toastCard === 'reset'" class="muted">{{ toast }}</div>
     </div>
-    <div v-if="toast" class="muted">{{ toast }}</div>
   </div>
 </template>
 
 <script setup lang="ts">
-import { ref } from 'vue'
+import { ref, watch } from 'vue'
 import Icon from './Icon.vue'
 import { backend } from '../api'
 import { useProfilesStore } from '../stores/profiles'
 import { useSettingsStore } from '../stores/settings'
 import { useConnectionStore } from '../stores/connection'
 import { useSubscriptionsStore } from '../stores/subscriptions'
+import { useConfirmStore } from '../stores/confirm'
+import { configTargetProfile } from '../configTarget'
 import { syncThemeClass } from '../theme'
 import type { BackupBlob } from '../types'
 
 const profiles = useProfilesStore()
 const settings = useSettingsStore()
 const connection = useConnectionStore()
+const confirmBox = useConfirmStore()
 
 // Section filter for the Advanced Backup workspace: each Panel
 // mounts one BackupPanel with a single card (export/import/raw/
@@ -111,12 +118,14 @@ function show(...keys: string[]): boolean {
 /** Single shared busy across all four cards (Phase F concurrency). */
 const busy = ref(false)
 const toast = ref('')
+/** Which card owns the current message, so it renders beside the button
+ *  that produced it instead of after the last card. */
+const toastCard = ref('')
 
-/** Parent sub-tab guard: an in-flight action prompts before switching. */
-function isBusy(): boolean {
-  return busy.value
+function say(card: string, message: string) {
+  toastCard.value = card
+  toast.value = message
 }
-defineExpose({ isBusy })
 
 function pad(n: number): string {
   return String(n).padStart(2, '0')
@@ -150,9 +159,9 @@ async function doExport() {
     a.click()
     document.body.removeChild(a)
     URL.revokeObjectURL(url)
-    toast.value = `Exported to ${name}.`
+    say('export', `Exported to ${name}.`)
   } catch (e) {
-    toast.value = String(e)
+    say('export', String(e))
   } finally {
     busy.value = false
   }
@@ -188,6 +197,17 @@ function onFile() {
 }
 
 async function doImport() {
+  // restoreAll replaces settings and profiles wholesale, so this wipes
+  // as much as the Reset card beside it — which asks for a typed token.
+  if (
+    !(await confirmBox.ask({
+      title: 'Replace all current data?',
+      body: 'The backup restores over your current settings, profiles, subscriptions and overrides. What is here now is not kept.',
+      confirmLabel: 'Replace data',
+      danger: true,
+    }))
+  )
+    return
   busy.value = true
   importError.value = ''
   toast.value = ''
@@ -196,7 +216,7 @@ async function doImport() {
     fileText.value = ''
     importSummary.value = ''
     await reloadStores()
-    toast.value = 'Import complete.'
+    say('import', 'Import complete.')
   } catch (e) {
     importError.value = String(e)
   } finally {
@@ -214,14 +234,35 @@ const copied = ref(false)
 async function showRaw() {
   busy.value = true
   toast.value = ''
+  await refreshRaw()
+  busy.value = false
+}
+
+/** Quiet re-read: the auto refresh must not disable the other three
+ *  cards, so it stays off the shared busy flag. */
+async function refreshRaw() {
   try {
     rawConfig.value = await backend.getRawConfig()
   } catch (e) {
-    toast.value = String(e)
-  } finally {
-    busy.value = false
+    rawConfig.value = ''
+    say('raw', String(e))
   }
 }
+
+// The card promises the exact document the core receives. Both the
+// target profile and the stored overrides change it — the Core config
+// cards below edit the overrides on this same screen.
+watch(
+  [
+    () =>
+      configTargetProfile(connection.status, settings.settings.activeProfileId, profiles.profiles)
+        ?.id ?? '',
+    () => JSON.stringify(settings.settings.coreOverrides ?? {}),
+  ],
+  () => {
+    if (rawConfig.value) void refreshRaw()
+  },
+)
 
 async function copyRaw() {
   if (!rawConfig.value) return
@@ -247,6 +288,14 @@ async function copyRaw() {
 const resetArmed = ref(false)
 const resetToken = ref('')
 
+/** Disarming drops the typed token: keeping it would leave "Confirm
+ *  reset" enabled the next time the card is armed, turning the two-step
+ *  guard into one click. */
+function toggleReset() {
+  resetArmed.value = !resetArmed.value
+  if (!resetArmed.value) resetToken.value = ''
+}
+
 async function doReset() {
   busy.value = true
   toast.value = ''
@@ -256,9 +305,9 @@ async function doReset() {
     resetToken.value = ''
     rawConfig.value = ''
     await reloadStores()
-    toast.value = 'All data reset.'
+    say('reset', 'All data reset.')
   } catch (e) {
-    toast.value = String(e)
+    say('reset', String(e))
   } finally {
     busy.value = false
   }

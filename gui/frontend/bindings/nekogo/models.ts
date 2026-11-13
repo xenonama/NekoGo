@@ -1016,6 +1016,55 @@ export class Settings {
     "tunStack": string;
 
     /**
+     * The rest of the TUN group, after PattN's TunModeItem. Every field
+     * is optional: an unset value renders what NekoGo rendered before the
+     * field existed, so an upgrade never re-routes someone's traffic.
+     * TunMTU is the interface MTU; 0 means tunMTU (1350). Raise it on a
+     * clean link, lower it when a fragile one fragments.
+     */
+    "tunMTU"?: number;
+
+    /**
+     * TunAddress is the interface's IPv4 prefix; empty means tunAddress.
+     */
+    "tunAddress"?: string;
+
+    /**
+     * TunAddress6 is the interface's IPv6 prefix; empty means a PattN
+     * pool entry, and it is only used when TunEnableIPv6 is on and the OS
+     * will accept it (see tunTakesIPv6).
+     */
+    "tunAddress6"?: string;
+
+    /**
+     * TunEnableIPv6 puts an IPv6 prefix on the interface. Off by default,
+     * unlike PattN: NekoGo has never given the TUN an IPv6 address, and
+     * switching one on is a route change, not a setting cosmetic.
+     */
+    "tunEnableIPv6"?: boolean;
+
+    /**
+     * TunAutoRoute installs the default route into the TUN. Pointer so an
+     * absent value keeps meaning "yes" (the historical hardcoded true)
+     * rather than silently becoming a TUN that captures nothing.
+     */
+    "tunAutoRoute"?: boolean | null;
+
+    /**
+     * TunStrictRoute blocks traffic that does not come from the TUN.
+     * Plain bool: false is both PattN's NekoGo-compatible value and the
+     * one NekoGo has always rendered.
+     */
+    "tunStrictRoute"?: boolean;
+    "tunRouteExclude"?: string[];
+
+    /**
+     * TunIcmp is the ICMP policy: rule | direct | unreachable | drop |
+     * reply. Empty means "rule", i.e. no ICMP rule rendered.
+     */
+    "tunIcmp"?: string;
+
+    /**
      * remembered OS-proxy switch: Connect auto-ensures the OS proxy only when true (see ensureSystemProxy)
      */
     "systemProxy": boolean;
@@ -1222,6 +1271,31 @@ export class Settings {
     "aetherPsiphon"?: boolean;
 
     /**
+     * Chain Psiphon options (Settings → Chain, advanced mode). They
+     * drive the two chain legs only — the SNI-spoof→Psiphon leg (a plain
+     * psiphon-only aether run) and the Aether→Psiphon leg — and never a
+     * profile's own tunnel: a profile with its own Aether Psiphon fields
+     * keeps them. Empty means aether's own default.
+     * ChainPsiphonRegion is the ISO alpha-2 egress country ("" = Psiphon
+     * chooses).
+     */
+    "chainPsiphonRegion"?: string;
+
+    /**
+     * ChainPsiphonMode is the fronting shape: auto | cdn | direct.
+     */
+    "chainPsiphonMode"?: string;
+
+    /**
+     * ChainPsiphonCDN/SNI/Sets carry the fronting overrides: own CDN
+     * edge IPs, the SNI names used beside them, and the built-in edge
+     * sets to try.
+     */
+    "chainPsiphonCdnIps"?: string;
+    "chainPsiphonCdnSni"?: string;
+    "chainPsiphonCdnSets"?: string;
+
+    /**
      * SNIConfig holds the sni-spoof engine options. Empty/zero values
      * mean "engine default" and are omitted from the generated
      * config JSON. Only used when a profile selects CoreSpoof.
@@ -1336,38 +1410,42 @@ export class Settings {
      * Creates a new Settings instance from a string or object.
      */
     static createFrom($$source: any = {}): Settings {
-        const $$createField38_0 = $$createType14;
-        const $$createField43_0 = $$createType15;
-        const $$createField45_0 = $$createType2;
-        const $$createField46_0 = $$createType2;
-        const $$createField52_0 = $$createType16;
-        const $$createField55_0 = $$createType18;
-        const $$createField56_0 = $$createType20;
-        const $$createField57_0 = $$createType22;
+        const $$createField20_0 = $$createType2;
+        const $$createField46_0 = $$createType14;
+        const $$createField51_0 = $$createType15;
+        const $$createField53_0 = $$createType2;
+        const $$createField54_0 = $$createType2;
+        const $$createField65_0 = $$createType16;
+        const $$createField68_0 = $$createType18;
+        const $$createField69_0 = $$createType20;
+        const $$createField70_0 = $$createType22;
         let $$parsedSource = typeof $$source === 'string' ? JSON.parse($$source) : $$source;
+        if ("tunRouteExclude" in $$parsedSource) {
+            $$parsedSource["tunRouteExclude"] = $$createField20_0($$parsedSource["tunRouteExclude"]);
+        }
         if ("subscriptions" in $$parsedSource) {
-            $$parsedSource["subscriptions"] = $$createField38_0($$parsedSource["subscriptions"]);
+            $$parsedSource["subscriptions"] = $$createField46_0($$parsedSource["subscriptions"]);
         }
         if ("coreOverrides" in $$parsedSource) {
-            $$parsedSource["coreOverrides"] = $$createField43_0($$parsedSource["coreOverrides"]);
+            $$parsedSource["coreOverrides"] = $$createField51_0($$parsedSource["coreOverrides"]);
         }
         if ("collapsedProxyGroups" in $$parsedSource) {
-            $$parsedSource["collapsedProxyGroups"] = $$createField45_0($$parsedSource["collapsedProxyGroups"]);
+            $$parsedSource["collapsedProxyGroups"] = $$createField53_0($$parsedSource["collapsedProxyGroups"]);
         }
         if ("proxyGroups" in $$parsedSource) {
-            $$parsedSource["proxyGroups"] = $$createField46_0($$parsedSource["proxyGroups"]);
+            $$parsedSource["proxyGroups"] = $$createField54_0($$parsedSource["proxyGroups"]);
         }
         if ("sniConfig" in $$parsedSource) {
-            $$parsedSource["sniConfig"] = $$createField52_0($$parsedSource["sniConfig"]);
+            $$parsedSource["sniConfig"] = $$createField65_0($$parsedSource["sniConfig"]);
         }
         if ("sniIps" in $$parsedSource) {
-            $$parsedSource["sniIps"] = $$createField55_0($$parsedSource["sniIps"]);
+            $$parsedSource["sniIps"] = $$createField68_0($$parsedSource["sniIps"]);
         }
         if ("sniSnis" in $$parsedSource) {
-            $$parsedSource["sniSnis"] = $$createField56_0($$parsedSource["sniSnis"]);
+            $$parsedSource["sniSnis"] = $$createField69_0($$parsedSource["sniSnis"]);
         }
         if ("aetherScanResults" in $$parsedSource) {
-            $$parsedSource["aetherScanResults"] = $$createField57_0($$parsedSource["aetherScanResults"]);
+            $$parsedSource["aetherScanResults"] = $$createField70_0($$parsedSource["aetherScanResults"]);
         }
         return new Settings($$parsedSource as Partial<Settings>);
     }

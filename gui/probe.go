@@ -2,10 +2,15 @@ package main
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
 	"net/url"
+	"strconv"
+	"strings"
+	"syscall"
 	"time"
 )
 
@@ -81,8 +86,130 @@ func distinctPort(avoid ...int) (int, error) {
 	return 0, fmt.Errorf("no free port distinct from %v", avoid)
 }
 
-// proxiedHeadOrGet issues one HTTP GET through an HTTP proxy at
-// proxyAddr ("127.0.0.1:2080"), mirroring Throne's urlTest
+// inboundPortGrace bounds how long a connect waits for an inbound port
+// that is occupied at the moment it is checked. A port held by the
+// previous attempt's core — killed, still exiting, socket not yet
+// released — frees within milliseconds, and that gap is exactly what a
+// user means by "I clicked Connect many times and it finally worked":
+// the clicks were not fixing anything, they were the waiting. A port
+// held by another program never frees, so the window ends with the port
+// named instead of another silent retry.
+var inboundPortGrace = 2 * time.Second
+
+// portOccupied reports whether a failed bind means the port is taken.
+// Windows phrases it three ways (the API error, the socket error, and
+// Go's wrapper), and anything else — an address this process may not
+// use, a disabled adapter — is not a port collision, so it must not be
+// reported as one or waited out; the core itself gives those details.
+func portOccupied(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, syscall.EADDRINUSE) {
+		return true
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "in use") || strings.Contains(msg, "only one usage")
+}
+
+// occupiedBindPorts probe-binds every address and returns the ones a
+// collision accounts for. Other bind failures are dropped: they are the
+// core's to report, and refusing a connect over them would be a guess.
+func occupiedBindPorts(addrs []string) []string {
+	var busy []string
+	for _, a := range addrs {
+		l, err := net.Listen("tcp", a)
+		if err != nil {
+			if portOccupied(err) {
+				busy = append(busy, a)
+			}
+			continue
+		}
+		_ = l.Close()
+	}
+	return busy
+}
+
+// bindPortHeldError describes a port that stayed busy for the whole
+// grace window. The number is what the user has to act on, so it leads;
+// the setting is named by the label the Settings tab shows for it.
+func bindPortHeldError(addr string) error {
+	_, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		port = addr
+	}
+	return fmt.Errorf("port %s in use — still held after waiting %s. Close whatever owns it (a core left by the last connect, another proxy, a second NekoGo window) or set a different Mixed port in Settings", port, inboundPortGrace)
+}
+
+// waitBindPortsFree holds a connect until every address is bindable or
+// inboundPortGrace passes. Returns nil once they are all free.
+func waitBindPortsFree(addrs []string) error {
+	if len(addrs) == 0 {
+		return nil
+	}
+	deadline := time.Now().Add(inboundPortGrace)
+	for {
+		busy := occupiedBindPorts(addrs)
+		if len(busy) == 0 {
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return bindPortHeldError(busy[0])
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+}
+
+// singBoxBindPorts renders the core config once to learn which addresses
+// this connect is about to bind, so the pre-flight checks exactly what
+// the engine will: a full raw core override names its own ports, and a
+// TUN inbound names none.
+func singBoxBindPorts(profile *Profile, settings Settings) ([]string, error) {
+	cfg, err := BuildSingBoxConfig(profile, settings)
+	if err != nil {
+		return nil, err
+	}
+	var doc struct {
+		Inbounds []struct {
+			Listen     string `json:"listen"`
+			ListenPort *int   `json:"listen_port"`
+		} `json:"inbounds"`
+	}
+	if err := json.Unmarshal([]byte(cfg), &doc); err != nil {
+		return nil, err
+	}
+	var addrs []string
+	for _, ib := range doc.Inbounds {
+		if ib.ListenPort == nil || *ib.ListenPort <= 0 || *ib.ListenPort > 65535 {
+			continue
+		}
+		host := strings.TrimSpace(ib.Listen)
+		if host == "" {
+			host = "127.0.0.1"
+		}
+		addrs = append(addrs, net.JoinHostPort(host, strconv.Itoa(*ib.ListenPort)))
+	}
+	return addrs, nil
+}
+
+// preflightSingBoxPorts refuses a sing-box connect whose inbound port is
+// held by something else, before a core process exists. Both sing-box
+// paths run it; xray and mihomo already refused this way and the custom
+// core was the odd one out, failing seconds later with the engine's own
+// bind error after the RPC handshake. Config-build failures are not
+// reported here: Start renders the config again and owns that message.
+func preflightSingBoxPorts(profile *Profile, settings Settings) error {
+	if profile == nil {
+		return nil
+	}
+	addrs, err := singBoxBindPorts(profile, settings)
+	if err != nil {
+		return nil
+	}
+	return waitBindPortsFree(addrs)
+}
+
+// proxiedHeadOrGet issues one HTTP GET through an HTTP proxy at// proxyAddr ("127.0.0.1:2080"), mirroring Throne's urlTest
 // (core/internal/probe/urltest.go): a single GET whose latency runs
 // from request start to headers received, then the body is closed
 // unread. No HEAD attempt, no body read — those extras made NekoGo

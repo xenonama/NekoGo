@@ -236,28 +236,7 @@ func buildAetherArguments(p *Profile, port int) []string {
 		args = append(args, aetherFlagPsiphonBind, fmt.Sprintf("%s:%d", aetherLoopback, *psiphonBind))
 	}
 	if psiphon != "off" {
-		shape := aetherEnumDefault(aetherPsiphonModes, cfg.PsiphonMode, "auto")
-		args = append(args, "--psiphon-mode", shape)
-		// The CDN lists feed the fronted transports alone; the server
-		// names count only beside an IP list of one's own.
-		cdnIPs, hasIPs := "", false
-		if v, ok := aetherSettingValue(cfg.PsiphonCDN); ok && shape != "direct" {
-			cdnIPs, hasIPs = v, true
-			args = append(args, "--psiphon-cdn-ips", cdnIPs)
-		}
-		if hasIPs {
-			if v, ok := aetherSettingValue(cfg.PsiphonSNI); ok {
-				args = append(args, "--psiphon-cdn-sni", v)
-			}
-		}
-		if shape != "direct" {
-			if sets := aetherCdnSetJoin(cfg.PsiphonSets); sets != "" {
-				args = append(args, "--psiphon-cdn-sets", sets)
-			}
-		}
-		if v, ok := aetherSettingValue(cfg.PsiphonRegn); ok {
-			args = append(args, "--psiphon-region", v)
-		}
+		args = append(args, psiphonOptionArgs(cfg.PsiphonMode, cfg.PsiphonCDN, cfg.PsiphonSNI, cfg.PsiphonSets, cfg.PsiphonRegn)...)
 		// "shipped-list" is a PattNG placeholder, not a path aether.exe
 		// 2.3.0 accepts. The bundled list runs without the flag; only a
 		// real user-configured path would justify emitting this flag,
@@ -266,11 +245,63 @@ func buildAetherArguments(p *Profile, port int) []string {
 	return args
 }
 
+// psiphonOptionArgs renders the Psiphon shape flags both Psiphon paths
+// pass to aether.exe: an Aether profile's own settings (above) and the
+// Chain tab's global options (psiphon-only runs have no profile to
+// read). Sharing one renderer is the point — a flag one path emitted
+// and the other did not would make the Chain tab change one leg's
+// behaviour in silence.
+func psiphonOptionArgs(mode, cdnIPs, cdnSNI, cdnSets, region string) []string {
+	shape := aetherEnumDefault(aetherPsiphonModes, mode, "auto")
+	args := []string{"--psiphon-mode", shape}
+	// The CDN lists feed the fronted transports alone; the server
+	// names count only beside an IP list of one's own.
+	cdn, hasIPs := "", false
+	if v, ok := aetherSettingValue(cdnIPs); ok && shape != "direct" {
+		cdn, hasIPs = v, true
+		args = append(args, "--psiphon-cdn-ips", cdn)
+	}
+	if hasIPs {
+		if v, ok := aetherSettingValue(cdnSNI); ok {
+			args = append(args, "--psiphon-cdn-sni", v)
+		}
+	}
+	if shape != "direct" {
+		if sets := aetherCdnSetJoin(cdnSets); sets != "" {
+			args = append(args, "--psiphon-cdn-sets", sets)
+		}
+	}
+	if v, ok := aetherSettingValue(region); ok {
+		args = append(args, "--psiphon-region", v)
+	}
+	return args
+}
+
+// normalizeChainPsiphon canonicalizes the Chain tab's Psiphon options
+// the way normalizePsiphon does a profile's: mode to aether's enum,
+// lists comma-separated, sets in built-in order, region upper-case —
+// and rejects a country aether cannot read (a two-letter code or
+// nothing). Called from SaveSettings, so a bad value never reaches a
+// chain run.
+func normalizeChainPsiphon(cfg *Settings) error {
+	cfg.ChainPsiphonMode = aetherEnumDefault(aetherPsiphonModes, strings.TrimSpace(cfg.ChainPsiphonMode), "auto")
+	cfg.ChainPsiphonCDN = joinComma(cfg.ChainPsiphonCDN)
+	cfg.ChainPsiphonSNI = joinComma(cfg.ChainPsiphonSNI)
+	cfg.ChainPsiphonSets = aetherCdnSetJoin(cfg.ChainPsiphonSets)
+	cfg.ChainPsiphonRegion = strings.ToUpper(strings.TrimSpace(cfg.ChainPsiphonRegion))
+	if cfg.ChainPsiphonRegion != "" && !validCountryCode(cfg.ChainPsiphonRegion) {
+		return fmt.Errorf("chainPsiphonRegion must be a two-letter country code (e.g. DE) or empty")
+	}
+	return nil
+}
+
 // aetherPsiphonChainProfile returns the profile the engine should run
 // for [p]: a copy with psiphon=chain when Settings.AetherPsiphon arms
 // Psiphon on top of the Aether tunnel. The stored profile is never
 // mutated, and a profile that names its own Psiphon mode (or carries a
 // hand-written command) keeps it — the toggle only fills the default.
+// The Chain tab's options ride along: they belong to the chain legs, and
+// this leg runs Psiphon only because the chain toggle said so.
 func aetherPsiphonChainProfile(p *Profile, settings Settings) *Profile {
 	if p == nil || p.Protocol != "aether" || !settings.AetherPsiphon {
 		return p
@@ -283,6 +314,11 @@ func aetherPsiphonChainProfile(p *Profile, settings Settings) *Profile {
 	}
 	cp := *p
 	cp.Aether.Psiphon = "chain"
+	cp.Aether.PsiphonMode = settings.ChainPsiphonMode
+	cp.Aether.PsiphonCDN = settings.ChainPsiphonCDN
+	cp.Aether.PsiphonSNI = settings.ChainPsiphonSNI
+	cp.Aether.PsiphonSets = settings.ChainPsiphonSets
+	cp.Aether.PsiphonRegn = settings.ChainPsiphonRegion
 	return &cp
 }
 

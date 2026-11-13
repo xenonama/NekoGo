@@ -283,11 +283,48 @@ type Settings struct {
 	TProxyPort         int    `json:"tproxyPort"` // 0 = disabled
 	TunEnabled         bool   `json:"tunEnabled"` // sing-box TUN
 	// TunStack selects the sing-box TUN network stack.
-	// system | gvisor | mixed; empty means the default (system).
-	// "system" hands packets to the OS stack; "gvisor" runs a whole
-	// TCP/IP stack in user space and costs roughly 2-5x the CPU per
-	// byte on Windows, so it stays opt-in.
-	TunStack        string `json:"tunStack"`
+	// system | gvisor | mixed; empty means the default (gvisor).
+	// "gvisor" keeps TCP in the core and needs nothing from Windows.
+	// "system" and "mixed" terminate TCP in the OS, which sees the
+	// tunnel's own handshake as a new INBOUND connection to the core and
+	// filters it unless the core is allowed through the firewall — then
+	// DNS answers and TCP times out. They cost less CPU, so they stay
+	// available, but they are not the default.
+	TunStack string `json:"tunStack"`
+	// TunOSStackMigrated is the one-time marker for the migration that
+	// moved a stored "system"/"mixed" stack to the default. NekoGo
+	// hardcoded that stack before the setting existed and persisted it on
+	// its first save, so configs predate the fix rather than choosing it.
+	// Once set, a deliberate pick of System/Mixed is never rewritten.
+	TunOSStackMigrated bool `json:"tunOSStackMigrated,omitempty"`
+	// The rest of the TUN group, after PattN's TunModeItem. Every field
+	// is optional: an unset value renders what NekoGo rendered before the
+	// field existed, so an upgrade never re-routes someone's traffic.
+	// TunMTU is the interface MTU; 0 means tunMTU (1350). Raise it on a
+	// clean link, lower it when a fragile one fragments.
+	TunMTU int `json:"tunMTU,omitempty"`
+	// TunAddress is the interface's IPv4 prefix; empty means tunAddress.
+	TunAddress string `json:"tunAddress,omitempty"`
+	// TunAddress6 is the interface's IPv6 prefix; empty means a PattN
+	// pool entry, and it is only used when TunEnableIPv6 is on and the OS
+	// will accept it (see tunTakesIPv6).
+	TunAddress6 string `json:"tunAddress6,omitempty"`
+	// TunEnableIPv6 puts an IPv6 prefix on the interface. Off by default,
+	// unlike PattN: NekoGo has never given the TUN an IPv6 address, and
+	// switching one on is a route change, not a setting cosmetic.
+	TunEnableIPv6 bool `json:"tunEnableIPv6,omitempty"`
+	// TunAutoRoute installs the default route into the TUN. Pointer so an
+	// absent value keeps meaning "yes" (the historical hardcoded true)
+	// rather than silently becoming a TUN that captures nothing.
+	TunAutoRoute *bool `json:"tunAutoRoute,omitempty"`
+	// TunStrictRoute blocks traffic that does not come from the TUN.
+	// Plain bool: false is both PattN's NekoGo-compatible value and the
+	// one NekoGo has always rendered.
+	TunStrictRoute  bool     `json:"tunStrictRoute,omitempty"`
+	TunRouteExclude []string `json:"tunRouteExclude,omitempty"`
+	// TunIcmp is the ICMP policy: rule | direct | unreachable | drop |
+	// reply. Empty means "rule", i.e. no ICMP rule rendered.
+	TunIcmp         string `json:"tunIcmp,omitempty"`
 	SystemProxy     bool   `json:"systemProxy"`     // remembered OS-proxy switch: Connect auto-ensures the OS proxy only when true (see ensureSystemProxy)
 	ActiveProfileID string `json:"activeProfileId"` // last used profile
 	XrayAPIAddress  string `json:"xrayApiAddress"`  // e.g. 127.0.0.1:10085
@@ -393,6 +430,22 @@ type Settings struct {
 	// through the tunnel, and the app keeps dialling the Psiphon
 	// listener. A profile that names its own Psiphon mode keeps it.
 	AetherPsiphon bool `json:"aetherPsiphon,omitempty"`
+	// Chain Psiphon options (Settings → Chain, advanced mode). They
+	// drive the two chain legs only — the SNI-spoof→Psiphon leg (a plain
+	// psiphon-only aether run) and the Aether→Psiphon leg — and never a
+	// profile's own tunnel: a profile with its own Aether Psiphon fields
+	// keeps them. Empty means aether's own default.
+	// ChainPsiphonRegion is the ISO alpha-2 egress country ("" = Psiphon
+	// chooses).
+	ChainPsiphonRegion string `json:"chainPsiphonRegion,omitempty"`
+	// ChainPsiphonMode is the fronting shape: auto | cdn | direct.
+	ChainPsiphonMode string `json:"chainPsiphonMode,omitempty"`
+	// ChainPsiphonCDN/SNI/Sets carry the fronting overrides: own CDN
+	// edge IPs, the SNI names used beside them, and the built-in edge
+	// sets to try.
+	ChainPsiphonCDN  string `json:"chainPsiphonCdnIps,omitempty"`
+	ChainPsiphonSNI  string `json:"chainPsiphonCdnSni,omitempty"`
+	ChainPsiphonSets string `json:"chainPsiphonCdnSets,omitempty"`
 	// SNIConfig holds the sni-spoof engine options. Empty/zero values
 	// mean "engine default" and are omitted from the generated
 	// config JSON. Only used when a profile selects CoreSpoof.
@@ -516,6 +569,7 @@ func DefaultSettings() Settings {
 		MixedPort:      2080,
 		TunEnabled:     false,
 		TunStack:       tunStackDefault,
+		TunAutoRoute:   boolPtr(true),
 		SystemProxy:    true,
 		XrayAPIAddress: "127.0.0.1:10085",
 		SingBoxRPCAddr: "127.0.0.1", // CPU audit #2: "info" emits a line per connection open/close;

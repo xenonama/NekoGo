@@ -8,11 +8,14 @@ package main
 // landing mid-connect could stop a core that never ran and leave the
 // live sing-box.exe (or aether.exe) behind.
 //
-// The children are the test binary re-executed in linger-helper mode
-// (helper_process_test.go): they sleep instead of binding, so a readiness
-// probe either sits in its loop (nothing answers) or is answered by a
-// listener the test itself owns (the probe succeeds while the group is
-// still uncommitted). No real binaries, drivers or admin rights needed.
+// Two stand-ins for the CLI, both the test binary re-executed under the
+// official name: the linger helper (helper_process_test.go) sleeps
+// instead of binding, so a readiness probe sits in its loop and Stop can
+// interrupt it; the fake core (fake_singbox_test.go) binds the config's
+// inbound, so the probe succeeds and the engine is left running with the
+// group still uncommitted. No real binaries, drivers or admin rights
+// needed — and nothing here pre-binds a port, which the connect-time port
+// pre-flight would (correctly) refuse.
 
 import (
 	"fmt"
@@ -128,20 +131,17 @@ func TestStopTakesDownUpstreamEngineWithUncommittedFlags(t *testing.T) {
 		t.Skip("upstream CLI stand-in relies on Windows process handles")
 	}
 	bin := fakeCLIInScratchDir(t)
-	t.Setenv("GO_WANT_HELPER_PROCESS", "1")
-	t.Setenv("GO_WANT_HELPER_PIDFILE", filepath.Join(t.TempDir(), "helper.pid"))
 
 	cores, up, _, s := upstreamStopRig(t)
 	s.UpstreamCorePath = bin
 	p := hungUpstreamProfile()
 
-	// The engine never binds, so this listener is what answers the
-	// readiness dial: the upstream Start completes, and CoreManager —
-	// never told about it, because Start is what would publish the flags —
-	// still reports the pre-connect state.
-	fake := newLoopbackSink(t, s.MixedPort)
-	defer fake.close()
-
+	// No helper env here: the child runs the fake-CLI branch
+	// (fake_singbox_test.go), so it binds the config's inbound itself,
+	// exactly like the official binary. The readiness dial is answered by
+	// the core's own listener, and upstream Start completes — while
+	// CoreManager, never told about it because Start is what would publish
+	// the flags, still reports the pre-connect state.
 	if err := up.Start(p, s); err != nil {
 		t.Fatalf("upstream engine Start: %v", err)
 	}

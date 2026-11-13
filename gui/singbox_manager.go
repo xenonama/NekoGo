@@ -276,6 +276,17 @@ func (m *SingBoxManager) startAborted(epoch uint64) bool {
 // when our epoch is still current, otherwise the child is torn down and
 // Start reports an abort instead of a stale success.
 func (m *SingBoxManager) Start(profile *Profile, settings Settings) error {
+	// The mixed inbound is a fixed port, so a collision is not bad luck:
+	// every attempt fails identically until whatever holds it lets go,
+	// which is why users "click Connect until it works". Refuse (or wait
+	// the release out) before spawning, and outside the lock so the grace
+	// window cannot stall Stop or the stats poll (BUG-004 lifecycle).
+	if m.IsRunning() {
+		return fmt.Errorf("sing-box already running")
+	}
+	if err := preflightSingBoxPorts(profile, settings); err != nil {
+		return err
+	}
 	m.mu.Lock()
 	if m.running {
 		m.mu.Unlock()
@@ -966,19 +977,28 @@ func BuildSingBoxConfig(profile *Profile, settings Settings) (string, error) {
 	tunOn := tunActiveFor(profile, settings)
 	dnsRule := map[string]any{"protocol": "dns", "outbound": "direct"}
 	if tunOn {
-		dnsRule = map[string]any{"protocol": "dns", "action": "hijack-dns"}
+		// Port 53 as well as the protocol: the TUN inbound marks
+		// protocol=dns only for its own derived hijack address, so a query
+		// to the resolver the OS already had is not recognised, falls
+		// through to final:proxy, and the proxy is asked to reach the
+		// user's own LAN from the far side of the tunnel. Every lookup
+		// dies with the core reporting nothing wrong (PattN's logical-or).
+		dnsRule = map[string]any{
+			"type": "logical", "mode": "or", "action": "hijack-dns",
+			"rules": []any{
+				map[string]any{"port": []any{53}},
+				map[string]any{"protocol": "dns"},
+			},
+		}
 	}
 	rules := []any{dnsRule}
 	if tunOn {
-		// auto_route also routes packets addressed to the TUN's own
-		// address back into the outbound, which can loop a packet and
-		// pin a CPU core. Drop them before anything else (PattN
-		// SingboxRoutingService's TUN self-address guard).
-		rules = append([]any{map[string]any{
-			"ip_cidr": []any{tunSelfAddress},
-			"action":  "reject",
-			"method":  "drop",
-		}}, rules...)
+		// The self-address drop guard, the NetBIOS/LLMNR and multicast
+		// rejects and the ICMP policy, ahead of everything else: each
+		// exists to stop a packet reaching an outbound that would feed
+		// it back into the interface (PattN tun_singbox_rules plus the
+		// guard in SingboxRoutingService).
+		rules = append(tunRouteRules(settings), rules...)
 	}
 	route := map[string]any{
 		"rules": rules,
@@ -1023,8 +1043,18 @@ func BuildSingBoxConfig(profile *Profile, settings Settings) (string, error) {
 	}
 	if dnsOK {
 		cfg["dns"] = dns
+		// TUN needs the bootstrap even when the user configured DNS:
+		// one server with no detour of its own leaves dnsResolver
+		// empty, and the proxy's hostname would then be resolved
+		// through that server — which rides the proxy. Proxy mode is
+		// left exactly as it rendered before.
+		if tunOn && dnsResolver == "" {
+			servers, _ := dns["servers"].([]any)
+			dns["servers"] = append(servers, tunDNSBootstrapEntry())
+			dnsResolver = dnsBootstrapTag
+		}
 		// A hostname-addressed resolver cannot resolve its own name
-		// without a bootstrap path, and sing-box refuses to start an
+		// without a bootstrap path, and sing-box refuses to start a
 		// multi-server block that has no default domain resolver. Both
 		// are answered by the same tag returned above.
 		if dnsResolver != "" {
@@ -1040,22 +1070,49 @@ func BuildSingBoxConfig(profile *Profile, settings Settings) (string, error) {
 		}
 	} else if tunOn {
 		// TUN leaves no system resolver to fall back on (every query
-		// is hijacked into the module), so it needs a server of its
+		// is hijacked into the module), so it needs servers of its
 		// own. The user's explicit DnsRemote/DnsDirect wins above;
 		// this default only fills the gap.
+		//
+		// The bootstrap has to be named here as well. Without
+		// default_domain_resolver sing-box resolves the proxy's own
+		// hostname through the DNS block's default transport, and the
+		// block's default is the proxied DoH entry: the lookup waits on
+		// the connection it exists to make. PattN sets the field for
+		// every TUN config, custom DNS or not.
 		cfg["dns"] = singTunDefaultDNSBlock(dnsDetour)
+		route["default_domain_resolver"] = map[string]any{"server": dnsBootstrapTag}
 	}
 	if tunOn {
-		// CPU audit #1: the stack is a setting, defaulting to "system".
-		// gVisor keeps every packet in user space and costs 2-5x the
-		// CPU per byte on Windows; it stays available for users who
-		// need its NAT behaviour, but it is no longer the default.
-		cfg["inbounds"] = append(cfg["inbounds"].([]any), map[string]any{
+		// The stack is a setting, and its default is the user-space one
+		// for the reason recorded on tunStackDefault: the OS stack asks
+		// Windows Firewall to allow the core, and when that never
+		// happens the tunnel carries DNS but no TCP.
+		//
+		// Everything else the interface takes is a setting too, after
+		// PattN's TunModeItem: an MTU a fragile link can lower, an
+		// address pool a collision can be moved off, routes the
+		// interface must leave alone, and an IPv6 address the OS gate
+		// decides whether to ask for at all. An unset value renders
+		// what NekoGo rendered before the field existed.
+		tunIn := map[string]any{
 			"type": "tun", "tag": "tun-in", "stack": normalizeTunStack(settings.TunStack),
 			"interface_name": tunInterfaceName,
-			"address":        tunAddress, "mtu": tunMTU,
-			"auto_route": true, "strict_route": false,
-		})
+			"address":        tunAddressList(settings),
+			"mtu":            tunEffectiveMTU(settings),
+			"auto_route":     tunAutoRouteEnabled(settings),
+			"strict_route":   settings.TunStrictRoute,
+			// PattN's template also turns inbound `sniff` on. Not
+			// here: `sniff` is a legacy inbound field, deprecated
+			// in sing-box 1.11 and removed in 1.13 — with it the
+			// official binary refuses the whole config at
+			// startup (TestTunConfigPassesOfficialCheck). The
+			// hijack above catches port 53, which needs no sniffing.
+		}
+		if len(settings.TunRouteExclude) > 0 {
+			tunIn["route_exclude_address"] = settings.TunRouteExclude
+		}
+		cfg["inbounds"] = append(cfg["inbounds"].([]any), tunIn)
 	}
 	// Phase E: merge stored section overrides (route/dns/inbound/
 	// experimental) over the rendered defaults before writing.
@@ -1069,13 +1126,12 @@ func BuildSingBoxConfig(profile *Profile, settings Settings) (string, error) {
 	return string(data), nil
 }
 
-// tunAddress is the TUN interface address; tunSelfAddress is the same
-// host as a /32 for the route guard that drops traffic addressed to the
-// tunnel itself.
-const (
-	tunAddress     = "172.19.0.1/24"
-	tunSelfAddress = "172.19.0.1/32"
-)
+// tunAddress is the default TUN interface address, rendered when
+// settings.tunAddress is unset. The guard that drops traffic addressed
+// to the tunnel itself is derived from whatever address actually
+// renders (tunSelfHostPrefixes), not from a second constant that would
+// go stale the moment the interface moves.
+const tunAddress = "172.19.0.1/24"
 
 // tunInterfaceName names the Wintun adapter explicitly (PattN parity).
 // Without it the adapter gets a driver-generated name, which makes it
@@ -1094,19 +1150,38 @@ const tunInterfaceName = "nekogo_tun"
 const tunMTU = 1350
 
 // tunStackDefault is the TUN network stack used when settings.tunStack
-// is empty or unrecognized. "system" hands packets to the OS stack;
-// gVisor ("gvisor") parses every packet again in user space and costs
-// roughly 2-5x the CPU per byte on Windows, so it is opt-in.
-const tunStackDefault = "system"
+// is empty or unrecognized: "gvisor", PattN's default too
+// (Global.TunStacks.First).
+//
+// "system" is not a default an app can pick silently. It terminates TCP
+// inside the OS: sing-tun rewrites the app's SYN to come from the
+// tunnel's peer address (172.19.0.2) into the engine's own listener on
+// the tunnel address (172.19.0.1), so the handshake is a NEW INBOUND
+// connection to the core process and Windows Firewall decides whether it
+// happens. sing-tun tries to allow it (fixWindowsFirewall) and throws
+// away the error, and on the machine this was traced on no such rule
+// existed before or after an elevated connect: every DNS query through
+// the tunnel answered in ~200ms while a TCP dial to the same host timed
+// out, because UDP never leaves user space in that stack and TCP does.
+// gVisor terminates TCP in user space as well, so it carries traffic
+// with no firewall change at all - for the CPU cost the old comment
+// worried about, which is the trade a working tunnel asks for.
+//
+// Settings still offers system and mixed for users who have allowed the
+// core through the firewall; "mixed" is the same OS listener for TCP, so
+// it inherits the same requirement.
+const tunStackDefault = "gvisor"
 
-// normalizeTunStack returns the canonical stack value: one of
-// system | gvisor | mixed, or tunStackDefault for empty/unknown input.
-// Defensive on purpose: SaveSettings validates, but hand-edited and
-// legacy configs (and backups predating the setting) flow through here.
+// normalizeTunStack returns the canonical stack value: one of the
+// engines' pool (tun_config.go), or tunStackDefault for empty/unknown
+// input. Defensive on purpose: SaveSettings validates, but hand-edited
+// and legacy configs (and backups predating the setting) flow through here.
 func normalizeTunStack(stack string) string {
-	switch v := strings.ToLower(strings.TrimSpace(stack)); v {
-	case "system", "gvisor", "mixed":
-		return v
+	v := strings.ToLower(strings.TrimSpace(stack))
+	for _, o := range tunStackOptions {
+		if v == o {
+			return v
+		}
 	}
 	return tunStackDefault
 }
@@ -1114,9 +1189,14 @@ func normalizeTunStack(stack string) string {
 // validTunStack reports whether stack is an accepted settings.tunStack
 // value. Empty is accepted: it means "use the default".
 func validTunStack(stack string) bool {
-	switch strings.ToLower(strings.TrimSpace(stack)) {
-	case "", "system", "gvisor", "mixed":
+	v := strings.ToLower(strings.TrimSpace(stack))
+	if v == "" {
 		return true
+	}
+	for _, o := range tunStackOptions {
+		if v == o {
+			return true
+		}
 	}
 	return false
 }
@@ -1131,10 +1211,13 @@ func inboundListenAddr(s Settings) string {
 	return "127.0.0.1"
 }
 
-// dnsBootstrapTag names the detour-free system-resolver entry added when a
-// configured server is named by hostname and has no proxy to ride. "local" is
-// the OS resolver, so unlike a hardcoded public DoH bootstrap it sends no
-// lookup to a third party the user never chose.
+// dnsBootstrapTag names the detour-free fallback resolver: "local" (the
+// OS resolver) when a configured server is named by hostname and has no
+// proxy to ride, and plain UDP when TUN needs one that answers before
+// the proxy is reachable. The OS resolver is preferred where it can be
+// used — it sends no lookup to a third party the user never chose — but
+// under TUN the system resolver is often the poisoned one the tunnel
+// exists to avoid, so the bootstrap there is PattN's public IP.
 const dnsBootstrapTag = "dns-bootstrap"
 
 // singDNSBlock renders the sing-box dns block from the user-configured
@@ -1250,22 +1333,42 @@ func dnsDetourForOutbound(outbound map[string]any) string {
 	return "proxy"
 }
 
-// singTunDefaultDNSBlock is the fallback resolver for TUN mode when the
-// user configured none. The address is an IP, so no hostname bootstrap
-// is needed. A non-empty detour routes the lookup through the tunnel:
-// without one the engine dials the resolver directly (DNS dialers only
-// follow route.final when a detour names an outbound), which in TUN mode
-// leaks every query outside the tunnel.
+// singTunDefaultDNSBlock is the fallback resolver set for TUN mode when
+// the user configured none. Two servers, after PattN: the proxied
+// resolver answers everything the tunnel hijacks, and a detour-free one
+// exists so the proxy's own hostname can be resolved without the proxy.
+//
+// A non-empty detour routes the lookup through the tunnel: without one
+// the engine dials the resolver directly (DNS dialers only follow
+// route.final when a detour names an outbound), which in TUN mode leaks
+// every query outside the tunnel. That is right for the hijacked
+// queries and wrong as the only entry in the block — dialing the proxy
+// needs its address resolved, and a resolver that detours to that proxy
+// cannot answer before the dial it depends on. PattN keeps
+// direct-dns-1 / local-local, plain UDP to DomainPureIPDNSAddress.First()
+// (= 8.8.8.8), for exactly this, and names it in default_domain_resolver.
 func singTunDefaultDNSBlock(detour string) map[string]any {
 	entry := defaultDNSEntry("remote")
 	if detour != "" {
 		entry["detour"] = detour
 	}
 	return map[string]any{
-		"servers": []any{entry},
+		"servers": []any{entry, tunDNSBootstrapEntry()},
 		"final":   "remote",
 	}
 }
+
+// tunDNSBootstrapEntry is the detour-free entry TUN mode keeps beside the
+// proxied resolver, so the proxy's own hostname can be resolved before
+// the proxy is reachable. PattN's direct-dns-1 / local-local, plain UDP
+// to Global.DomainPureIPDNSAddress.First(). An IP address, so resolving
+// it needs no further lookup.
+func tunDNSBootstrapEntry() map[string]any {
+	return map[string]any{"type": "udp", "tag": dnsBootstrapTag, "server": tunDNSBootstrapAddress}
+}
+
+// tunDNSBootstrapAddress is the bootstrap resolver's address.
+const tunDNSBootstrapAddress = "8.8.8.8"
 
 // parseDNSAddr converts a DNS server value into the sing-box 1.14 typed
 // server object (without a tag). Plain text is the contract: a scheme URL

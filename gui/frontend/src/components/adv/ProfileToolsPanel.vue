@@ -101,11 +101,55 @@
       :profile="editingProfile"
       @saved="onProfileSaved"
     />
+    <!-- New-group name input. Teleported to the body because the card is
+         a size container, which would otherwise become the containing
+         block for the fixed overlay (same reason as ProxiesTable). -->
+    <Teleport to="body">
+      <div
+        v-if="groupPrompt"
+        class="nb-modal-overlay"
+        @click.self="groupPrompt = false"
+        @keydown.esc.prevent="groupPrompt = false"
+      >
+        <div class="nb-modal" role="dialog" aria-modal="true" aria-label="New group">
+          <div class="nb-modal-head">
+            <span class="nb-section-title">New group</span>
+            <button class="nb-icon-btn" title="Close" @click="groupPrompt = false">
+              <Icon name="x" :size="18" />
+            </button>
+          </div>
+          <p class="muted nb-modal-hint">
+            Name a remark group, then "{{ target?.name }}" moves into it.
+          </p>
+          <label class="nb-sub-field">
+            <span class="muted">Group remark</span>
+            <input
+              ref="groupInput"
+              v-model="newGroupName"
+              list="nb-adv-group-names"
+              placeholder="e.g. US nodes"
+              @keydown.enter.prevent="submitNewGroup"
+            />
+          </label>
+          <datalist id="nb-adv-group-names">
+            <option v-for="g in groupNames" :key="g" :value="g" />
+          </datalist>
+          <div class="nb-modal-foot">
+            <button class="nb-act nb-act--ghost" @click="groupPrompt = false">
+              <Icon name="x" :size="14" />Cancel
+            </button>
+            <button class="nb-act nb-act--primary" :disabled="!newGroupName.trim()" @click="submitNewGroup">
+              <Icon name="check" :size="14" />Move
+            </button>
+          </div>
+        </div>
+      </div>
+    </Teleport>
   </div>
 </template>
 
 <script setup lang="ts">
-import { computed, ref, watch } from 'vue'
+import { computed, nextTick, ref, watch } from 'vue'
 import Icon from '../Icon.vue'
 import PickSelect from '../PickSelect.vue'
 import JsonEditorModal from '../JsonEditorModal.vue'
@@ -125,6 +169,9 @@ const busyWhat = ref('')
 const note = ref('')
 const msg = ref('')
 const moveGroup = ref('')
+const groupPrompt = ref(false)
+const newGroupName = ref('')
+const groupInput = ref<HTMLInputElement | null>(null)
 const showJson = ref(false)
 const editingProfile = ref<Profile | null>(null)
 
@@ -253,16 +300,30 @@ async function duplicate() {
   }
 }
 
-/** Move the profile to a group via saveProfile. */
+/** Move the profile to a group via saveProfile. "New group…" asks for
+ *  the name in the app's own dialog: WebView2 can refuse prompt()
+ *  outright, which left the option doing nothing at all. */
 async function moveToGroup() {
   if (!target.value) return
-  let g = moveGroup.value
+  const g = moveGroup.value
   if (g === '__new__') {
-    const name = prompt('New group name:')
-    if (name === null) return
-    g = name.trim()
-    if (!g) return
+    newGroupName.value = ''
+    groupPrompt.value = true
+    void nextTick(() => groupInput.value?.focus())
+    return
   }
+  await applyMove(g)
+}
+
+async function submitNewGroup() {
+  const name = newGroupName.value.trim()
+  if (!name) return
+  groupPrompt.value = false
+  await applyMove(name)
+}
+
+async function applyMove(g: string) {
+  if (!target.value) return
   busy.value = true
   msg.value = ''
   try {

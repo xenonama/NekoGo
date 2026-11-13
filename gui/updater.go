@@ -13,10 +13,10 @@ package main
 // releases). The NekoBox core still ships in the fork's own releases
 // (xenonama/NekoGo) until a dedicated core repo exists; pickForkAsset
 // only matches fork-published assets, so the two sources can never be
-// mixed up. Upstream xray.exe lacks the NekoGo-compatible config
-// format — installing it would break Connect entirely (see AI_ACT_LOG
-// 2026-09-30 19:38:46 and 2026-10-01 13:45:00), so xray stays on the
-// fork source.
+// mixed up. xray is not fork-published at all: the row follows
+// XTLS/Xray-core and installs the xray.exe of that release, which is
+// the binary the Xray engine runs and the one BuildXrayConfig's stock
+// Xray JSON is written for.
 //
 // Covered components (see updatableIDs):
 //   - geoip/geosite: plain data files, updated in place.
@@ -372,7 +372,7 @@ func githubLatest(ownerRepo string) (*ghRelease, error) {
 //	| Component | Source repo           | Asset pattern                        | Install path |
 //	| singbox   | SagerNet/sing-box     | sing-box-<ver>-windows-<arch>.zip    | resolveUpstreamCore path, else exe dir |
 //	| nekobox   | xenonama/NekoGo       | nekobox_core.exe (or .zip holding it) | resolved core path, else exe dir |
-//	| xray      | xenonama/NekoGo       | xray.exe (or .zip holding it)         | resolved xray path, else exe dir |
+//	| xray      | XTLS/Xray-core        | Xray-windows-64.zip                  | resolved xray path, else exe dir |
 //	| mihomo    | MetaCubeX/mihomo      | mihomo-windows-<arch>[-v1]-v<ver>.zip | resolved mihomo path, else exe dir\bin\mihomo.exe |
 //	| gui       | xenonama/NekoGo       | NekoGo-Setup-*.exe / NekoGo-Portable-*.zip | %APPDATA%/NekoGo/updates/ (manual open via Open installer button; never auto-opened) |
 //	| geoip     | Loyalsoldier/geoip    | Country.mmdb (@release)              | gui/assets/GeoLite2-Country.mmdb |
@@ -398,6 +398,11 @@ const nekoCoreOwnerRepo = forkOwnerRepo
 // and would make updateNeeded offer the same alpha forever.
 const mihomoOwnerRepo = "MetaCubeX/mihomo"
 
+// xrayOwnerRepo publishes xray.exe itself. The row used to read the app
+// repo (forkOwnerRepo), which compared an Xray banner against a NekoGo
+// release tag and installed the xray.exe bundled with the app release.
+const xrayOwnerRepo = "XTLS/Xray-core"
+
 // mihomoAsset picks the Windows archive for this arch from a stable
 // mihomo release, anchored to the exact name build.bat fetches. The
 // v1.19.33 release ships 31 Windows archives whose names all contain
@@ -418,6 +423,40 @@ func mihomoAsset(assets []ghAsset, tag string) *ghAsset {
 		level = "-v1"
 	}
 	want := strings.ToLower("mihomo-windows-" + runtime.GOARCH + level + "-v" + normTag(tag) + ".zip")
+	for i := range assets {
+		if strings.ToLower(assets[i].Name) == want {
+			return &assets[i]
+		}
+	}
+	return nil
+}
+
+// xrayAsset picks the Windows archive for this arch from an XTLS
+// release. The names are fixed and arch-suffixed, not versioned:
+// Xray-windows-32.zip, Xray-windows-64.zip and
+// Xray-windows-arm64-v8a.zip (measured in v26.11.9). Every archive also
+// ships as a "<name>.dgst" sidecar whose name contains it, so the match
+// is anchored exactly; a substring match would hand back a checksum
+// text file to unpack. XTLS versions nothing but the platform in the
+// name, so the tag is not part of the match. Other platforms ship zips
+// too, but the shipped layout is the Windows one, so they stay on the
+// manual note like the sing-box and mihomo rows.
+func xrayAsset(assets []ghAsset) *ghAsset {
+	if runtime.GOOS != "windows" {
+		return nil
+	}
+	suffix := ""
+	switch runtime.GOARCH {
+	case "amd64":
+		suffix = "-64"
+	case "arm64":
+		suffix = "-arm64-v8a"
+	case "386":
+		suffix = "-32"
+	default:
+		return nil
+	}
+	want := strings.ToLower("xray-windows" + suffix + ".zip")
 	for i := range assets {
 		if strings.ToLower(assets[i].Name) == want {
 			return &assets[i]
@@ -939,6 +978,31 @@ func (a *App) checkMihomo(c *UpdatableComponent) {
 	}
 }
 
+// checkXray resolves the xray row against XTLS/Xray-core's own
+// releases — the repo that publishes xray.exe — the same way the
+// singbox row follows SagerNet and the mihomo row follows MetaCubeX.
+// The app release (forkOwnerRepo) ships an xray.exe too, and reading
+// that row compared an Xray banner against a NekoGo tag such as
+// "1.0.0-beta.3" and installed the binary bundled with the app.
+func (a *App) checkXray(c *UpdatableComponent) {
+	rel, err := githubLatest(xrayOwnerRepo)
+	if err != nil {
+		c.LastError = err.Error()
+		return
+	}
+	a.updateLog(c.ID, "info", fmt.Sprintf("[update:%s] source=%s latest=%s", c.ID, xrayOwnerRepo, rel.TagName))
+	c.Latest = rel.TagName
+	asset := xrayAsset(rel.Assets)
+	if asset == nil {
+		c.UpdateAvail = false
+		c.Notes = fmt.Sprintf("No automatic install for %s/%s — download xray manually.", runtime.GOOS, runtime.GOARCH)
+		return
+	}
+	if coreUpdateNeeded(c.Current, rel.TagName, asset) {
+		c.UpdateAvail = true
+	}
+}
+
 func (a *App) checkGUI(c *UpdatableComponent, lk releaseLookup) {
 	// AUDIT (hotfix Task 2): queries xenonama/NekoGo/releases (list,
 	// newest first, prereleases included) — NOT /releases/latest, so
@@ -983,10 +1047,10 @@ func (a *App) checkGUI(c *UpdatableComponent, lk releaseLookup) {
 func (a *App) CheckUpdates() ([]UpdatableComponent, error) {
 	rows := a.localUpdatables()
 	now := time.Now().Format(time.RFC3339)
-	// nekobox, xray and gui all read the fork's newest release: one
+	// nekobox and gui both read the fork's newest release: one
 	// lookup per repo, not one per row. GitHub allows 60 unauthenticated
 	// calls an hour and the panel's per-row Check button runs a whole
-	// pass, so three identical requests spent half that budget for
+	// pass, so identical requests spent half that budget for
 	// nothing. Written here and only read inside the goroutines below,
 	// so the map needs no lock.
 	lookups := map[string]releaseLookup{}
@@ -1012,7 +1076,7 @@ func (a *App) CheckUpdates() ([]UpdatableComponent, error) {
 			case "nekobox":
 				a.checkCore(c, "nekobox_core", lookups[nekoCoreOwnerRepo])
 			case "xray":
-				a.checkCore(c, "xray", lookups[forkOwnerRepo])
+				a.checkXray(c)
 			case "mihomo":
 				a.checkMihomo(c)
 			case "gui":
@@ -1864,6 +1928,95 @@ func (a *App) updateMihomo() (*UpdatableComponent, error) {
 	return &c, nil
 }
 
+// xrayInstallPath is where xray.exe belongs, mirroring resolveXray: the
+// dedicated XrayPath override (a directory gets xray.exe inside it, a
+// file is updated in place), otherwise the binary a.xray already
+// resolved, and bin\ next to nekogo.exe as the default destination.
+// resolveXray only accepts an override that EXISTS on disk (it errors
+// on a missing one), so an install into a configured-but-unpopulated
+// directory would land in bin\ instead of where the user pointed the
+// setting — the destination is computed here rather than read from the
+// manager. Settings.CorePath and UpstreamCorePath are other engines'
+// overrides and are never read here.
+func (a *App) xrayInstallPath() (string, error) {
+	if a.store != nil {
+		if p := strings.TrimSpace(a.store.GetSettings().XrayPath); p != "" {
+			if info, err := os.Stat(p); err == nil && info.IsDir() {
+				return filepath.Join(p, coreExeName("xray")), nil
+			}
+			return p, nil
+		}
+	}
+	if cur := a.currentCorePath("xray"); cur != "" {
+		return cur, nil
+	}
+	return filepath.Join(coreExeDir(), coreExeName("xray")), nil
+}
+
+// updateXray installs the Xray engine from XTLS/Xray-core's own
+// release. The archive holds wintun.dll, geoip.dat and README.md beside
+// the binary (measured in v26.11.9), so only xray.exe is extracted, and
+// it goes to the path resolveXray reads.
+func (a *App) updateXray() (*UpdatableComponent, error) {
+	if a.coreBusy() {
+		return nil, fmt.Errorf("disconnect before updating")
+	}
+	rel, err := githubLatest(xrayOwnerRepo)
+	if err != nil {
+		return nil, err
+	}
+	asset := xrayAsset(rel.Assets)
+	if asset == nil {
+		return nil, fmt.Errorf("no xray build for %s/%s in %s", runtime.GOOS, runtime.GOARCH, rel.TagName)
+	}
+	dest, err := a.xrayInstallPath()
+	if err != nil {
+		return nil, err
+	}
+	if owner := coreImageOwner(dest); owner != "" && owner != "xray" {
+		return nil, fmt.Errorf("xray update would overwrite %s, which belongs to the %s row; fix xrayPath in settings", filepath.Base(dest), owner)
+	}
+	a.updateLog("xray", "info", fmt.Sprintf("[update:xray] installing %s from %s", asset.Name, rel.TagName))
+	data, err := a.downloadFile("xray", asset.BrowserDownloadURL)
+	if err != nil {
+		a.updateLog("xray", "error", "[update:xray] ERROR: "+err.Error())
+		return nil, err
+	}
+	if err := a.verifyDigest("xray", asset.Name, asset.Digest, data); err != nil {
+		a.updateLog("xray", "error", "[update:xray] ERROR: "+err.Error())
+		return nil, err
+	}
+	data, err = extractExeFromZip(data, coreExeName("xray"))
+	if err != nil {
+		a.updateLog("xray", "error", "[update:xray] ERROR: "+err.Error())
+		return nil, err
+	}
+	installed := true
+	if err := a.installExeWithBackup("xray", dest, data, "version"); err != nil {
+		if !errors.Is(err, errAlreadyUpToDate) {
+			a.updateLog("xray", "error", "[update:xray] ERROR: "+err.Error())
+			return nil, err
+		}
+		installed = false
+		a.updateLog("xray", "info", "[update:xray] already up to date (identical binary)")
+	}
+	a.invalidateCoreVersion("xray")
+	c := UpdatableComponent{ID: "xray", Latest: rel.TagName, UpdateAvail: false}
+	for _, base := range a.localUpdatables() {
+		if base.ID == "xray" {
+			c = base
+			break
+		}
+	}
+	c.Latest = rel.TagName
+	c.UpdateAvail = false
+	c.Notes = ""
+	if !installed {
+		c.Notes = "Already up to date"
+	}
+	return &c, nil
+}
+
 // currentCorePath returns the resolved exe path a component runs
 // today ("" when none resolves — fresh install to the exe dir).
 func (a *App) currentCorePath(id string) string {
@@ -2013,10 +2166,7 @@ func (a *App) UpdateComponent(id string) (*UpdatableComponent, error) {
 		}
 		return a.updateCoreExe(id, nekoCoreOwnerRepo, "nekobox_core", "sing-box", "version")
 	case "xray":
-		if a.coreBusy() {
-			return nil, fmt.Errorf("disconnect before updating")
-		}
-		return a.updateCoreExe(id, forkOwnerRepo, "xray", "version")
+		return a.updateXray()
 	case "mihomo":
 		return a.updateMihomo()
 	case "gui":

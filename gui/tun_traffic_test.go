@@ -203,36 +203,44 @@ func TestBuildSingBoxTunInterfaceName(t *testing.T) {
 }
 
 // TestTunConfigPassesOfficialCheck: both shipped binaries accept the
-// rendered TUN config, including interface_name. Skips when the engines
-// are not built into the tree.
+// rendered TUN config, including interface_name and both DNS bootstrap
+// shapes. Skips when the engines are not built into the tree.
 func TestTunConfigPassesOfficialCheck(t *testing.T) {
 	s := DefaultSettings()
 	s.TunEnabled = true
-	p := &Profile{ID: "s", Name: "ss", Core: CoreSingBox, Protocol: "shadowsocks",
-		Address: "1.2.3.4", Port: 8388, IDOrPassword: "pw"}
-	raw, err := BuildSingBoxConfig(p, s)
-	if err != nil {
-		t.Fatal(err)
-	}
-	path := filepath.Join(t.TempDir(), "tun.json")
-	if err := os.WriteFile(path, []byte(raw), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	checked := 0
-	for _, core := range []string{
-		filepath.Join("build", "bin", "nekobox_core.exe"),
-		filepath.Join("bin", "sing-box.exe"),
+	// The hostname profile is the one that needs the detour-free
+	// bootstrap and default_domain_resolver to be resolvable at all; the
+	// IP profile is what the renderer had before. Both must load.
+	for _, p := range []*Profile{
+		{ID: "s", Name: "ss", Core: CoreSingBox, Protocol: "shadowsocks",
+			Address: "1.2.3.4", Port: 8388, IDOrPassword: "pw"},
+		{ID: "h", Name: "hs", Core: CoreSingBox, Protocol: "shadowsocks",
+			Address: "de1.example-vps.net", Port: 8388, IDOrPassword: "pw"},
 	} {
-		if _, err := os.Stat(core); err != nil {
-			continue
-		}
-		checked++
-		out, err := exec.Command(core, "check", "-c", path).CombinedOutput()
+		raw, err := BuildSingBoxConfig(p, s)
 		if err != nil {
-			t.Fatalf("%s rejected the TUN config: %v\n%s\nconfig: %s", core, err, out, raw)
+			t.Fatal(err)
 		}
-	}
-	if checked == 0 {
-		t.Skip("no engine binaries built in the tree")
+		path := filepath.Join(t.TempDir(), "tun.json")
+		if err := os.WriteFile(path, []byte(raw), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		checked := 0
+		for _, core := range []string{
+			filepath.Join("build", "bin", "nekobox_core.exe"),
+			filepath.Join("build", "bin", "sing-box.exe"),
+		} {
+			if _, err := os.Stat(core); err != nil {
+				continue
+			}
+			checked++
+			out, err := exec.Command(core, "check", "-c", path).CombinedOutput()
+			if err != nil {
+				t.Fatalf("%s rejected the TUN config: %v\n%s\nconfig: %s", core, err, out, raw)
+			}
+		}
+		if checked == 0 {
+			t.Skip("no engine binaries built in the tree")
+		}
 	}
 }

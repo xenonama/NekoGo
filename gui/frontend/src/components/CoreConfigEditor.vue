@@ -64,6 +64,9 @@ import Icon from './Icon.vue'
 import { backend } from '../api'
 import { useConnectionStore } from '../stores/connection'
 import { useSettingsStore } from '../stores/settings'
+import { useProfilesStore } from '../stores/profiles'
+import { useConfirmStore } from '../stores/confirm'
+import { configTargetProfile } from '../configTarget'
 
 const props = withDefaults(
   defineProps<{
@@ -83,13 +86,20 @@ const props = withDefaults(
 
 const connection = useConnectionStore()
 const settings = useSettingsStore()
+const profiles = useProfilesStore()
+const confirmBox = useConfirmStore()
 
 const ack = computed(() => settings.settings.rawOverrideAck === true)
 const hasSectionOverrides = computed(() => {
   const ov = settings.settings.coreOverrides ?? {}
   return ['route', 'dns', 'inbound', 'experimental'].some((k) => {
     const v = ov[k]
-    return v !== undefined && v !== null && String(v).trim() !== ''
+    if (v === undefined || v === null) return false
+    // Mirrors Go isEmptyOverride: a stored {} or [] carries no intent
+    // (the merger skips it), so it is not an edit a raw save destroys.
+    if (Array.isArray(v)) return v.length > 0
+    if (typeof v === 'object') return Object.keys(v).length > 0
+    return JSON.stringify(v).trim() !== ''
   })
 })
 const showOverrideWarning = computed(
@@ -120,7 +130,11 @@ const staleTarget = ref(false)
 const dirty = computed(() => draft.value !== loaded.value)
 
 /** The profile the backend would render for this editor. */
-const targetID = computed(() => connection.status.profileId || settings.settings.activeProfileId)
+const targetID = computed(
+  () =>
+    configTargetProfile(connection.status, settings.settings.activeProfileId, profiles.profiles)
+      ?.id ?? '',
+)
 
 /** Reload the shell's settings snapshot after a core-config write: the
  *  backend owns CoreOverrides and the store otherwise keeps the startup
@@ -202,6 +216,16 @@ function format() {
   }
 }
 
+/** Both saves ask the same question: the JSON is stored, but the core
+ *  keeps running the old config until it reconnects. */
+function askReload(): Promise<boolean> {
+  return confirmBox.ask({
+    title: 'Reload the core?',
+    body: 'Saved. The running core keeps its old config until it reconnects. Disconnect and connect again now?',
+    confirmLabel: 'Reload now',
+  })
+}
+
 async function save() {
   if (staleTarget.value) {
     error.value = 'The active profile changed while this draft was open — press Reload before saving.'
@@ -220,7 +244,7 @@ async function save() {
       await backend.setRawConfig(draft.value)
       loaded.value = draft.value
       void refreshSettings()
-      if (!confirm('Saved. Reload the core now to apply? (Disconnect + Connect)')) {
+      if (!(await askReload())) {
         toast.value = 'Saved. Reload the core later to apply.'
         return
       }
@@ -232,7 +256,7 @@ async function save() {
     await backend.setCoreConfigSection(props.section, draft.value)
     loaded.value = draft.value
     void refreshSettings()
-    if (!confirm('Saved. Reload the core now to apply? (Disconnect + Connect)')) {
+    if (!(await askReload())) {
       toast.value = 'Saved. Reload the core later to apply.'
       return
     }

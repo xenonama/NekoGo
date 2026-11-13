@@ -189,7 +189,7 @@
 
       <div v-if="sortedFiltered.length === 0" class="muted nb-px-msg">No proxies match the current search or filters.</div>
 
-      <div class="nb-px-bar">
+      <div class="nb-px-bar nb-px-bar--sticky">
         <span>Total: {{ profiles.profiles.length }}</span>
         <span v-if="hasMoreRows">Showing {{ renderedRowCount }} of {{ flatRows.length }}</span>
         <span>Selected: {{ selectedIds.size }}</span>

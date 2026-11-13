@@ -103,6 +103,16 @@ func (m *UpstreamSingBoxManager) log(level, msg string) {
 }
 
 func (m *UpstreamSingBoxManager) Start(profile *Profile, settings Settings) error {
+	// Same fixed inbound as the custom core, same deterministic collision,
+	// and the official CLI reports it only after it has read the config
+	// file. Checked before anything is written or spawned, and unlocked so
+	// the grace window cannot block Stop.
+	if m.IsRunning() {
+		return fmt.Errorf("upstream sing-box already running")
+	}
+	if err := preflightSingBoxPorts(profile, settings); err != nil {
+		return err
+	}
 	m.mu.Lock()
 	if m.running {
 		m.mu.Unlock()
