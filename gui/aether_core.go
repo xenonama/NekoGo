@@ -118,7 +118,12 @@ func buildAetherArguments(p *Profile, port int) []string {
 		if aetherIsOverMasque(protocol) && transport == "h2" {
 			args = append(args, "--h2")
 			// The ClientHello of the MASQUE handshake and of the calls
-			// to the WARP API; without the flag both send whole.
+			// to the WARP API; without the flag both send whole. Said
+			// only when asked: the core fragments by default because
+			// Iran's firewall resets a whole ClientHello whose SNI ends
+			// in cloudflareclient.com, and --no-fragment would turn that
+			// defence off on every profile that never touched the setting
+			// (PattN AetherArgs.kt:247 has no else branch either).
 			if cfg.Fragment {
 				args = append(args, "--fragment")
 				if r, ok := aetherRangeParse(cfg.FragmentSz, aetherFragmentSizeBounds); ok {
@@ -127,10 +132,6 @@ func buildAetherArguments(p *Profile, port int) []string {
 				if r, ok := aetherRangeParse(cfg.FragmentDl, aetherFragmentDelayBounds); ok {
 					args = append(args, "--fragment-delay", r.String())
 				}
-			} else {
-				// aether 2.3.0 defaults --fragment to ON; sending
-				// --no-fragment is the only way to turn it off.
-				args = append(args, "--no-fragment")
 			}
 		}
 		// Encrypted Client Hello hides the server name of the MASQUE
@@ -198,29 +199,7 @@ func buildAetherArguments(p *Profile, port int) []string {
 		args = append(args, aetherFlagTorBind, fmt.Sprintf("%s:%d", aetherLoopback, *torBind))
 	}
 	if tor != "off" {
-		// Told nothing, the core tries Tor plainly and turns to fetched
-		// bridges where Tor is blocked.
-		bridges := aetherEnumDefault(aetherTorBridges, cfg.TorBridges, "auto")
-		switch bridges {
-		case "auto":
-		case "first":
-			args = append(args, "--tor-bridges")
-		case "never":
-			args = append(args, "--no-tor-bridges")
-		case "own":
-			for _, line := range aetherBridgeLines(cfg.TorBridgeLines) {
-				if v, ok := aetherSettingValue(line); ok {
-					args = append(args, "--tor-bridge", v)
-				}
-			}
-		}
-		// Where fetched bridges come from; with the profile's own
-		// lines, or none at all, nothing is fetched.
-		if bridges == "auto" || bridges == "first" {
-			if relays := aetherEnumDefault(aetherTorRelays, cfg.TorRelays, "auto"); relays != "auto" {
-				args = append(args, "--tor-relays", relays)
-			}
-		}
+		args = append(args, torOptionArgs(cfg.TorBridges, cfg.TorBridgeLines, cfg.TorRelays)...)
 	}
 
 	switch psiphon {
@@ -237,10 +216,7 @@ func buildAetherArguments(p *Profile, port int) []string {
 	}
 	if psiphon != "off" {
 		args = append(args, psiphonOptionArgs(cfg.PsiphonMode, cfg.PsiphonCDN, cfg.PsiphonSNI, cfg.PsiphonSets, cfg.PsiphonRegn)...)
-		// "shipped-list" is a PattNG placeholder, not a path aether.exe
-		// 2.3.0 accepts. The bundled list runs without the flag; only a
-		// real user-configured path would justify emitting this flag,
-		// and no such field exists yet.
+		args = append(args, psiphonBundledArgs(cfg.PsiphonBundledList)...)
 	}
 	return args
 }
@@ -275,6 +251,149 @@ func psiphonOptionArgs(mode, cdnIPs, cdnSNI, cdnSets, region string) []string {
 		args = append(args, "--psiphon-region", v)
 	}
 	return args
+}
+
+// torOptionArgs renders the Tor shape flags both Tor paths pass to
+// aether.exe: an Aether profile's own settings (above) and the Chain
+// tab's global options (tor-only runs have no profile to read). Sharing
+// one renderer is the point — a flag one path emitted and the other did
+// not would make the Chain tab change one leg's behaviour in silence.
+func torOptionArgs(bridges, bridgeLines, relays string) []string {
+	var args []string
+	// Told nothing, the core tries Tor plainly and turns to fetched
+	// bridges where Tor is blocked.
+	shape := aetherEnumDefault(aetherTorBridges, bridges, "auto")
+	switch shape {
+	case "auto":
+	case "first":
+		args = append(args, "--tor-bridges")
+	case "never":
+		args = append(args, "--no-tor-bridges")
+	case "own":
+		for _, line := range aetherBridgeLines(bridgeLines) {
+			if v, ok := aetherSettingValue(line); ok {
+				args = append(args, "--tor-bridge", v)
+			}
+		}
+	}
+	// Where fetched bridges come from; with the profile's own lines, or
+	// none at all, nothing is fetched.
+	if shape == "auto" || shape == "first" {
+		if r := aetherEnumDefault(aetherTorRelays, relays, "auto"); r != "auto" {
+			args = append(args, "--tor-relays", r)
+		}
+	}
+	return args
+}
+
+// bridgeLinesIdleNote is what torOptionArgs left out, in the run's own
+// words: the Chain tab keeps its bridge lines whatever Bridges says, and
+// only own passes them, so a tab moved off own after a paste — or left
+// there because the lines were typed before the shape was chosen — runs
+// a Tor the user believes they have bridged and waits the whole
+// readiness budget on a directory fetch this network truncates. The
+// reason is read back out of [argv] rather than out of the settings so
+// it cannot disagree with what is actually being run. Empty means the
+// run has nothing to explain.
+func bridgeLinesIdleNote(argv []string, lines string) string {
+	if aetherTorModeOf(argv) == "off" || containsStr(argv, "--tor-bridge") {
+		return ""
+	}
+	n := len(aetherBridgeLines(lines))
+	if n == 0 {
+		return ""
+	}
+	why := "auto, which waits for plain Tor to fail and then fetches its own"
+	switch {
+	case containsStr(argv, "--no-tor-bridges"):
+		why = "never, which dials plain relays and takes no bridges at all"
+	case containsStr(argv, "--tor-bridges"):
+		why = "first, which always starts over bridges the engine fetched"
+	}
+	take := "lines"
+	if n == 1 {
+		take = "line"
+	}
+	return fmt.Sprintf("this run takes none of the %d bridge %s saved: Bridges is %s. "+
+		"Set it to own to hand them to the engine.", n, take, why)
+}
+
+// normalizeChainTor canonicalizes the Chain tab's Tor options the way
+// normalizeChainPsiphon does Psiphon's: aether's enums matched
+// case-sensitively, so an unknown spelling falls back to the default
+// rather than reaching the core, and the bridge lines keep the shape a
+// torrc uses (one per line) with the editor's line endings removed.
+// Called from SaveSettings, so a bad value never reaches a chain run.
+func normalizeChainTor(cfg *Settings) error {
+	cfg.ChainTorBridges = aetherEnumDefault(aetherTorBridges, strings.TrimSpace(cfg.ChainTorBridges), "auto")
+	cfg.ChainTorRelays = aetherEnumDefault(aetherTorRelays, strings.TrimSpace(cfg.ChainTorRelays), "auto")
+	cfg.ChainTorBridgeLines = strings.TrimSpace(
+		strings.ReplaceAll(cfg.ChainTorBridgeLines, "\r\n", "\n"))
+	return nil
+}
+
+// aetherTorChainProfile returns the profile the engine should run for
+// [p]: a copy with tor=chain when Settings.AetherTor arms Tor on top of
+// the Aether tunnel. The stored profile is never mutated, and a profile
+// that names its own Tor mode (or carries a hand-written command) keeps
+// it — the toggle only fills the default. The Chain tab's Tor options
+// ride along, exactly as the Psiphon toggle carries its own.
+func aetherTorChainProfile(p *Profile, settings Settings) *Profile {
+	if p == nil || p.Protocol != "aether" || !settings.AetherTor {
+		return p
+	}
+	if strings.TrimSpace(p.Aether.Command) != "" {
+		return p
+	}
+	if aetherEnumDefault(aetherTors, p.Aether.Tor, "off") != "off" {
+		return p
+	}
+	cp := *p
+	cp.Aether.Tor = "chain"
+	cp.Aether.TorBridges = settings.ChainTorBridges
+	cp.Aether.TorRelays = settings.ChainTorRelays
+	cp.Aether.TorBridgeLines = settings.ChainTorBridgeLines
+	return &cp
+}
+
+// aetherProfileTorChain reports whether the engine for [p] runs Tor on
+// top of the tunnel (tor=chain): the app then dials the Tor listener,
+// and connect must wait for a real circuit before the transport starts.
+func aetherProfileTorChain(p *Profile) bool {
+	return p != nil && p.Protocol == "aether" &&
+		aetherEnumDefault(aetherTors, p.Aether.Tor, "off") == "chain"
+}
+
+// aetherTunnelOnlyProfile returns the profile the engine runs when the
+// Tor hop is not its own business: a copy of [p] with tor turned off, so
+// the arguments stop carrying --tor and --tor-bind, the tunnel takes
+// back the port the app dials, and readiness is the tunnel's own budget
+// again instead of a bootstrap's. What the hop needs — the bridge mode
+// and the lines — stays on the copy for aetherTorHopSettings to read.
+func aetherTunnelOnlyProfile(p *Profile) *Profile {
+	if !aetherProfileTorChain(p) {
+		return p
+	}
+	cp := *p
+	cp.Aether.Tor = "off"
+	return &cp
+}
+
+// aetherTorHopSettings returns the settings a standalone daemon carries
+// the hop with. The Chain tab's Tor options are what a connect renders
+// into the engine's arguments, whether the toggle armed the hop
+// (aetherTorChainProfile copied them over) or the profile named its own
+// mode and brought its own lines; reading them back out of [hop] hands
+// the daemon exactly the bridges the engine run would have dialled
+// instead of quietly switching to a different set.
+func aetherTorHopSettings(settings Settings, hop *Profile) Settings {
+	if hop == nil {
+		return settings
+	}
+	cp := settings
+	cp.ChainTorBridges = hop.Aether.TorBridges
+	cp.ChainTorBridgeLines = hop.Aether.TorBridgeLines
+	return cp
 }
 
 // normalizeChainPsiphon canonicalizes the Chain tab's Psiphon options
@@ -445,6 +564,18 @@ func normalizeFragment(cfg *aetherSettings) error {
 
 // normalizeAetherEndpoints: server + port for one-hop profiles, the
 // outer/inner pair for two-hop ones (AetherFmt.normalizeEndpoints).
+// aetherPortUnused reports whether the profile's own address and port
+// reach nothing: a two-hop tunnel names its hops instead, and a
+// carrier-only run dials no WARP endpoint at all. The editor hides the
+// endpoint row for both, so save must not demand a port it never shows.
+func aetherPortUnused(p Profile) bool {
+	if p.Protocol != "aether" {
+		return false
+	}
+	return aetherIsTwoHops(aetherEnumDefault(aetherProtocols, p.Aether.Protocol, "wg")) ||
+		p.Aether.Psiphon == "only" || p.Aether.Tor == "only"
+}
+
 func normalizeAetherEndpoints(p *Profile, cfg *aetherSettings) error {
 	protocol := aetherEnumDefault(aetherProtocols, cfg.Protocol, "wg")
 	if aetherIsTwoHops(protocol) {
@@ -637,4 +768,44 @@ func normalizeTor(cfg *aetherSettings) error {
 	}
 	cfg.TorRelays = aetherEnumDefault(aetherTorRelays, cfg.TorRelays, "auto")
 	return nil
+}
+
+// AetherCommandPreview renders the engine line a profile's settings
+// produce, for the Aether tab's command box: the same shaping a connect
+// applies, the hand-written command left out (the box compares against
+// it), and the port a command that names no listener gets. The listen
+// port a connect really uses is picked then, so this one is the
+// placeholder the command reader would supply.
+func (a *App) AetherCommandPreview(p Profile) string {
+	if p.Protocol != "aether" || a.store == nil {
+		return ""
+	}
+	settings := a.store.GetSettings()
+	shaped := aetherTorChainProfile(aetherPsiphonChainProfile(&p, settings), settings)
+	shaped.Aether.Command = ""
+	args := buildAetherArguments(shaped, aetherDefaultCommandPort)
+	args = append(args, "--log-level", aetherLogLevel(settings.LogLevel))
+	return aetherCommandLine(args)
+}
+
+// aetherCommandLine writes argv as one line aetherWords reads back into
+// the same words: a bridge line carries spaces, so it goes in quotes,
+// and the quote chosen is the one the word does not contain.
+func aetherCommandLine(argv []string) string {
+	words := make([]string, 0, len(argv))
+	for _, w := range argv {
+		switch {
+		case w == "":
+			words = append(words, `""`)
+		case !strings.ContainsFunc(w, isSpaceRune) && !strings.ContainsAny(w, `"'`):
+			words = append(words, w)
+		case !strings.Contains(w, `"`):
+			words = append(words, `"`+w+`"`)
+		case !strings.Contains(w, `'`):
+			words = append(words, `'`+w+`'`)
+		default:
+			words = append(words, w)
+		}
+	}
+	return strings.Join(words, " ")
 }

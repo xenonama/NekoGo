@@ -433,12 +433,12 @@ func parseVlessTrojan(link string) (*Profile, error) {
 	//   - chained shape (trojan/vless over TLS+WS at 127.0.0.1:40443):
 	//     only the engine serves that loopback port;
 	//   - direct domain shape (trojan/vless over TLS+WS at a bare
-	//     domain like prompt.txt Test-CF www.calmlunch.com): the
+	//     domain like Test-CF's www.node.example): the
 	//     direct dial is DPI-blocked, only the engine's fake
 	//     ClientHello passes — tag it too so it arrives with the
 	//     spoof tag like APPXA.
-	// The normal config (an IPv6 literal, prompt.txt
-	// nat3.xxai.dpdns.org) is not a domain and stays a normal direct
+	// The normal config (an IPv6 literal, the cdn.node.example
+	// fixture) is not a domain and stays a normal direct
 	// profile (no spoof tag). IP literals never auto-tag: proving
 	// CF-fronting needs a live lookup and import stays synchronous —
 	// the SNI tab remains the opt-in path there (SpoofUseProfile).

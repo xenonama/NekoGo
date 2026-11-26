@@ -38,6 +38,8 @@ func chainSettings(t *testing.T) Settings {
 // no psiphon options at all — it always ran with aether's defaults, so
 // the country the user picked in the Chain tab was ignored.
 func TestPsiphonOnlyArgsCarriesChainOptions(t *testing.T) {
+	const entries = `C:\NekoGo\aether\psiphon-servers.txt`
+	withPsiphonEntries(t, entries)
 	base := []string{
 		"--bind", "127.0.0.1:1234",
 		"--psiphon-only",
@@ -45,17 +47,21 @@ func TestPsiphonOnlyArgsCarriesChainOptions(t *testing.T) {
 		"--log-level", "debug",
 	}
 	got := psiphonOnlyArgs(1234, 5678, "debug", "", DefaultSettings())
-	if want := append(append([]string{}, base...), "--psiphon-mode", "auto"); !reflect.DeepEqual(got, want) {
+	want := append(append([]string{}, base...),
+		"--psiphon-mode", "auto",
+		"--psiphon-server-entries", entries)
+	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("psiphonOnlyArgs(defaults) = %v, want %v", got, want)
 	}
 
 	got = psiphonOnlyArgs(1234, 5678, "debug", `C:\chain-dir`, chainSettings(t))
-	want := append(append([]string{}, base...),
+	want = append(append([]string{}, base...),
 		"--psiphon-mode", "cdn",
 		"--psiphon-cdn-ips", "1.1.1.1,8.8.8.8",
 		"--psiphon-cdn-sni", "example.com",
 		"--psiphon-cdn-sets", "cloudflare,fastly",
 		"--psiphon-region", "DE",
+		"--psiphon-server-entries", entries,
 		"--psiphon-dir", `C:\chain-dir`)
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("psiphonOnlyArgs(chain options) = %v, want %v", got, want)

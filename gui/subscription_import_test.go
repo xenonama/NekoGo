@@ -109,6 +109,39 @@ func TestEditSubscriptionKeepsTheFeedWhenTheNewURLYieldsNothing(t *testing.T) {
 	}
 }
 
+// TestEditSubscriptionRejectsAllSaveInvalidLinks: parsing is not enough to
+// make a replacement feed usable. If every distinct link fails profile
+// validation, the old feed and its profile ownership must remain intact.
+func TestEditSubscriptionRejectsAllSaveInvalidLinks(t *testing.T) {
+	old := subFeedServer(t, func() string { return nodeLink(1) })
+	bad := subFeedServer(t, func() string {
+		return "vless://11111111-1111-1111-1111-111111111111@192.0.2.1:443?security=tls&flow=xtls-rprx-vision&mux=8#invalid"
+	})
+	store, err := NewConfigStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	app := NewApp(store, make(chan LogEntry, 64))
+	if _, err := app.ImportLinks(old.URL); err != nil {
+		t.Fatalf("seed import: %v", err)
+	}
+	res, err := app.EditSubscription(old.URL, bad.URL, "")
+	if err == nil {
+		t.Fatalf("repoint with only unsaveable profiles reported success: %+v", res)
+	}
+	if res == nil || res.Invalid != 1 {
+		t.Fatalf("replacement result = %+v, want one rejected link", res)
+	}
+	subs := store.GetSettings().Subscriptions
+	if len(subs) != 1 || subs[0].URL != old.URL {
+		t.Fatalf("feeds after refused repoint = %+v, want only the old feed", subs)
+	}
+	profiles := store.ListProfiles()
+	if len(profiles) != 1 || profiles[0].SubURL != old.URL {
+		t.Fatalf("profiles after refused repoint = %+v, want the old profile and source", profiles)
+	}
+}
+
 // TestImportsAreSerialized: the dedupe set is built before the fetch, so
 // two imports in flight both treat a shared node as new and store it
 // twice — permanently, because SaveProfile matches by id. It is reachable

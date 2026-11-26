@@ -8,6 +8,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -330,36 +331,62 @@ func migrateFromOldAppDataDir(newDir, oldDir string) (bool, error) {
 	return true, nil
 }
 
-// rewriteLegacyPaths renames the old app-data directory inside the
-// migrated JSON. The whole file used to be search-replaced, which also
-// rewrote credentials or profile names that merely contained the old
-// name ("SNI-NekoBox"); only path-shaped strings are touched now.
-// Unparseable JSON is copied verbatim (the loader's own recovery path
-// handles it).
+// rewriteLegacyPaths renames the old app-data directory only in settings
+// that hold filesystem paths. Credentials, profile names, URLs and raw
+// outbound JSON may legitimately contain the same text and must survive
+// byte-for-byte. Unparseable JSON is copied verbatim.
 func rewriteLegacyPaths(raw []byte) []byte {
-	var v any
-	if err := json.Unmarshal(raw, &v); err != nil {
+	var doc map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &doc); err != nil {
 		return raw
 	}
-	var walk func(any)
-	walk = func(node any) {
-		switch n := node.(type) {
-		case map[string]any:
-			for k, val := range n {
-				if s, ok := val.(string); ok {
-					n[k] = rewriteLegacyPathValue(s)
-				} else {
-					walk(val)
-				}
+	var settings map[string]json.RawMessage
+	if err := json.Unmarshal(doc["settings"], &settings); err != nil || settings == nil {
+		return raw
+	}
+	changed := false
+	for _, key := range []string{
+		"corePath", "upstreamCorePath", "xrayPath", "mihomoPath",
+		"aetherPath", "torPath", "logOutputPath", "geoIPDBPath",
+	} {
+		var value string
+		if err := json.Unmarshal(settings[key], &value); err != nil {
+			continue
+		}
+		fixed := rewriteLegacyPathValue(value)
+		if fixed == value {
+			continue
+		}
+		settings[key], _ = json.Marshal(fixed)
+		changed = true
+	}
+	var externals []map[string]json.RawMessage
+	if err := json.Unmarshal(settings["externals"], &externals); err == nil {
+		for _, entry := range externals {
+			var value string
+			if err := json.Unmarshal(entry["exePath"], &value); err != nil {
+				continue
 			}
-		case []any:
-			for _, val := range n {
-				walk(val)
+			fixed := rewriteLegacyPathValue(value)
+			if fixed == value {
+				continue
 			}
+			entry["exePath"], _ = json.Marshal(fixed)
+			changed = true
+		}
+		if changed {
+			settings["externals"], _ = json.Marshal(externals)
 		}
 	}
-	walk(v)
-	out, err := json.Marshal(v)
+	if !changed {
+		return raw
+	}
+	settingsJSON, err := json.Marshal(settings)
+	if err != nil {
+		return raw
+	}
+	doc["settings"] = settingsJSON
+	out, err := json.Marshal(doc)
 	if err != nil {
 		return raw
 	}
@@ -490,11 +517,19 @@ func (c *ConfigStore) SaveProfile(p Profile) (Profile, error) {
 	for i, e := range c.profiles {
 		if e.ID == p.ID {
 			c.profiles[i] = p
-			return p, c.saveLocked()
+			if err := c.saveLocked(); err != nil {
+				c.profiles[i] = e
+				return p, err
+			}
+			return p, nil
 		}
 	}
 	c.profiles = append(c.profiles, p)
-	return p, c.saveLocked()
+	if err := c.saveLocked(); err != nil {
+		c.profiles = c.profiles[:len(c.profiles)-1]
+		return p, err
+	}
+	return p, nil
 }
 
 // UpdateProfile replaces an existing profile in the in-memory store
@@ -590,6 +625,11 @@ func (c *ConfigStore) GetSettings() Settings {
 	if s.CoreEngine == "" {
 		s.CoreEngine = "custom"
 	}
+	limit := defaultConsoleLogLimit
+	if s.ConsoleLogLimit != nil && *s.ConsoleLogLimit >= 0 {
+		limit = *s.ConsoleLogLimit
+	}
+	s.ConsoleLogLimit = &limit
 	// SNI spoofing defaults to ON; configs written before the toggle
 	// existed omit the field. Report the effective value so the UI and
 	// every caller can treat it as a plain bool.
@@ -646,14 +686,69 @@ func cloneSlice[T any](in []T) []T {
 // was added after the snapshot — the profiles stayed, the data vanished
 // on the next restart. Carry the live values over; the backup restore
 // path uses restoreAll, which still replaces everything.
+//
+// The SNI lists are shared rather than backend-owned, so they are merged:
+// the tab's entry set wins, the scanner's stamps are carried over.
 func (c *ConfigStore) SaveSettings(s Settings) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	s.Subscriptions = c.settings.Subscriptions
 	s.AetherScanResults = c.settings.AetherScanResults
 	s.CoreOverrides = c.settings.CoreOverrides
+	s.SNIIPs = mergeSNIIPStamps(s.SNIIPs, c.settings.SNIIPs)
+	s.SNISNIs = mergeSNIStamps(s.SNISNIs, c.settings.SNISNIs)
+	if s.ConsoleLogLimit != nil {
+		limit := *s.ConsoleLogLimit
+		s.ConsoleLogLimit = &limit
+	}
+	previous := c.settings
 	c.settings = s
-	return c.saveLocked()
+	if err := c.saveLocked(); err != nil {
+		c.settings = previous
+		return err
+	}
+	return nil
+}
+
+// mergeSNIIPStamps keeps the live scanner stamps on the entries the tab
+// posts. The tab owns the entry set, Source and Selected; the scanner owns
+// LastOK/LastMs/LastAt/LastTLS and writes them through UpdateSNI, including
+// on a cancelled run. A snapshot taken before that write would erase it.
+func mergeSNIIPStamps(incoming, live []SNIIP) []SNIIP {
+	if len(incoming) == 0 || len(live) == 0 {
+		return incoming
+	}
+	by := make(map[string]SNIIP, len(live))
+	for _, e := range live {
+		by[e.IP] = e
+	}
+	for i := range incoming {
+		if old, ok := by[incoming[i].IP]; ok {
+			incoming[i].LastOK, incoming[i].LastMs = old.LastOK, old.LastMs
+			incoming[i].LastAt, incoming[i].LastTLS = old.LastAt, old.LastTLS
+		}
+	}
+	return incoming
+}
+
+// mergeSNIStamps is mergeSNIIPStamps for the decoy-SNI list, which also
+// carries Plan A's resolved address.
+func mergeSNIStamps(incoming, live []SNISNI) []SNISNI {
+	if len(incoming) == 0 || len(live) == 0 {
+		return incoming
+	}
+	by := make(map[string]SNISNI, len(live))
+	for _, e := range live {
+		by[e.Host] = e
+	}
+	for i := range incoming {
+		if old, ok := by[incoming[i].Host]; ok {
+			incoming[i].LastOK, incoming[i].LastMs = old.LastOK, old.LastMs
+			incoming[i].LastAt, incoming[i].LastTLS = old.LastAt, old.LastTLS
+			incoming[i].LastIP = old.LastIP
+		}
+	}
+	return incoming
 }
 
 // UpdateCoreOverrides applies fn to the live override map under the
@@ -696,8 +791,30 @@ func (c *ConfigStore) updateProfileFields(id string, fn func(*Profile)) (Profile
 func (c *ConfigStore) SetActiveProfileID(id string) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	previous := c.settings.ActiveProfileID
 	c.settings.ActiveProfileID = id
-	return c.saveLocked()
+	if err := c.saveLocked(); err != nil {
+		c.settings.ActiveProfileID = previous
+		return err
+	}
+	return nil
+}
+
+// SetActiveProfileIDIfUnchanged persists id only while the selection still
+// matches the value observed before a long-running Connect started.
+func (c *ConfigStore) SetActiveProfileIDIfUnchanged(id, expected string) (bool, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.settings.ActiveProfileID != expected {
+		return false, nil
+	}
+	previous := c.settings.ActiveProfileID
+	c.settings.ActiveProfileID = id
+	if err := c.saveLocked(); err != nil {
+		c.settings.ActiveProfileID = previous
+		return true, err
+	}
+	return true, nil
 }
 
 // restoreAll atomically replaces settings and profiles with one
@@ -753,6 +870,16 @@ func (c *ConfigStore) UpdateAetherScanResults(fn func([]AetherScanResult) []Aeth
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.settings.AetherScanResults = fn(c.settings.AetherScanResults)
+	return c.saveLocked()
+}
+
+// UpdateAetherKeys applies fn to the persisted WARP-key renewal settings
+// atomically, like UpdateAetherScanResults: a renewal saving while the
+// settings tab saves cannot drop either update.
+func (c *ConfigStore) UpdateAetherKeys(fn func(aetherKeysSettings) aetherKeysSettings) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.settings.AetherKeys = fn(c.settings.AetherKeys)
 	return c.saveLocked()
 }
 
@@ -878,6 +1005,44 @@ func (c *ConfigStore) DeleteProfilesBySource(subURL, group string) (int, error) 
 		return 0, nil
 	}
 	c.profiles = kept
+	return n, c.saveLocked()
+}
+
+// RenameFeedProfiles re-files the profiles one feed owns after its
+// display name changes, and returns how many moved.
+//
+// The feed's own profiles are found by SubURL, which is exact. Matching on
+// the old group name alone also catches a second feed the user gave the
+// same name — one provider handing out two links is ordinary — and every
+// hand-picked profile filed in a remark group that happens to share it, so
+// a rename dragged all of them into the renamed feed's group. Profiles
+// imported before SubURL existed carry no feed pointer at all, so the group
+// name is the only evidence they have; that fallback stands down when the
+// name is also a group the user created.
+//
+// A profile the user moved out of the feed group on purpose keeps the group
+// it was moved to: only rows still carrying the old name follow.
+func (c *ConfigStore) RenameFeedProfiles(subURL, oldName, newName string) (int, error) {
+	if subURL == "" || oldName == "" || newName == "" || oldName == newName {
+		return 0, nil
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	legacy := !slices.Contains(c.settings.ProxyGroups, oldName)
+	n := 0
+	for i := range c.profiles {
+		p := &c.profiles[i]
+		if p.Group != oldName {
+			continue
+		}
+		if p.SubURL == subURL || (legacy && p.SubURL == "") {
+			p.Group = newName
+			n++
+		}
+	}
+	if n == 0 {
+		return 0, nil
+	}
 	return n, c.saveLocked()
 }
 

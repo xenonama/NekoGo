@@ -13,6 +13,73 @@ import * as json$0 from "../encoding/json/models.js";
 import * as jsontext$0 from "../encoding/json/jsontext/models.js";
 
 /**
+ * AetherKeyInfo is one key file of the identity folder and the identity
+ * it holds. Only the device and the addresses WARP gave it are read: the
+ * private key, certificate and access token in the same file are never
+ * read, logged or handed to the GUI.
+ */
+export class AetherKeyInfo {
+    "file": string;
+    "label": string;
+    "present": boolean;
+    "deviceId"?: string;
+    "ipv4"?: string;
+    "ipv6"?: string;
+
+    /** Creates a new AetherKeyInfo instance. */
+    constructor($$source: Partial<AetherKeyInfo> = {}) {
+        if (!("file" in $$source)) {
+            this["file"] = "";
+        }
+        if (!("label" in $$source)) {
+            this["label"] = "";
+        }
+        if (!("present" in $$source)) {
+            this["present"] = false;
+        }
+
+        Object.assign(this, $$source);
+    }
+
+    /**
+     * Creates a new AetherKeyInfo instance from a string or object.
+     */
+    static createFrom($$source: any = {}): AetherKeyInfo {
+        let $$parsedSource = typeof $$source === 'string' ? JSON.parse($$source) : $$source;
+        return new AetherKeyInfo($$parsedSource as Partial<AetherKeyInfo>);
+    }
+}
+
+/**
+ * AetherKeysStatus is the live renewal progress the WARP keys card polls.
+ */
+export class AetherKeysStatus {
+    "running": boolean;
+    "kind"?: string;
+    "startedAt"?: string;
+    "lastError"?: string;
+    "lastErrorAt"?: string;
+    "lastOkAt"?: string;
+
+    /** Creates a new AetherKeysStatus instance. */
+    constructor($$source: Partial<AetherKeysStatus> = {}) {
+        if (!("running" in $$source)) {
+            this["running"] = false;
+        }
+
+        Object.assign(this, $$source);
+    }
+
+    /**
+     * Creates a new AetherKeysStatus instance from a string or object.
+     */
+    static createFrom($$source: any = {}): AetherKeysStatus {
+        let $$parsedSource = typeof $$source === 'string' ? JSON.parse($$source) : $$source;
+        return new AetherKeysStatus($$parsedSource as Partial<AetherKeysStatus>);
+    }
+}
+
+/**
  * AetherScanResult is the endpoint a scan found. One-hop profiles use
  * Host and Port; two-hop profiles use Outer and Inner; WireGuard over
  * MASQUE keeps the profile's own inner endpoint, as PattNG's
@@ -1008,12 +1075,24 @@ export class Settings {
 
     /**
      * TunStack selects the sing-box TUN network stack.
-     * system | gvisor | mixed; empty means the default (system).
-     * "system" hands packets to the OS stack; "gvisor" runs a whole
-     * TCP/IP stack in user space and costs roughly 2-5x the CPU per
-     * byte on Windows, so it stays opt-in.
+     * system | gvisor | mixed; empty means the default (gvisor).
+     * "gvisor" keeps TCP in the core and needs nothing from Windows.
+     * "system" and "mixed" terminate TCP in the OS, which sees the
+     * tunnel's own handshake as a new INBOUND connection to the core and
+     * filters it unless the core is allowed through the firewall — then
+     * DNS answers and TCP times out. They cost less CPU, so they stay
+     * available, but they are not the default.
      */
     "tunStack": string;
+
+    /**
+     * TunOSStackMigrated is the one-time marker for the migration that
+     * moved a stored "system"/"mixed" stack to the default. NekoGo
+     * hardcoded that stack before the setting existed and persisted it on
+     * its first save, so configs predate the fix rather than choosing it.
+     * Once set, a deliberate pick of System/Mixed is never rewritten.
+     */
+    "tunOSStackMigrated"?: boolean;
 
     /**
      * The rest of the TUN group, after PattN's TunModeItem. Every field
@@ -1111,11 +1190,9 @@ export class Settings {
     "mihomoPath"?: string;
 
     /**
-     * CoreEngine selects which sing-box binary runs sing-box profiles and
-     * every sing-box transport (plain, SNI spoof, Aether).
-     * "custom" = nekobox_core.exe (NekoBox fork with Thrift RPC).
-     * "upstream" = official sing-box.exe (CLI only: stats/connections via
-     * its Clash API).
+     * CoreEngine is the preferred core: custom (nekobox_core), upstream
+     * (official sing-box), xray, or mihomo. Unsupported protocols fall back
+     * to custom; raw outbound formats and SNI spoof keep their special routing.
      */
     "coreEngine"?: string;
 
@@ -1123,6 +1200,13 @@ export class Settings {
      * aether.exe override
      */
     "aetherPath"?: string;
+
+    /**
+     * TorPath is the standalone tor.exe override. It is separate from
+     * AetherPath: aether carries Arti, which is not the Tor Project's
+     * own daemon, and the two binaries must never resolve to each other.
+     */
+    "torPath"?: string;
 
     /**
      * en, zh, fa, ru...
@@ -1133,6 +1217,12 @@ export class Settings {
      * debug | info | warn | error (legacy "warning" migrates to "warn" on save)
      */
     "logLevel": string;
+
+    /**
+     * ConsoleLogLimit is the newest number of buffered entries shown in the
+     * Console. Nil keeps the legacy default; zero shows the whole buffer.
+     */
+    "consoleLogLimit"?: number | null;
 
     /**
      * LogOutputPath, when set, makes the GUI append every log line to
@@ -1246,6 +1336,15 @@ export class Settings {
     "spoofPsiphon"?: boolean;
 
     /**
+     * SpoofTor is the same chain with Tor as the exit hop instead of
+     * Psiphon: the spoofed tunnel carries Tor's relays, traffic enters
+     * through the TUN inbound and leaves through a Tor circuit. One exit
+     * chain per leg, so SaveSettings keeps whichever of the two switches
+     * was already there and says which one it dropped.
+     */
+    "spoofTor"?: boolean;
+
+    /**
      * SpoofXray runs a plain CoreSpoof connect on the Xray transport
      * instead of sing-box (nekobox_core). The spoof engine stays the
      * route; only the transport core changes. The SNI spoof + Psiphon
@@ -1271,6 +1370,14 @@ export class Settings {
     "aetherPsiphon"?: boolean;
 
     /**
+     * AetherTor runs Tor on top of an Aether connect through the core's
+     * own chain mode: Tor's relays are dialled through the tunnel, and
+     * the app keeps dialling the Tor listener. A profile that names its
+     * own Tor mode keeps it.
+     */
+    "aetherTor"?: boolean;
+
+    /**
      * Chain Psiphon options (Settings → Chain, advanced mode). They
      * drive the two chain legs only — the SNI-spoof→Psiphon leg (a plain
      * psiphon-only aether run) and the Aether→Psiphon leg — and never a
@@ -1294,6 +1401,39 @@ export class Settings {
     "chainPsiphonCdnIps"?: string;
     "chainPsiphonCdnSni"?: string;
     "chainPsiphonCdnSets"?: string;
+
+    /**
+     * Chain Tor options (Settings → Chain, advanced mode), the Tor
+     * sibling of the Psiphon ones above: they drive the two Tor chain
+     * legs and never a profile's own tunnel.
+     * ChainTorBridges is how the leg reaches the Tor network: auto tries
+     * Tor plainly and turns to fetched bridges where it is blocked,
+     * first goes to bridges at once, never uses none, own uses the lines
+     * below.
+     */
+    "chainTorBridges"?: string;
+
+    /**
+     * ChainTorRelays adds onionoo's running relays to the bridge pool:
+     * auto (alongside bridgedb) | only | off. Consulted only while
+     * bridges are fetched.
+     */
+    "chainTorRelays"?: string;
+
+    /**
+     * ChainTorBridgeLines holds the user's own bridge lines, one per
+     * line, in the shape a torrc uses. Read when ChainTorBridges is own.
+     */
+    "chainTorBridgeLines"?: string;
+
+    /**
+     * ReconnectMode is the Reconnect button: "off" hides it, "restart"
+     * (the default, and what a config without the key meant) takes every
+     * leg down and raises them again, "sticky" hands the SNI-spoof
+     * chain's exit hop to the next connect instead of reaping it. See
+     * reconnect.go.
+     */
+    "reconnectMode"?: string;
 
     /**
      * SNIConfig holds the sni-spoof engine options. Empty/zero values
@@ -1330,6 +1470,13 @@ export class Settings {
      * scan APIs update this list atomically.
      */
     "aetherScanResults"?: AetherScanResult[];
+
+    /**
+     * AetherKeys are the WARP-key renewal knobs of the Aether tab. The
+     * identities themselves live in TOML files beside the core, never in
+     * config.json.
+     */
+    "aetherKeys"?: aetherKeysSettings;
 
     /** Creates a new Settings instance. */
     constructor($$source: Partial<Settings> = {}) {
@@ -1410,42 +1557,46 @@ export class Settings {
      * Creates a new Settings instance from a string or object.
      */
     static createFrom($$source: any = {}): Settings {
-        const $$createField20_0 = $$createType2;
-        const $$createField46_0 = $$createType14;
-        const $$createField51_0 = $$createType15;
-        const $$createField53_0 = $$createType2;
-        const $$createField54_0 = $$createType2;
-        const $$createField65_0 = $$createType16;
-        const $$createField68_0 = $$createType18;
-        const $$createField69_0 = $$createType20;
-        const $$createField70_0 = $$createType22;
+        const $$createField21_0 = $$createType2;
+        const $$createField49_0 = $$createType14;
+        const $$createField54_0 = $$createType15;
+        const $$createField56_0 = $$createType2;
+        const $$createField57_0 = $$createType2;
+        const $$createField74_0 = $$createType16;
+        const $$createField77_0 = $$createType18;
+        const $$createField78_0 = $$createType20;
+        const $$createField79_0 = $$createType22;
+        const $$createField80_0 = $$createType23;
         let $$parsedSource = typeof $$source === 'string' ? JSON.parse($$source) : $$source;
         if ("tunRouteExclude" in $$parsedSource) {
-            $$parsedSource["tunRouteExclude"] = $$createField20_0($$parsedSource["tunRouteExclude"]);
+            $$parsedSource["tunRouteExclude"] = $$createField21_0($$parsedSource["tunRouteExclude"]);
         }
         if ("subscriptions" in $$parsedSource) {
-            $$parsedSource["subscriptions"] = $$createField46_0($$parsedSource["subscriptions"]);
+            $$parsedSource["subscriptions"] = $$createField49_0($$parsedSource["subscriptions"]);
         }
         if ("coreOverrides" in $$parsedSource) {
-            $$parsedSource["coreOverrides"] = $$createField51_0($$parsedSource["coreOverrides"]);
+            $$parsedSource["coreOverrides"] = $$createField54_0($$parsedSource["coreOverrides"]);
         }
         if ("collapsedProxyGroups" in $$parsedSource) {
-            $$parsedSource["collapsedProxyGroups"] = $$createField53_0($$parsedSource["collapsedProxyGroups"]);
+            $$parsedSource["collapsedProxyGroups"] = $$createField56_0($$parsedSource["collapsedProxyGroups"]);
         }
         if ("proxyGroups" in $$parsedSource) {
-            $$parsedSource["proxyGroups"] = $$createField54_0($$parsedSource["proxyGroups"]);
+            $$parsedSource["proxyGroups"] = $$createField57_0($$parsedSource["proxyGroups"]);
         }
         if ("sniConfig" in $$parsedSource) {
-            $$parsedSource["sniConfig"] = $$createField65_0($$parsedSource["sniConfig"]);
+            $$parsedSource["sniConfig"] = $$createField74_0($$parsedSource["sniConfig"]);
         }
         if ("sniIps" in $$parsedSource) {
-            $$parsedSource["sniIps"] = $$createField68_0($$parsedSource["sniIps"]);
+            $$parsedSource["sniIps"] = $$createField77_0($$parsedSource["sniIps"]);
         }
         if ("sniSnis" in $$parsedSource) {
-            $$parsedSource["sniSnis"] = $$createField69_0($$parsedSource["sniSnis"]);
+            $$parsedSource["sniSnis"] = $$createField78_0($$parsedSource["sniSnis"]);
         }
         if ("aetherScanResults" in $$parsedSource) {
-            $$parsedSource["aetherScanResults"] = $$createField70_0($$parsedSource["aetherScanResults"]);
+            $$parsedSource["aetherScanResults"] = $$createField79_0($$parsedSource["aetherScanResults"]);
+        }
+        if ("aetherKeys" in $$parsedSource) {
+            $$parsedSource["aetherKeys"] = $$createField80_0($$parsedSource["aetherKeys"]);
         }
         return new Settings($$parsedSource as Partial<Settings>);
     }
@@ -1596,7 +1747,7 @@ export class SpoofStats {
      * Creates a new SpoofStats instance from a string or object.
      */
     static createFrom($$source: any = {}): SpoofStats {
-        const $$createField8_0 = $$createType24;
+        const $$createField8_0 = $$createType25;
         let $$parsedSource = typeof $$source === 'string' ? JSON.parse($$source) : $$source;
         if ("methods" in $$parsedSource) {
             $$parsedSource["methods"] = $$createField8_0($$parsedSource["methods"]);
@@ -1618,10 +1769,12 @@ export class SpoofStatus {
     "lastError": string;
 
     /**
-     * Chain reports the SNI spoof → Psiphon chain on a live connect;
-     * ChainPort is Psiphon's local SOCKS listener.
+     * Chain reports the SNI spoof → exit-chain leg on a live connect;
+     * ChainDriver names it ("psiphon" or "tor") and ChainPort is that
+     * chain's local SOCKS listener.
      */
     "chain": boolean;
+    "chainDriver": string;
     "chainPort": number;
 
     /** Creates a new SpoofStatus instance. */
@@ -1643,6 +1796,9 @@ export class SpoofStatus {
         }
         if (!("chain" in $$source)) {
             this["chain"] = false;
+        }
+        if (!("chainDriver" in $$source)) {
+            this["chainDriver"] = "";
         }
         if (!("chainPort" in $$source)) {
             this["chainPort"] = 0;
@@ -1703,8 +1859,8 @@ export class Stats {
      * Creates a new Stats instance from a string or object.
      */
     static createFrom($$source: any = {}): Stats {
-        const $$createField2_0 = $$createType25;
-        const $$createField3_0 = $$createType25;
+        const $$createField2_0 = $$createType26;
+        const $$createField3_0 = $$createType26;
         let $$parsedSource = typeof $$source === 'string' ? JSON.parse($$source) : $$source;
         if ("uplinkByTag" in $$parsedSource) {
             $$parsedSource["uplinkByTag"] = $$createField2_0($$parsedSource["uplinkByTag"]);
@@ -1828,7 +1984,7 @@ export class URLTestResult {
  */
 export class UpdatableComponent {
     /**
-     * "geoip" | "geosite" | "singbox" | "nekobox" | "xray" | "mihomo" | "gui"
+     * "geoip" | "geosite" | "singbox" | "nekobox" | "xray" | "mihomo" | "tor" | "psiphon" | "psiphon-servers" | "gui"
      */
     "id": string;
     "name": string;
@@ -1910,6 +2066,59 @@ export class WgKeyPair {
 }
 
 /**
+ * aetherKeysSettings are the WARP keys card's own settings. No profile's
+ * settings reach them and they reach no profile (PattN AetherKeysSettings).
+ */
+export class aetherKeysSettings {
+    /**
+     * all | wg | masque | gool | mim — the kinds --register takes on
+     * aether 2.3.0. gool-classic is a protocol, not a registration.
+     */
+    "kind"?: string;
+
+    /**
+     * EnrollAddress is --enroll-address: where the calls to the WARP API
+     * go. This core has no --api-sni/--api-host; the server name and the
+     * HTTP host stay api.cloudflareclient.com.
+     */
+    "enrollAddress"?: string;
+    "fragment"?: boolean;
+    "fragmentSize"?: string;
+    "fragmentDelay"?: string;
+    "ech"?: boolean;
+    "echDns"?: string;
+    "echDomain"?: string;
+    "fingerprint"?: string;
+
+    /**
+     * Carrier reaches the API through Tor or Psiphon instead of directly
+     * (--tor-reverse / --psiphon-reverse, which this core applies to the
+     * registrations whatever the protocol).
+     */
+    "carrier"?: string;
+
+    /**
+     * Command is blank unless it was edited by hand, and then it runs as
+     * written.
+     */
+    "command"?: string;
+
+    /** Creates a new aetherKeysSettings instance. */
+    constructor($$source: Partial<aetherKeysSettings> = {}) {
+
+        Object.assign(this, $$source);
+    }
+
+    /**
+     * Creates a new aetherKeysSettings instance from a string or object.
+     */
+    static createFrom($$source: any = {}): aetherKeysSettings {
+        let $$parsedSource = typeof $$source === 'string' ? JSON.parse($$source) : $$source;
+        return new aetherKeysSettings($$parsedSource as Partial<aetherKeysSettings>);
+    }
+}
+
+/**
  * aetherSettings is the NekoGo-side Aether profile config: every field a
  * PattNG ProfileItem stores for an Aether profile, minus the ones with
  * no NekoGo equivalent (PattNG's Xray-only finalMask/dialMode, chain
@@ -1947,7 +2156,7 @@ export class aetherSettings {
     "masqueSni"?: string;
 
     /**
-     * chrome|firefox|semi-python|go, empty = chrome
+     * chrome|chrome-120|firefox|semi-python|go, empty = chrome
      */
     "fingerprint"?: string;
 
@@ -2056,6 +2265,7 @@ const $$createType19 = SNISNI.createFrom;
 const $$createType20 = $Create.Array($$createType19);
 const $$createType21 = AetherScanResult.createFrom;
 const $$createType22 = $Create.Array($$createType21);
-const $$createType23 = SpoofRanked.createFrom;
-const $$createType24 = $Create.Array($$createType23);
-const $$createType25 = $Create.Map($Create.Any, $Create.Any);
+const $$createType23 = aetherKeysSettings.createFrom;
+const $$createType24 = SpoofRanked.createFrom;
+const $$createType25 = $Create.Array($$createType24);
+const $$createType26 = $Create.Map($Create.Any, $Create.Any);

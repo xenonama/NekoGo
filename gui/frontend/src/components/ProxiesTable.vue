@@ -20,13 +20,13 @@
         </button>
       </div>
     </div>
-    <template v-else>
       <!-- Main toolbar: higher sticky layer than the filter bar below it,
            so the +Add dropdown (z-index lives inside this toolbar's
            stacking context) is never painted over by the filters row. -->
       <div class="nb-px-toolbar nb-px-toolbar--main">
         <input v-model="search" class="grow nb-field" placeholder="Search name or address..." aria-label="Search proxies" />
         <span class="muted nb-px-count">{{ sortedFiltered.length }} / {{ profiles.profiles.length }}</span>
+        <span v-if="draggingIds.length > 0" class="muted nb-px-drag-hint">Drop on a group header to move</span>
         <div class="nb-px-menu-wrap">
           <button class="nb-act nb-act--primary" title="Add" @click="menuOpen = !menuOpen"><Icon name="plus" :size="14" />Add</button>
           <div v-if="menuOpen" class="nb-px-menu">
@@ -79,7 +79,14 @@
       <div class="nb-px-grid" role="listbox" aria-multiselectable="true" aria-label="Proxy profiles">
         <template v-for="g in visibleGroups" :key="g.name">
         <div
-          v-if="g.total > 1 || g.manual"
+          class="nb-px-section"
+          :class="{ 'is-drop-target': dragOverGroup === g.name }"
+          @dragenter.prevent="onGroupDragEnter(g.name, $event)"
+          @dragover.prevent="onGroupDragOver(g.name, $event)"
+          @dragleave="onGroupDragLeave(g.name, $event)"
+          @drop.prevent="onGroupDrop(g.name, $event)"
+        >
+        <div
           class="nb-px-group"
           :class="{ 'nb-px-group--static': !foldingActive }"
           :role="foldingActive ? 'button' : undefined"
@@ -87,32 +94,46 @@
           :aria-expanded="foldingActive ? !g.folded : undefined"
           :title="foldingActive ? (g.folded ? 'Expand group' : 'Collapse group') : 'Folding applies when nothing is searched or filtered'"
           @click="foldGroup(g.name)"
-          @keydown.enter="foldGroup(g.name)"
-          @keydown.space.prevent="foldGroup(g.name)"
+          @keydown.enter.self="foldGroup(g.name)"
+          @keydown.space.self.prevent="foldGroup(g.name)"
         >
+          <!-- Whole-group selection: the sticky bar acts on a selection,
+               and a group is the unit a user thinks in ("test this feed",
+               "move these into US"). Every member counts, folded or not,
+               so the tick matches the pill beside it. -->
+          <input
+            type="checkbox"
+            class="nb-px-check"
+            :disabled="g.total === 0"
+            :checked="groupSelectionState(g.name) === 'all'"
+            :indeterminate.prop="groupSelectionState(g.name) === 'some'"
+            :aria-label="`Select all in ${g.name || 'Ungrouped'}`"
+            @click.stop
+            @change="toggleGroupSelection(g.name)"
+          />
           <span class="nb-px-chev" :class="{ 'nb-px-chev--off': !foldingActive }">{{ g.folded ? '▸' : '▾' }}</span>
           <span class="nb-px-group-name">{{ g.name || 'Ungrouped' }}</span>
           <span class="nb-px-pill">{{ g.total }}</span>
-          <button
-            v-if="g.empty"
-            class="nb-icon-btn nb-px-group-x"
-            title="Remove this empty group"
-            aria-label="Remove this empty group"
-            @click.stop="removeGroup(g.name)"
-          ><Icon name="x" :size="13" /></button>
+          <span v-if="g.name" class="nb-px-group-actions">
+            <button class="nb-icon-btn" title="Rename group" :aria-label="`Rename group ${g.name}`" :disabled="groupSaving" @click.stop="openRenameGroup(g.name)"><Icon name="pencil" :size="13" /></button>
+            <button class="nb-icon-btn" title="Remove group without deleting profiles" :aria-label="`Remove group ${g.name}`" :disabled="groupSaving" @click.stop="removeGroup(g.name)"><Icon name="x" :size="13" /></button>
+          </span>
         </div>
-        <div v-if="g.total > 0 && ((g.total < 2 && !g.manual) || !g.folded)" class="nb-px-rows">
+        <div v-if="g.total > 0 && !g.folded" class="nb-px-rows">
           <div
             v-for="r in g.rows"
             :key="r.id"
             :data-pid="r.id"
             class="nb-px-row"
-            :class="{ selected: r.selected, active: r.active, failed: r.failedNoLat, 'is-menu-open': rowMenuFor === r.id }"
+            :class="{ selected: r.selected, active: r.active, failed: r.failedNoLat, 'is-menu-open': rowMenuFor === r.id, dragging: draggingIds.includes(r.id) }"
             role="option"
             :aria-selected="r.selected"
             :aria-label="r.ariaLabel"
             tabindex="0"
+            draggable="true"
             data-rowmenu
+            @dragstart="onRowDragStart(r.profile, $event)"
+            @dragend="onRowDragEnd"
             @click="onRowClick(r.profile, $event)"
             @dblclick="onRowDbl(r.profile, $event)"
             @keydown="onRowKeydown(r.profile, $event)"
@@ -180,6 +201,7 @@
             </span>
           </div>
         </div>
+        </div>
         </template>
       </div>
 
@@ -187,7 +209,7 @@
            10k-profile list never puts 10k rows in the DOM at once. -->
       <div v-if="hasMoreRows" ref="moreSentinel" class="nb-px-sentinel" aria-hidden="true" />
 
-      <div v-if="sortedFiltered.length === 0" class="muted nb-px-msg">No proxies match the current search or filters.</div>
+      <div v-if="profiles.profiles.length > 0 && sortedFiltered.length === 0" class="muted nb-px-msg">No proxies match the current search or filters.</div>
 
       <div class="nb-px-bar nb-px-bar--sticky">
         <span>Total: {{ profiles.profiles.length }}</span>
@@ -199,9 +221,9 @@
         <button class="nb-act nb-act--primary" :disabled="selectedIds.size === 0 || busy" @click="testSelected"><Icon name="bolt" :size="14" />Test Selected</button>
         <button v-if="!testAllRunning" class="nb-act nb-act--accent" :disabled="busy || sortedFiltered.length === 0" @click="testAll"><Icon name="bolt" :size="14" />Test All</button>
         <button v-else class="nb-act nb-act--warn" title="Stop the Test All sweep" @click="cancelTestAll"><Icon name="x" :size="14" />Cancel ({{ testAllDone }}/{{ testAllTotal }})</button>
+        <button class="nb-act" :disabled="selectedIds.size === 0" @click="openGroupDialogSelection"><Icon name="folder" :size="14" />Move to group</button>
         <button class="nb-act" :disabled="selectedIds.size === 0" @click="exportSelected"><Icon name="upload" :size="14" />Export Selected</button>
       </div>
-    </template>
     <div v-if="rowCtx.visible" ref="rowCtxMenu" class="nb-ctxmenu" :style="{ left: rowCtx.x + 'px', top: rowCtx.y + 'px' }">
       <button v-for="(it, i) in rowCtx.items" :key="i" class="nb-ctxmenu-item" @click="runCtxItem(it)">
         <Icon v-if="it.icon" :name="it.icon" :size="15" /><span>{{ it.label }}</span>
@@ -212,39 +234,82 @@
          would otherwise become the containing block for the fixed overlay. -->
     <Teleport to="body">
       <div v-if="groupDialog.open" class="nb-modal-overlay" @click.self="closeGroupDialog" @keydown.esc.prevent="closeGroupDialog">
-        <div class="nb-modal" role="dialog" aria-modal="true" :aria-label="groupDialog.profile ? 'Move to group' : 'New group'">
+        <div class="nb-modal" role="dialog" aria-modal="true" :aria-label="groupDialogTitle">
           <div class="nb-modal-head">
-            <span class="nb-section-title">{{ groupDialog.profile ? 'Move to group' : 'New group' }}</span>
+            <span class="nb-section-title">{{ groupDialogTitle }}</span>
             <button class="nb-icon-btn" title="Close" @click="closeGroupDialog"><Icon name="x" :size="18" /></button>
           </div>
           <p class="muted nb-modal-hint">
-            {{ groupDialog.profile
-              ? `Group remark for "${groupDialog.profile.name}". Leave empty to move it to Ungrouped.`
-              : 'Name a remark group. It appears in the list like feed groups, even before profiles are moved into it.' }}
+            {{
+              groupDialog.rename
+                ? `Rename "${groupDialog.rename}" for all its profiles. Subscription names and sources stay unchanged.`
+                : groupDialog.targets.length > 1
+                ? `Choose a group for the ${groupDialog.targets.length} selected profiles.`
+                : groupDialog.targets.length === 1
+                  ? `Choose a group for "${groupDialog.targets[0].name}".`
+                  : 'Name a remark group. It appears in the list like feed groups, even before profiles are moved into it.'
+            }}
           </p>
-          <p class="muted nb-modal-hint">Tip: focus a row and hold Alt + ↑ / ↓ to move it into the group above or below.</p>
-          <label class="nb-sub-field">
+          <p class="muted nb-modal-hint">Tip: drag a config onto a group header to move it, or focus a row and hold Alt + ↑ / ↓.</p>
+          <!-- Move: an explicit, themed group list. The old free-text
+               datalist was a native popup that rendered poorly in the
+               WebView and made the target hard to see and pick. -->
+          <template v-if="groupDialog.targets.length > 0 && !groupDialog.rename">
+            <div class="nb-group-pick" role="listbox" aria-label="Target group">
+              <button
+                v-for="opt in moveGroupChoices"
+                :key="opt.value"
+                type="button"
+                class="nb-group-opt"
+                :class="{ active: !moveNew && moveTarget === opt.value }"
+                role="option"
+                :aria-selected="!moveNew && moveTarget === opt.value"
+                @click="chooseMoveGroup(opt.value)"
+              >
+                <Icon :name="opt.value ? 'folder' : 'servers'" :size="14" />
+                <span class="nb-group-opt-name">{{ opt.label }}</span>
+                <span class="nb-group-opt-count">{{ opt.count }}</span>
+                <Icon v-if="!moveNew && moveTarget === opt.value" name="check" :size="14" />
+              </button>
+              <button
+                type="button"
+                class="nb-group-opt nb-group-opt--new"
+                :class="{ active: moveNew }"
+                @click="chooseNewGroup"
+              >
+                <Icon name="plus" :size="14" />
+                <span class="nb-group-opt-name">New group…</span>
+                <Icon v-if="moveNew" name="check" :size="14" />
+              </button>
+            </div>
+            <label v-if="moveNew" class="nb-sub-field">
+              <span class="muted">New group name</span>
+              <input
+                ref="groupInput"
+                v-model="groupName"
+                placeholder="e.g. US nodes"
+                @keydown.enter.prevent="submitGroupDialog"
+              />
+            </label>
+          </template>
+          <label v-else class="nb-sub-field">
             <span class="muted">Group remark</span>
             <input
               ref="groupInput"
               v-model="groupName"
-              list="nb-group-names"
               placeholder="e.g. US nodes"
               @keydown.enter.prevent="submitGroupDialog"
             />
           </label>
-          <datalist id="nb-group-names">
-            <option v-for="g in groupNames" :key="g" :value="g" />
-          </datalist>
           <div v-if="groupErr" class="nb-conn-err">{{ groupErr }}</div>
           <div class="nb-modal-foot">
             <button class="nb-act nb-act--ghost" @click="closeGroupDialog"><Icon name="x" :size="14" />Cancel</button>
             <button
               class="nb-act nb-act--primary"
-              :disabled="groupSaving || (!groupDialog.profile && !groupName.trim())"
+              :disabled="!canSubmitGroupDialog"
               @click="submitGroupDialog"
             >
-              <Icon name="check" :size="14" />{{ groupSaving ? 'Saving…' : groupDialog.profile ? 'Move' : 'Create' }}
+              <Icon name="check" :size="14" />{{ groupSaving ? 'Saving…' : groupDialog.rename ? 'Rename' : groupDialog.targets.length ? 'Move' : 'Create' }}
             </button>
           </div>
         </div>
@@ -261,10 +326,12 @@ import { useProfilesStore } from '../stores/profiles'
 import { useConnectionStore } from '../stores/connection'
 import { useSettingsStore } from '../stores/settings'
 import { useSubscriptionsStore } from '../stores/subscriptions'
+import { useConfirmStore } from '../stores/confirm'
 import { reloadProfilesAndSubs } from '../stores/sync'
 import { backend } from '../api'
 import { copyText } from '../clipboard'
 import { flagEmoji, isStale, latencyClass } from '../data/servers'
+import { profileEndpointLabel } from '../aether'
 import type { Profile } from '../types'
 
 const emit = defineEmits<{
@@ -276,6 +343,7 @@ const emit = defineEmits<{
 const profiles = useProfilesStore()
 const connection = useConnectionStore()
 const settings = useSettingsStore()
+const confirmBox = useConfirmStore()
 
 const search = ref('')
 const sortKey = ref('name')
@@ -398,8 +466,8 @@ const groupNames = computed(() =>
 
 const groupOptions = computed<PickOption[]>(() => [
   { value: '', label: 'All groups' },
-  { value: '__none__', label: 'No group' },
-  ...groupNames.value.map((g) => ({ value: g, label: g })),
+  { value: 'ungrouped', label: 'No group' },
+  ...groupNames.value.map((g) => ({ value: `group:${g}`, label: g })),
 ])
 
 onMounted(async () => {
@@ -528,16 +596,16 @@ function makeRow(p: Profile, isSingleInGroup: boolean): PxRow {
   const selected = selectedIds.value.has(p.id)
   const active = isActive(p.id)
   const spoof = p.core === 2
-  const mihomo = p.core === 3
+  const mihomo = !!p.rawOutbound?.trim() && p.core === 3
   const aether = p.protocol.toLowerCase() === 'aether'
   const proto = p.protocol.toUpperCase()
-  const addr = `${p.address}:${p.port}`
+  const addr = profileEndpointLabel(p)
   const net = p.network ? (p.tls ? `${p.network} · tls` : p.network) : 'tcp'
   const latClass = stale ? 'lat-stale' : latencyClass(lat)
   const latTitle = stale ? 'Measured over 1 hour ago' : 'Measured latency'
   const flag = flagEmoji(p.countryCode ?? '')
   const lastTitle = `Last connected: ${relTime(p.lastConnectedAt)}`
-  const ariaLabel = `${p.name}, ${p.address}:${p.port}`
+  const ariaLabel = `${p.name}, ${addr}`
   const failTitle = failed && profiles.lastErrorAt[p.id]
     ? `${profiles.lastError[p.id]} (failed ${relTime(profiles.lastErrorAt[p.id])})`
     : failed ? profiles.lastError[p.id] : ''
@@ -575,9 +643,9 @@ const sortedFiltered = computed(() => {
   let rows = profiles.profiles.filter((p) => {
     if (q && !(p.name.toLowerCase().includes(q) || p.address.toLowerCase().includes(q))) return false
     if (fGroup.value) {
-      if (fGroup.value === '__none__') {
+      if (fGroup.value === 'ungrouped') {
         if (p.group) return false
-      } else if ((p.group ?? '') !== fGroup.value) return false
+      } else if (`group:${p.group ?? ''}` !== fGroup.value) return false
     }
     if (fProto.value && p.protocol.toLowerCase() !== fProto.value) return false
     if (fStatus.value === 'active' && !isActive(p.id)) return false
@@ -609,7 +677,7 @@ const groupEntries = computed<[string, Profile[]][]>(() => {
   // them, unless a search/type/status filter is narrowing the list.
   if (!search.value.trim() && !fProto.value && !fStatus.value) {
     for (const g of manualGroups.value) {
-      if (fGroup.value && fGroup.value !== g) continue
+      if (fGroup.value && fGroup.value !== `group:${g}`) continue
       if (!map.has(g)) map.set(g, [])
     }
   }
@@ -631,11 +699,8 @@ const foldedNow = computed(() => (foldingActive.value ? collapsed.value : noFold
 const flatRows = computed<PxRow[]>(() => {
   const out: PxRow[] = []
   for (const [name, rows] of groupEntries.value) {
-    // Manual groups always carry a header (even for one row), so their
-    // collapse state applies at any count; feed groups only fold at 2+.
-    const manual = manualGroups.value.includes(name)
-    if ((rows.length >= 2 || manual) && foldedNow.value.has(name)) continue
-    for (const p of rows) out.push(makeRow(p, rows.length < 2 && !manual))
+    if (foldedNow.value.has(name)) continue
+    for (const p of rows) out.push(makeRow(p, false))
   }
   return out
 })
@@ -656,23 +721,22 @@ const visibleGroups = computed(() => {
   for (const [name, rows] of groupEntries.value) {
     const manual = manualGroups.value.includes(name)
     const empty = rows.length === 0 && manual
-    const folded = (rows.length >= 2 || manual) && foldedNow.value.has(name)
+    const folded = foldedNow.value.has(name)
     if (folded) {
       out.push({ name, total: rows.length, rows: [], empty, manual, folded })
       continue
     }
-    if (used >= limit) break
-    const take = rows.slice(0, limit - used)
+    // Headers remain reachable even when the row budget is exhausted.
+    const take = rows.slice(0, Math.max(0, limit - used))
     out.push({
       name,
       total: rows.length,
-      rows: take.map((p) => makeRow(p, rows.length < 2 && !manual)),
+      rows: take.map((p) => makeRow(p, false)),
       empty,
       manual,
       folded,
     })
     used += take.length
-    if (take.length < rows.length) break
   }
   return out
 })
@@ -682,8 +746,7 @@ const renderedRowCount = computed(() =>
 )
 const totalShownRows = computed(() =>
   groupEntries.value.reduce((n, [name, rows]) => {
-    const manual = manualGroups.value.includes(name)
-    const folded = (rows.length >= 2 || manual) && foldedNow.value.has(name)
+    const folded = foldedNow.value.has(name)
     return n + (folded ? 0 : rows.length)
   }, 0),
 )
@@ -707,30 +770,101 @@ function toggleGroup(name: string) {
   batchCount.value = 1
 }
 
-// Group editor: one modal both creates a remark group (profile = null)
-// and moves a single profile into a group. window.prompt is avoided so
-// the flow looks like the rest of the app and works in the WebView.
-const groupDialog = reactive<{ open: boolean; profile: Profile | null }>({ open: false, profile: null })
+// Group editor: one modal that names a new remark group (no targets),
+// moves the profile a row menu was opened from, or re-files a whole
+// selection handed over by the sticky bar. window.prompt is avoided so the
+// flow looks like the rest of the app and works in the WebView.
+const groupDialog = reactive<{ open: boolean; targets: Profile[]; rename: string }>({ open: false, targets: [], rename: '' })
+const groupDialogTitle = computed(() => groupDialog.rename ? 'Rename group' : groupDialog.targets.length ? 'Move to group' : 'New group')
 const groupName = ref('')
 const groupErr = ref('')
 const groupSaving = ref(false)
 const groupInput = ref<HTMLInputElement | null>(null)
+// Move dialog: the chosen target ('' is Ungrouped, null means "not chosen
+// yet") and whether the user is typing a brand-new group name instead.
+const moveTarget = ref<string | null>(null)
+const moveNew = ref(false)
 
-function openGroupDialog(profile: Profile | null) {
-  groupDialog.profile = profile
-  groupName.value = profile?.group ?? ''
+const moveGroupChoices = computed(() => {
+  const counts = new Map<string, number>()
+  for (const p of profiles.profiles) {
+    const g = p.group ?? ''
+    counts.set(g, (counts.get(g) ?? 0) + 1)
+  }
+  return [
+    { value: '', label: 'Ungrouped', count: counts.get('') ?? 0 },
+    ...groupNames.value.map((g) => ({ value: g, label: g, count: counts.get(g) ?? 0 })),
+  ]
+})
+
+const canSubmitGroupDialog = computed(() => {
+  if (groupSaving.value) return false
+  if (groupDialog.rename) return !!groupName.value.trim() && groupName.value.trim() !== groupDialog.rename
+  if (groupDialog.targets.length === 0) return !!groupName.value.trim()
+  if (moveNew.value) return !!groupName.value.trim()
+  if (moveTarget.value === null) return false
+  // Choosing the group every target already sits in is a no-op, so the
+  // Move button stays disabled instead of writing a pointless save.
+  return !groupDialog.targets.every((p) => (p.group ?? '') === moveTarget.value)
+})
+
+function openGroupDialogFor(targets: Profile[]) {
+  if (groupSaving.value) return
+  groupDialog.rename = ''
+  groupDialog.targets = targets
+  // Only a lone profile can be prefilled: a selection straddles groups, so
+  // the user must pick a target explicitly instead of moving everything to
+  // whichever group happened to be first.
+  groupName.value = targets.length === 1 ? (targets[0].group ?? '') : ''
+  moveTarget.value = targets.length === 1 ? (targets[0].group ?? '') : null
+  moveNew.value = false
   groupErr.value = ''
   groupDialog.open = true
   void nextTick(() => {
-    groupInput.value?.focus()
-    groupInput.value?.select()
+    if (targets.length === 0) {
+      groupInput.value?.focus()
+      groupInput.value?.select()
+    }
   })
 }
 
-function closeGroupDialog() {
-  groupDialog.open = false
-  groupDialog.profile = null
+function openGroupDialog(profile: Profile | null) {
+  openGroupDialogFor(profile ? [profile] : [])
+}
+
+function openGroupDialogSelection() {
+  openGroupDialogFor(profiles.profiles.filter((p) => selectedIds.value.has(p.id)))
+}
+
+function openRenameGroup(name: string) {
+  if (groupSaving.value) return
+  openGroupDialogFor([])
+  groupDialog.rename = name
+  groupName.value = name
+}
+
+function chooseMoveGroup(value: string) {
+  moveNew.value = false
+  moveTarget.value = value
+  groupName.value = value
   groupErr.value = ''
+}
+
+function chooseNewGroup() {
+  moveNew.value = true
+  moveTarget.value = null
+  groupName.value = ''
+  groupErr.value = ''
+  void nextTick(() => groupInput.value?.focus())
+}
+
+function closeGroupDialog() {
+  if (groupSaving.value) return
+  groupDialog.open = false
+  groupDialog.targets = []
+  groupErr.value = ''
+  moveTarget.value = null
+  moveNew.value = false
 }
 
 /** Persist a newly named group; it shows up like feed groups even while
@@ -748,46 +882,85 @@ async function createGroup(name: string) {
       throw e
     }
   }
-  msg.value = `Group "${name}" added. Move profiles in from a row's ⋯ menu.`
+  msg.value = `Group "${name}" added. Move profiles in from a row's ⋯ menu or the bar under the list.`
+}
+
+/** Persist one move for a set of profiles; shared by the modal and by
+ *  drag-and-drop so both paths validate and report the same way. */
+async function persistMove(targets: Profile[], name: string) {
+  let moved = 0
+  let failed = 0
+  let lastName = ''
+  let firstErr = ''
+  for (const target of targets) {
+    if ((target.group ?? '') === name) continue
+    try {
+      await profiles.save({ ...target, group: name || undefined })
+      moved++
+      lastName = target.name
+    } catch (e) {
+      failed++
+      if (!firstErr) firstErr = String(e)
+    }
+  }
+  return { moved, failed, lastName, firstErr }
 }
 
 async function submitGroupDialog() {
   if (groupSaving.value) return
-  const profile = groupDialog.profile
+  const targets = groupDialog.targets
   const typed = groupName.value.trim()
-  // "Ungrouped" is the display label for an empty group value, so typing
-  // it is the same as leaving the box empty.
-  const name = typed === 'Ungrouped' ? '' : typed
+  const moving = targets.length > 0 && !groupDialog.rename
+  let name = typed
   groupErr.value = ''
-  if (!profile) {
+  if (moving && !moveNew.value) {
+    if (moveTarget.value === null) {
+      groupErr.value = 'Choose a group or create a new one.'
+      return
+    }
+    name = moveTarget.value
+  } else if (moving && !typed) {
+    groupErr.value = 'Enter a group name.'
+    return
+  }
+  if (groupDialog.rename && name === groupDialog.rename) {
+    closeGroupDialog()
+    return
+  }
+  if (targets.length === 0) {
     if (!name) {
       groupErr.value = 'Enter a group name.'
       return
     }
-    if (groupNames.value.includes(name)) {
+    if (groupNames.value.includes(name) && name !== groupDialog.rename) {
       groupErr.value = `A group named "${name}" already exists.`
       return
     }
-  } else if (name === (profile.group ?? '')) {
+  } else if (targets.length === 1 && name === (targets[0].group ?? '')) {
     closeGroupDialog()
     return
   }
   groupSaving.value = true
   try {
-    if (!profile) {
+    if (groupDialog.rename) {
+      const oldName = groupDialog.rename
+      if (backend.available()) await backend.renameProxyGroup(oldName, name)
+      applyGroupChange(oldName, name)
+      msg.value = `Group "${oldName}" renamed to "${name}".`
+    } else if (targets.length === 0) {
       await createGroup(name)
     } else {
-      // Re-file the profile via saveProfile; a name typed here becomes a
-      // persistent group so it survives the profile moving out later.
-      // Capture "new" before the save: afterwards the profile itself
-      // already makes the name part of groupNames.
+      // Re-file the profiles via saveProfile; a name typed here becomes a
+      // persistent group so it survives the profiles moving out later.
+      // Capture "new" before the saves: afterwards the profiles themselves
+      // already make the name part of groupNames.
       const isNewGroup = !!name && !groupNames.value.includes(name)
       // A folded destination — or a stale fold entry under a name that is
-      // only now coming back — would swallow the moved row, so reveal it.
+      // only now coming back — would swallow the moved rows, so reveal it.
       const revealed = uncollapse(name)
-      await profiles.save({ ...profile, group: name || undefined })
+      const { moved, failed, lastName, firstErr } = await persistMove(targets, name)
       if (revealed) batchCount.value = 1
-      if (isNewGroup) {
+      if (isNewGroup && moved > 0) {
         const prev = manualGroups.value
         settings.settings.proxyGroups = [...prev, name]
         if (backend.available()) {
@@ -800,9 +973,21 @@ async function submitGroupDialog() {
       } else if (revealed && backend.available()) {
         void settings.save().catch(() => {})
       }
-      msg.value = name ? `Moved "${profile.name}" to "${name}".` : `Moved "${profile.name}" to Ungrouped.`
+      const where = name ? `"${name}"` : 'Ungrouped'
+      if (failed > 0) {
+        msg.value = `Moved ${moved} of ${targets.length} profiles into ${where}; ${firstErr}`
+      } else if (moved === 0) {
+        msg.value = `All ${targets.length} profiles are already in ${where}.`
+      } else if (moved === 1) {
+        msg.value = `Moved "${lastName}" to ${where}.`
+      } else {
+        msg.value = `Moved ${moved} profiles to ${where}.`
+      }
     }
-    closeGroupDialog()
+    groupDialog.open = false
+    groupDialog.targets = []
+    moveTarget.value = null
+    moveNew.value = false
   } catch (e) {
     groupErr.value = String(e)
   } finally {
@@ -810,18 +995,40 @@ async function submitGroupDialog() {
   }
 }
 
-/** Remove a manual group; the button is only offered for empty ones. */
+function applyGroupChange(oldName: string, newName: string) {
+  for (const p of profiles.profiles) {
+    if (p.group === oldName) p.group = newName || undefined
+  }
+  settings.settings.proxyGroups = [...new Set([
+    ...manualGroups.value.filter((g) => g !== oldName),
+    ...(newName ? [newName] : []),
+  ])]
+  const next = new Set(collapsed.value)
+  const folded = next.delete(oldName)
+  if (folded && newName) next.add(newName)
+  collapsed.value = next
+  settings.settings.collapsedProxyGroups = [...next]
+  if (fGroup.value === `group:${oldName}`) fGroup.value = newName ? `group:${newName}` : ''
+  batchCount.value = 1
+}
+
 async function removeGroup(name: string) {
-  if (!confirm(`Remove the empty group "${name}"?`)) return
-  const prev = manualGroups.value
-  settings.settings.proxyGroups = prev.filter((g) => g !== name)
-  uncollapse(name)
-  if (!backend.available()) return
+  if (groupSaving.value) return
+  const accepted = await confirmBox.ask({
+    title: 'Remove group',
+    body: `Remove "${name}"? Its profiles will move to Ungrouped. No profiles or subscriptions will be deleted.`,
+    confirmLabel: 'Remove group',
+  })
+  if (!accepted || groupSaving.value) return
+  groupSaving.value = true
   try {
-    await settings.save()
+    if (backend.available()) await backend.removeProxyGroup(name)
+    applyGroupChange(name, '')
+    msg.value = `Group "${name}" removed; profiles kept in Ungrouped.`
   } catch (e) {
-    settings.settings.proxyGroups = prev
     msg.value = String(e)
+  } finally {
+    groupSaving.value = false
   }
 }
 
@@ -840,6 +1047,99 @@ function uncollapse(name: string): boolean {
 // Alt+ArrowUp/Down walks a config through the group list instead of
 // through the rows, so a keyboard-only re-filing never needs the ⋯ menu.
 const groupMoving = ref(false)
+
+// --- Drag a config onto a group header (or anywhere inside that group's
+// section) to re-file it. Dragging a row that is part of a multi-selection
+// moves the whole selection, matching Delete/Test/Export Selected. ---
+const draggingIds = ref<string[]>([])
+const dragOverGroup = ref<string | null>(null)
+
+function clearDragState() {
+  draggingIds.value = []
+  dragOverGroup.value = null
+}
+
+function onRowDragStart(p: Profile, e: DragEvent) {
+  if (busy.value || groupSaving.value || groupMoving.value) {
+    e.preventDefault()
+    return
+  }
+  // Buttons, checkboxes and inputs keep their normal click/drag behavior;
+  // only dragging the row body starts a move.
+  const t = e.target as HTMLElement | null
+  if (t?.closest('button,input,a,select,textarea')) {
+    e.preventDefault()
+    return
+  }
+  const ids = selectedIds.value.has(p.id) && selectedIds.value.size > 1
+    ? [...selectedIds.value]
+    : [p.id]
+  draggingIds.value = ids
+  dragOverGroup.value = null
+  if (e.dataTransfer) {
+    e.dataTransfer.effectAllowed = 'move'
+    // WebView/Firefox require a payload before a drag is allowed at all.
+    e.dataTransfer.setData('text/plain', ids.join('\n'))
+  }
+}
+
+function onRowDragEnd() {
+  clearDragState()
+}
+
+function onGroupDragEnter(name: string, e: DragEvent) {
+  if (draggingIds.value.length === 0) return
+  e.preventDefault()
+  dragOverGroup.value = name
+}
+
+function onGroupDragOver(name: string, e: DragEvent) {
+  if (draggingIds.value.length === 0) return
+  e.preventDefault()
+  if (e.dataTransfer) e.dataTransfer.dropEffect = 'move'
+  dragOverGroup.value = name
+}
+
+function onGroupDragLeave(name: string, e: DragEvent) {
+  if (dragOverGroup.value !== name) return
+  const section = e.currentTarget as HTMLElement | null
+  const next = e.relatedTarget as Node | null
+  if (section && next && section.contains(next)) return
+  dragOverGroup.value = null
+}
+
+async function onGroupDrop(name: string, e: DragEvent) {
+  if (draggingIds.value.length === 0) return
+  const ids = [...draggingIds.value]
+  clearDragState()
+  const targets = profiles.profiles.filter((p) => ids.includes(p.id))
+  if (targets.length === 0) return
+  if (targets.every((p) => (p.group ?? '') === name)) {
+    msg.value = `Already in ${name ? `"${name}"` : 'Ungrouped'}.`
+    return
+  }
+  if (groupMoving.value || groupSaving.value) return
+  groupMoving.value = true
+  try {
+    // A folded destination would swallow the moved rows, so reveal it.
+    const revealed = uncollapse(name)
+    const { moved, failed, lastName, firstErr } = await persistMove(targets, name)
+    if (revealed) batchCount.value = 1
+    if (revealed && backend.available()) void settings.save().catch(() => {})
+    const where = name ? `"${name}"` : 'Ungrouped'
+    if (failed > 0) {
+      msg.value = `Moved ${moved} of ${targets.length} profiles into ${where}; ${firstErr}`
+    } else if (moved === 1) {
+      msg.value = `Moved "${lastName}" to ${where}.`
+    } else {
+      msg.value = `Moved ${moved} profiles to ${where}.`
+    }
+  } catch (e) {
+    msg.value = String(e)
+  } finally {
+    groupMoving.value = false
+  }
+}
 
 async function moveAcrossGroups(p: Profile, delta: number) {
   if (groupMoving.value) return
@@ -895,6 +1195,30 @@ function toggleSelect(id: string) {
 
 function clearSelection() {
   selectedIds.value = new Set()
+}
+
+function membersOfGroup(name: string): Profile[] {
+  return groupEntries.value.find(([g]) => g === name)?.[1] ?? []
+}
+
+/** 'all' | 'some' | 'none' over the profiles a group holds right now. */
+function groupSelectionState(name: string): 'all' | 'some' | 'none' {
+  const rows = membersOfGroup(name)
+  if (rows.length === 0) return 'none'
+  const n = rows.reduce((acc, p) => acc + (selectedIds.value.has(p.id) ? 1 : 0), 0)
+  return n === 0 ? 'none' : n === rows.length ? 'all' : 'some'
+}
+
+/** Tick or clear a whole group; a partly selected group completes. */
+function toggleGroupSelection(name: string) {
+  const rows = membersOfGroup(name)
+  const next = new Set(selectedIds.value)
+  const all = rows.length > 0 && rows.every((p) => next.has(p.id))
+  for (const p of rows) {
+    if (all) next.delete(p.id)
+    else next.add(p.id)
+  }
+  selectedIds.value = next
 }
 
 // --- Selection: a plain click (or a keyboard move) selects exactly one

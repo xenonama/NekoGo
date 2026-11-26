@@ -92,13 +92,13 @@ func TestP3PickGUIAssetAnchored(t *testing.T) {
 // BUG-042: TrayController.visible is mutex-guarded and read back.
 func TestP3TrayVisibleGuarded(t *testing.T) {
 	tc := &TrayController{}
-	tc.setVisible(true)
+	tc.Show()
 	if !tc.IsVisible() {
-		t.Fatal("IsVisible = false after setVisible(true)")
+		t.Fatal("IsVisible = false after Show()")
 	}
-	tc.setVisible(false)
+	tc.Hide()
 	if tc.IsVisible() {
-		t.Fatal("IsVisible = true after setVisible(false)")
+		t.Fatal("IsVisible = true after Hide()")
 	}
 	// Concurrent Show/Hide on a nil-tray controller must not race
 	// (run with -race in CI).

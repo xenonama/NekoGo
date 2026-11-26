@@ -23,6 +23,17 @@ func main() {
 }
 
 func run() error {
+	// Exclude duplicates before config, core reaping, or proxy recovery. An
+	// elevated relaunch only waits for its parent; it takes this same guard.
+	instance, err := acquireSingleInstance(singleInstanceScope, os.Args[1:])
+	if err != nil {
+		return fmt.Errorf("single instance: %w", err)
+	}
+	if instance == nil {
+		return nil
+	}
+	defer instance.Close()
+
 	// GC tuning: the GUI idles at ~35 MB RSS (measured) with a 1 s
 	// poll, so the default GOGC=100 collects more often than it needs
 	// to. A relaxed target trades a little RSS for less GC CPU, and the
@@ -37,6 +48,9 @@ func run() error {
 	if err != nil {
 		return fmt.Errorf("config: %w", err)
 	}
+	// The tray menu is native UI, so Windows has to be told the theme
+	// before it draws one (tray_theme_windows.go).
+	applyTrayTheme(store.GetSettings().Theme)
 
 	appSvc := NewApp(store, logCh)
 
@@ -111,6 +125,8 @@ func run() error {
 		Frameless: true,
 	})
 
+	instance.watchWindow(window)
+
 	// CASE A (beta.20): RegisterHook runs synchronously before the
 	// framework's internal destroy-listener; event.Cancel() aborts the
 	// close so the window can hide to tray instead. On Windows the OS
@@ -158,18 +174,7 @@ func run() error {
 				}
 			},
 			OnDisconnect: func() {
-				// Disconnect during a probe aborts it promptly via the
-				// CoreManager epoch (no lock pile-up); still honor the
-				// busy flag so a double-click cannot interleave two stops.
-				if appSvc.IsConnectBusy() {
-					appSvc.emitLog("tray", "info", "[tray] disconnect skipped: connect in flight, use Stop once settled")
-					return
-				}
-				if err := appSvc.Disconnect(); err != nil {
-					msg := fmt.Sprintf("[tray] ERROR disconnect: %v", err)
-					appSvc.emitLog("tray", "error", msg)
-					appSvc.noteError(msg)
-				}
+				runTrayDisconnect(appSvc)
 			},
 			OnSelectProfile: func(id string) {
 				// Servers-submenu pick: same guarded path as Connect,

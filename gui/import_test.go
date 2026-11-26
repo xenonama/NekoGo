@@ -172,7 +172,7 @@ func TestParseTrojan(t *testing.T) {
 	}
 }
 
-// TestParseTrojanSpoofPromptLinks pins the three prompt.txt configs:
+// TestParseTrojanSpoofFixtureLinks pins the three fixture links:
 // the normal config stays on its normal core (no spoof tag: an IPv6
 // literal never auto-tags), while both spoof configs auto-detect
 // CoreSpoof (spoof tag) — the chained loopback shape (APPXA, served
@@ -180,8 +180,8 @@ func TestParseTrojan(t *testing.T) {
 // direct dial is DPI-blocked). Both omit type=ws but carry ws-only
 // path/host. Flows through every sync path (preview/import/
 // subscription share parseOneLink).
-func TestParseTrojanSpoofPromptLinks(t *testing.T) {
-	normal := mustParse(t, "trojan://5504eaa8-1395-402f-8e0e-75ecd762e627@[2a06:98c1:3101::6812:202f]:443?alpn=http%2F1.1&fp=chrome&host=nat3.xxai.dpdns.org&path=%2Fanyway&security=tls&sni=nat3.xxai.dpdns.org&type=ws#@DeltaKroneckerGithub%20%7C%201877b3")
+func TestParseTrojanSpoofFixtureLinks(t *testing.T) {
+	normal := mustParse(t, "trojan://11111111-1111-1111-1111-111111111111@[2001:db8::6812:202f]:443?alpn=http%2F1.1&fp=chrome&host=cdn.node.example&path=%2Fanyway&security=tls&sni=cdn.node.example&type=ws#FreeNode")
 	if normal.Core.IsSpoof() {
 		t.Fatalf("normal config core = %v, want normal (IP literals never auto-tag)", normal.Core)
 	}
@@ -189,7 +189,7 @@ func TestParseTrojanSpoofPromptLinks(t *testing.T) {
 		t.Fatalf("normal config network = %q, want ws", normal.Network)
 	}
 
-	direct := mustParse(t, "trojan://humanity@www.calmlunch.com:443?host=www.calmlunch.com&path=%2Fassignment&security=tls&sni=www.calmlunch.com#Test-CF")
+	direct := mustParse(t, "trojan://pw@www.node.example:443?host=www.node.example&path=%2Fassignment&security=tls&sni=www.node.example#Test-CF")
 	if direct.Protocol != "trojan" || !direct.TLS {
 		t.Fatalf("direct spoof proto/tls = %q/%v, want trojan/true", direct.Protocol, direct.TLS)
 	}
@@ -199,17 +199,17 @@ func TestParseTrojanSpoofPromptLinks(t *testing.T) {
 	if !direct.Core.IsSpoof() {
 		t.Fatalf("direct config core = %v, want spoof (direct domain shape auto-tags like loopback)", direct.Core)
 	}
-	if direct.Address != "www.calmlunch.com" || direct.Port != 443 {
-		t.Fatalf("direct spoof endpoint = %s:%d, want www.calmlunch.com:443", direct.Address, direct.Port)
+	if direct.Address != "www.node.example" || direct.Port != 443 {
+		t.Fatalf("direct spoof endpoint = %s:%d, want www.node.example:443", direct.Address, direct.Port)
 	}
-	if direct.ServerName != "www.calmlunch.com" || direct.Path != "/assignment" || direct.Host != "www.calmlunch.com" {
+	if direct.ServerName != "www.node.example" || direct.Path != "/assignment" || direct.Host != "www.node.example" {
 		t.Fatalf("direct spoof sni/path/host = %q/%q/%q", direct.ServerName, direct.Path, direct.Host)
 	}
 	if direct.Name != "Test-CF" {
 		t.Fatalf("direct spoof name = %q, want Test-CF", direct.Name)
 	}
 
-	chained := mustParse(t, "trojan://humanity@127.0.0.1:40443?host=www.calmlunch.com&path=%2Fassignment&security=tls&sni=www.calmlunch.com&type=ws#APPXA")
+	chained := mustParse(t, "trojan://pw@127.0.0.1:40443?host=www.node.example&path=%2Fassignment&security=tls&sni=www.node.example&type=ws#APPXA")
 	if chained.Network != "ws" || !chained.Core.IsSpoof() {
 		t.Fatalf("chained spoof network/core = %q/%v, want ws/spoof", chained.Network, chained.Core)
 	}
@@ -315,25 +315,25 @@ func TestParseSSPlaintextSpecials(t *testing.T) {
 func TestParseSSQueryShape(t *testing.T) {
 	// Generated subscriptions routinely carry an empty query before the
 	// name, which used to leave "?" glued to the port: "ss: bad port 443?".
-	userinfo := base64.URLEncoding.EncodeToString([]byte("chacha20-ietf-poly1305:ARgvGZywA+gacgGV26Bvmu05+wZmRW/j+AdU+Z8Bt44="))
-	p := mustParse(t, "ss://"+userinfo+"@185.213.23.63:990?#%40DeltaKroneckerGithub")
+	userinfo := base64.URLEncoding.EncodeToString([]byte("chacha20-ietf-poly1305:Example+Key/with=punct"))
+	p := mustParse(t, "ss://"+userinfo+"@198.51.100.7:990?#%40ExampleChannel")
 	if p.Method != "chacha20-ietf-poly1305" {
 		t.Fatalf("method = %q", p.Method)
 	}
 	// The base64 punctuation in the password must reach the profile
 	// verbatim ("+" is not a space here, "%" is not an escape).
-	if p.IDOrPassword != "ARgvGZywA+gacgGV26Bvmu05+wZmRW/j+AdU+Z8Bt44=" {
+	if p.IDOrPassword != "Example+Key/with=punct" {
 		t.Fatalf("password mangled: %q", p.IDOrPassword)
 	}
-	if p.Address != "185.213.23.63" || p.Port != 990 {
+	if p.Address != "198.51.100.7" || p.Port != 990 {
 		t.Fatalf("endpoint = %s:%d", p.Address, p.Port)
 	}
-	if p.Name != "@DeltaKroneckerGithub" {
+	if p.Name != "@ExampleChannel" {
 		t.Fatalf("name = %q, want the fragment un-escaped", p.Name)
 	}
 
 	// A parameter NekoGo does not use is still not part of the endpoint.
-	p = mustParse(t, "ss://YWVzLTEyOC1nY206c2hhZG93c29ja3M@141.98.101.179:443?0rtt=true#Node")
+	p = mustParse(t, "ss://YWVzLTEyOC1nY206c2hhZG93c29ja3M@1.2.3.4:443?0rtt=true#Node")
 	if p.Port != 443 || p.Method != "aes-128-gcm" || p.IDOrPassword != "shadowsocks" {
 		t.Fatalf("bad mapping with a query: %+v", p)
 	}

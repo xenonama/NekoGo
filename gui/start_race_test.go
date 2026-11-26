@@ -9,11 +9,13 @@ package main
 // so Start blocks in its readiness probe exactly like a hung core.
 
 import (
+	"net"
 	"os"
 	"path/filepath"
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -79,6 +81,33 @@ func waitProcessGone(t *testing.T, pid int, timeout time.Duration) {
 	t.Fatalf("child pid %d still alive after %v (zombie/leak)", pid, timeout)
 }
 
+// raceSettings is DefaultSettings with a free mixed inbound. Start
+// preflights the ports it is about to bind and refuses a held one before
+// any child spawns, so the default 2080 made these tests fail whenever
+// NekoGo itself was connected — the helper never ran, and the failure read
+// as a lifecycle bug rather than a port collision.
+func raceSettings(t *testing.T) Settings {
+	t.Helper()
+	s := DefaultSettings()
+	for attempt := 0; attempt < 25; attempt++ {
+		port, err := freePort()
+		if err != nil {
+			t.Fatalf("freePort: %v", err)
+		}
+		// The HTTP inbound takes MixedPort and SOCKS the next one.
+		addrs := []string{
+			net.JoinHostPort("127.0.0.1", strconv.Itoa(port)),
+			net.JoinHostPort("127.0.0.1", strconv.Itoa(port+1)),
+		}
+		if len(occupiedBindPorts(addrs)) == 0 {
+			s.MixedPort = port
+			return s
+		}
+	}
+	t.Fatal("no free mixed inbound pair for the race tests")
+	return s
+}
+
 // TestStartDoesNotHoldLockDuringProbe (BUG-004): with Start blocked in
 // its dial probe, Stop/GetStats/IsRunning must each complete within
 // 200ms instead of queueing behind the manager mutex.
@@ -88,7 +117,8 @@ func TestStartDoesNotHoldLockDuringProbe(t *testing.T) {
 	p := &Profile{ID: "x", Name: "hung", Core: CoreSingBox, Protocol: "direct",
 		RawOutbound: `{"type":"direct","tag":"proxy"}`}
 	startErr := make(chan error, 1)
-	go func() { startErr <- m.Start(p, DefaultSettings()) }()
+	s := raceSettings(t)
+	go func() { startErr <- m.Start(p, s) }()
 	waitHelperPID(t, pidFile, 10*time.Second)
 
 	t0 := time.Now()
@@ -132,7 +162,8 @@ func TestStartAbortedByConcurrentStop(t *testing.T) {
 	p := &Profile{ID: "x", Name: "hung", Core: CoreSingBox, Protocol: "direct",
 		RawOutbound: `{"type":"direct","tag":"proxy"}`}
 	startErr := make(chan error, 1)
-	go func() { startErr <- m.Start(p, DefaultSettings()) }()
+	s := raceSettings(t)
+	go func() { startErr <- m.Start(p, s) }()
 	pid := waitHelperPID(t, pidFile, 10*time.Second)
 
 	if err := m.Stop(); err != nil {
@@ -169,7 +200,8 @@ func TestStopAbortsInFlightStart(t *testing.T) {
 	p := &Profile{ID: "x", Name: "hung", Core: CoreSingBox, Protocol: "direct",
 		RawOutbound: `{"type":"direct","tag":"proxy"}`}
 	startErr := make(chan error, 1)
-	go func() { startErr <- m.Start(p, DefaultSettings()) }()
+	s := raceSettings(t)
+	go func() { startErr <- m.Start(p, s) }()
 	waitHelperPID(t, pidFile, 10*time.Second)
 
 	t0 := time.Now()
@@ -181,14 +213,258 @@ func TestStopAbortsInFlightStart(t *testing.T) {
 	}
 	select {
 	case err := <-startErr:
-		if err == nil {
-			t.Fatal("in-flight Start succeeded behind a Stop; want abort error")
+		if err == nil || err.Error() != "connect aborted (concurrent stop)" {
+			t.Fatalf("in-flight Start err = %v, want the shared connect cancellation error", err)
 		}
 	case <-time.After(10 * time.Second):
 		t.Fatal("in-flight Start did not abort after Stop")
 	}
 	if _, _, running := m.Status(); running {
 		t.Fatal("CoreManager running after aborted Start")
+	}
+}
+
+func TestStopBeforeCoreEpochAbortsStart(t *testing.T) {
+	bin, pidFile := lingerHelperBinary(t)
+	m := NewCoreManager(NewSingBoxManager(bin, make(chan LogEntry, 512)), NewXrayManager("", "", make(chan LogEntry, 512)))
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	m.startHook = func() {
+		close(entered)
+		<-release
+	}
+	p := &Profile{ID: "x", Name: "early cancel", Core: CoreSingBox, Protocol: "direct",
+		RawOutbound: `{"type":"direct","tag":"proxy"}`}
+	startErr := make(chan error, 1)
+	s := raceSettings(t)
+	go func() { startErr <- m.Start(p, s) }()
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		close(release)
+		t.Fatal("Start never reached the pre-epoch test gate")
+	}
+	if err := m.Stop(); err != nil {
+		close(release)
+		t.Fatalf("Stop before core epoch: %v", err)
+	}
+	close(release)
+	select {
+	case err := <-startErr:
+		if err == nil || err.Error() != "connect aborted (concurrent stop)" {
+			t.Fatalf("Start after pre-epoch Stop = %v, want shared cancellation error", err)
+		}
+	case <-time.After(3 * time.Second):
+		_ = m.Stop()
+		t.Fatal("Start survived a Stop that completed before its core epoch was claimed")
+	}
+	if _, err := os.Stat(pidFile); !os.IsNotExist(err) {
+		t.Fatalf("cancelled Start spawned a child: pid file stat = %v", err)
+	}
+}
+
+// TestConnectCancelledBeforeCoreStart covers the window before CoreManager
+// owns an epoch: Disconnect must cancel the App-level attempt, not merely a
+// core probe that has not started yet.
+func TestConnectCancelledBeforeCoreStart(t *testing.T) {
+	store, err := NewConfigStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	app := NewApp(store, make(chan LogEntry, 64))
+	app.sysProxyHook = func(bool) error { return nil }
+	saved, err := app.SaveProfile(Profile{Name: "cancel", Core: CoreSingBox,
+		Protocol: "direct", RawOutbound: `{"type":"direct","tag":"proxy"}`})
+	if err != nil {
+		t.Fatal(err)
+	}
+	scan := make(chan struct{})
+	defer func() {
+		select {
+		case <-scan:
+		default:
+			close(scan)
+		}
+	}()
+	app.setOrphanScanDone(scan)
+	started := make(chan struct{}, 1)
+	app.coreStarter = func(*Profile, Settings) error {
+		started <- struct{}{}
+		return nil
+	}
+	connectErr := make(chan error, 1)
+	go func() { connectErr <- app.Connect(saved.ID) }()
+	deadline := time.Now().Add(5 * time.Second)
+	for !app.IsConnectBusy() && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if !app.IsConnectBusy() {
+		t.Fatal("Connect never claimed the in-flight slot")
+	}
+	if err := app.Disconnect(); err != nil {
+		t.Fatalf("Disconnect during orphan scan: %v", err)
+	}
+	close(scan)
+	select {
+	case err := <-connectErr:
+		if err == nil || err.Error() != "connect aborted (concurrent stop)" {
+			t.Fatalf("Connect after pre-start cancel = %v, want shared cancellation error", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("cancelled Connect did not settle")
+	}
+	select {
+	case <-started:
+		t.Fatal("cancelled Connect still invoked the core starter")
+	default:
+	}
+}
+
+// TestCancelledConnectRevertsLateSystemProxy forces Disconnect into the
+// SetSystemProxy call. The late enable must be undone before Connect settles.
+func TestCancelledConnectRevertsLateSystemProxy(t *testing.T) {
+	store, err := NewConfigStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	settings := DefaultSettings()
+	settings.SystemProxy = true
+	settings.MixedPort = 22980
+	if err := store.SaveSettings(settings); err != nil {
+		t.Fatal(err)
+	}
+	app := NewApp(store, make(chan LogEntry, 64))
+	saved, err := app.SaveProfile(Profile{Name: "proxy race", Core: CoreSingBox,
+		Protocol: "direct", RawOutbound: `{"type":"direct","tag":"proxy"}`})
+	if err != nil {
+		t.Fatal(err)
+	}
+	enabling := make(chan struct{})
+	release := make(chan struct{})
+	var enableOnce sync.Once
+	defer func() {
+		select {
+		case <-release:
+		default:
+			close(release)
+		}
+	}()
+	calls := make(chan bool, 4)
+	app.sysStateHook = func() (bool, string, error) { return false, "", nil }
+	app.sysProxyHook = func(enable bool) error {
+		calls <- enable
+		if enable {
+			enableOnce.Do(func() { close(enabling) })
+			<-release
+		}
+		return nil
+	}
+	app.coreStarter = func(p *Profile, _ Settings) error {
+		app.cores.mu.Lock()
+		app.cores.running = true
+		app.cores.activeID = p.ID
+		app.cores.activeCore = CoreSingBox
+		app.cores.mu.Unlock()
+		return nil
+	}
+	connectErr := make(chan error, 1)
+	go func() { connectErr <- app.Connect(saved.ID) }()
+	select {
+	case <-enabling:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Connect did not reach system-proxy setup")
+	}
+	if err := app.Disconnect(); err != nil {
+		t.Fatalf("Disconnect during proxy setup: %v", err)
+	}
+	close(release)
+	select {
+	case err := <-connectErr:
+		if err == nil || err.Error() != "connect aborted (concurrent stop)" {
+			t.Fatalf("Connect after proxy-setup cancel = %v, want shared cancellation error", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Connect did not settle after proxy setup was released")
+	}
+	var got []bool
+	for len(calls) > 0 {
+		got = append(got, <-calls)
+	}
+	if len(got) != 2 || !got[0] || got[1] {
+		t.Fatalf("system-proxy calls = %v, want enable then revert", got)
+	}
+	if app.getAutoProxy() {
+		t.Fatal("late proxy enable left autoProxyOn set after cancellation")
+	}
+	if _, _, running := app.cores.Status(); running {
+		t.Fatal("core running after cancelled Connect settled")
+	}
+}
+
+// TestConnectDoesNotOverwriteSelectionChangedDuringStart: the server rail
+// stays usable while a profile is starting. A newer selection must survive
+// the older Connect's final active-profile write.
+func TestConnectDoesNotOverwriteSelectionChangedDuringStart(t *testing.T) {
+	store, err := NewConfigStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	app := NewApp(store, make(chan LogEntry, 64))
+	app.sysProxyHook = func(bool) error { return nil }
+	defer app.Disconnect()
+	first, err := app.SaveProfile(Profile{Name: "first", Core: CoreSingBox,
+		Protocol: "direct", RawOutbound: `{"type":"direct","tag":"proxy"}`})
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := app.SaveProfile(Profile{Name: "second", Core: CoreSingBox,
+		Protocol: "direct", RawOutbound: `{"type":"direct","tag":"proxy"}`})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SetActiveProfileID("initial"); err != nil {
+		t.Fatal(err)
+	}
+	started := make(chan struct{})
+	release := make(chan struct{})
+	defer func() {
+		select {
+		case <-release:
+		default:
+			close(release)
+		}
+	}()
+	app.coreStarter = func(p *Profile, _ Settings) error {
+		close(started)
+		<-release
+		app.cores.mu.Lock()
+		app.cores.running = true
+		app.cores.activeID = p.ID
+		app.cores.activeCore = CoreSingBox
+		app.cores.mu.Unlock()
+		return nil
+	}
+	connectErr := make(chan error, 1)
+	go func() { connectErr <- app.Connect(first.ID) }()
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Connect did not reach the core starter")
+	}
+	if err := store.SetActiveProfileID(second.ID); err != nil {
+		t.Fatalf("select newer server: %v", err)
+	}
+	close(release)
+	select {
+	case err := <-connectErr:
+		if err != nil {
+			t.Fatalf("Connect: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Connect did not settle")
+	}
+	if got := store.GetSettings().ActiveProfileID; got != second.ID {
+		t.Fatalf("active profile after Connect = %q, want newer selection %q", got, second.ID)
 	}
 }
 

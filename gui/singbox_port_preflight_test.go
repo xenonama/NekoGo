@@ -10,13 +10,15 @@ package main
 // whatever held the port goes away — the retries are what waits, not
 // what fixes.
 //
-// Xray and mihomo already refuse this up front (checkPortFree in
+// Xray and mihomo refuse this up front too (waitBindPortsFree in
 // xray_manager.go / mihomo_manager.go). The sing-box paths spawned the
 // core, paid the RPC handshake and only then took the engine's own
 // bind error seconds later. These tests pin the parity, and pin the two
 // ways parity alone would be wrong: a port released a moment later must
 // still connect (the user must not have to click again), and a config
 // that does not bind the configured port must not be refused for it.
+// The connect-wide plan that checks every leg's ports before the first
+// child exists is pinned in connect_ports_test.go.
 
 import (
 	"encoding/json"

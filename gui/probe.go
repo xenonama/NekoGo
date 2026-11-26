@@ -130,20 +130,38 @@ func occupiedBindPorts(addrs []string) []string {
 	return busy
 }
 
+// The two remedies a held port can carry. Which one fits depends on who
+// numbered the port: a config inbound is a setting the user can move, a
+// listener the app picked (or an engine command line named) is not.
+const (
+	mixedPortRemedy  = "Close whatever owns it (a core left by the last connect, another proxy, a second NekoGo window) or set a different Mixed port in Settings"
+	enginePortRemedy = "Close whatever owns it (a core left by the last connect, another proxy, a second NekoGo window) and connect again — this listener is not one Settings can move"
+)
+
 // bindPortHeldError describes a port that stayed busy for the whole
-// grace window. The number is what the user has to act on, so it leads;
-// the setting is named by the label the Settings tab shows for it.
-func bindPortHeldError(addr string) error {
+// grace window. The number is what the user has to act on, so it leads.
+func bindPortHeldError(addr, remedy string) error {
 	_, port, err := net.SplitHostPort(addr)
 	if err != nil {
 		port = addr
 	}
-	return fmt.Errorf("port %s in use — still held after waiting %s. Close whatever owns it (a core left by the last connect, another proxy, a second NekoGo window) or set a different Mixed port in Settings", port, inboundPortGrace)
+	return fmt.Errorf("port %s in use — still held after waiting %s. %s", port, inboundPortGrace, remedy)
 }
 
 // waitBindPortsFree holds a connect until every address is bindable or
 // inboundPortGrace passes. Returns nil once they are all free.
 func waitBindPortsFree(addrs []string) error {
+	return waitPortsFree(addrs, mixedPortRemedy)
+}
+
+// waitEngineListenerFree is the same window for a listener the app
+// numbers itself, where telling the user to change a setting would send
+// them looking for a field that does not exist.
+func waitEngineListenerFree(port int) error {
+	return waitPortsFree([]string{net.JoinHostPort(aetherLoopback, strconv.Itoa(port))}, enginePortRemedy)
+}
+
+func waitPortsFree(addrs []string, remedy string) error {
 	if len(addrs) == 0 {
 		return nil
 	}
@@ -154,7 +172,7 @@ func waitBindPortsFree(addrs []string) error {
 			return nil
 		}
 		if time.Now().After(deadline) {
-			return bindPortHeldError(busy[0])
+			return bindPortHeldError(busy[0], remedy)
 		}
 		time.Sleep(100 * time.Millisecond)
 	}

@@ -23,7 +23,7 @@ import (
 // TestAppVersionMatchesVERSIONFile fails the build when the two drift: a
 // "-dev" suffix here made the UI claim a prerelease no release ever had,
 // and the updater order it against the published tag as a different build.
-var appVersion = "1.0.0-beta.3"
+var appVersion = "1.0.0-beta.4"
 
 // App is the Wails bound service. Every public method is callable from the
 // Vue frontend.
@@ -52,6 +52,10 @@ type App struct {
 	// Psiphon chain. Wired into cores via SetPsiphonManager: it is a
 	// member of the CoreSpoof group and stops with it.
 	psiphonMgr *AetherManager
+	// torMgr owns the aether.exe child of the SNI spoof → Tor chain —
+	// the same leg with the other exit chain, so the two managers are
+	// never both running and a leg picks one (spoofChainDriver).
+	torMgr *AetherManager
 	// upstreamMgr owns the official sing-box.exe CLI child process when
 	// Settings.CoreEngine == "upstream". Wired into cores via
 	// SetUpstreamSingBoxManager.
@@ -80,6 +84,8 @@ type App struct {
 	upstreamVer versionCache
 	xrayVer     versionCache
 	mihomoVer   versionCache
+	aetherVer   versionCache
+	torVer      versionCache
 	// orphanScanDone is closed when the startup orphan scan finished.
 	// The scan runs in the background (it spawns wmic + tasklist, ~420
 	// ms measured) so the window appears immediately; Connect waits for
@@ -94,9 +100,9 @@ type App struct {
 	// connMu guards connBusy/connEpoch: shared "a Connect is in flight"
 	// state covering auto-connect and user/tray Connect alike
 	// (integration BUG-001/002). The frontend polls it via Status and
-	// IsConnectBusy to disable Connect/Disconnect while busy; tray
-	// handlers skip while busy; Stop aborts the in-flight probe via the
-	// CoreManager epoch.
+	// IsConnectBusy. Disconnect invalidates this epoch as well as the
+	// CoreManager epoch so a Connect still waiting to start cannot revive
+	// after the user cancelled it.
 	connMu    sync.Mutex
 	connBusy  bool
 	connEpoch uint64
@@ -155,6 +161,14 @@ type App struct {
 	// progress polled by the Aether tab.
 	aetherScanStatusMu sync.Mutex
 	aetherScanStatus   AetherScanStatus
+	// aetherKeysMu guards aetherKeysCancel: at most one WARP-key renewal
+	// runs at a time, and it shares the core's slot with the scan.
+	aetherKeysMu     sync.Mutex
+	aetherKeysCancel context.CancelFunc
+	// aetherKeysStatusMu guards aetherKeysStatus: the live renewal
+	// progress polled by the Aether tab.
+	aetherKeysStatusMu sync.Mutex
+	aetherKeysStatus   AetherKeysStatus
 }
 
 // noteError records a startup/tray-level error for LastError.
@@ -210,6 +224,8 @@ func NewApp(store *ConfigStore, logCh chan LogEntry) *App {
 	a.cores.SetAetherManager(a.aetherMgr)
 	a.psiphonMgr = NewPsiphonManager(logCh)
 	a.cores.SetPsiphonManager(a.psiphonMgr)
+	a.torMgr = NewTorManager(logCh)
+	a.cores.SetTorManager(a.torMgr)
 	a.upstreamMgr = NewUpstreamSingBoxManager(logCh)
 	a.cores.SetUpstreamSingBoxManager(a.upstreamMgr)
 	a.mihomoMgr = NewMihomoManager(logCh)
@@ -329,10 +345,6 @@ func (a *App) refreshTray() {
 			name = p.Name
 		}
 	}
-	t.SetStatus(running, name, core)
-	// Throne parity: the Servers submenu follows the store (active
-	// checked, capped). The interface stays Show/Hide/SetStatus so
-	// headless fakes keep working; only the real controller refreshes.
 	if rc, ok := t.(*TrayController); ok {
 		all := a.store.ListProfiles()
 		entries := make([]TrayServer, 0, len(all))
@@ -345,8 +357,13 @@ func (a *App) refreshTray() {
 		} else {
 			active = a.store.GetSettings().ActiveProfileID
 		}
+		mode := a.store.GetSettings().ReconnectMode
+		canReconnect := !strings.EqualFold(strings.TrimSpace(mode), reconnectOff)
+		rc.SetConnectionState(running, a.IsConnectBusy(), name, core, len(all) > 0, canReconnect)
 		rc.RefreshServers(entries, active)
+		return
 	}
+	t.SetStatus(running, name, core)
 }
 
 // tryBeginConnect claims the connect-in-flight slot atomically. A
@@ -354,15 +371,27 @@ func (a *App) refreshTray() {
 // click) must be refused, not run in parallel: both Starts bump the
 // CoreManager epoch and the loser's abort path tears down whatever is
 // current — including the winner's freshly started core.
-func (a *App) tryBeginConnect() bool {
+func (a *App) tryBeginConnect() (uint64, bool) {
 	a.connMu.Lock()
 	defer a.connMu.Unlock()
 	if a.connBusy {
-		return false
+		return 0, false
 	}
 	a.connBusy = true
 	a.connEpoch++
-	return true
+	return a.connEpoch, true
+}
+
+func (a *App) connectCurrent(epoch uint64) bool {
+	a.connMu.Lock()
+	defer a.connMu.Unlock()
+	return a.connBusy && a.connEpoch == epoch
+}
+
+func (a *App) invalidateConnect() {
+	a.connMu.Lock()
+	a.connEpoch++
+	a.connMu.Unlock()
 }
 
 // tryBeginImport claims the import slot. A second import is refused
@@ -433,6 +462,100 @@ var mihomoProtocols = map[string]bool{
 	"socks": true, "http": true, "aether": true,
 }
 
+type coreChoice struct {
+	Profile  Profile
+	Engine   string
+	Fallback bool
+	Reason   string
+}
+
+func normalizeCoreEngine(engine string) (string, error) {
+	switch strings.ToLower(strings.TrimSpace(engine)) {
+	case "", "custom":
+		return "custom", nil
+	case "upstream", "xray", "mihomo":
+		return strings.ToLower(strings.TrimSpace(engine)), nil
+	default:
+		return "", fmt.Errorf("coreEngine must be one of custom, upstream, xray, mihomo")
+	}
+}
+
+// resolveProfileCore uses configuration only; missing binaries and start failures never trigger fallback.
+func resolveProfileCore(p *Profile, settings Settings) (coreChoice, error) {
+	if p == nil {
+		return coreChoice{}, fmt.Errorf("nil profile")
+	}
+	engine, err := normalizeCoreEngine(settings.CoreEngine)
+	if err != nil {
+		return coreChoice{}, err
+	}
+	choice := coreChoice{Profile: *p, Engine: engine}
+	if spoofConnectEnabled(p, settings) {
+		choice.Profile.Core = CoreSpoof
+		return choice, nil
+	}
+	if raw := strings.TrimSpace(p.RawOutbound); raw != "" {
+		var obj map[string]any
+		if err := json.Unmarshal([]byte(raw), &obj); err != nil {
+			return coreChoice{}, fmt.Errorf("rawOutbound: %w", err)
+		}
+		if obj == nil {
+			return coreChoice{}, fmt.Errorf("rawOutbound: want a JSON object, got null")
+		}
+		if p.Core.IsMihomo() {
+			choice.Profile.Core = CoreMihomo
+			choice.Engine = "mihomo"
+			return choice, nil
+		}
+		protocol, _ := obj["protocol"].(string)
+		if p.Core.IsXray() || strings.TrimSpace(protocol) != "" {
+			choice.Profile.Core = CoreXray
+			choice.Engine = "xray"
+			return choice, nil
+		}
+		choice.Profile.Core = CoreSingBox
+		switch engine {
+		case "upstream":
+			if reason := upstreamUnsupportedReason(p); reason != "" {
+				choice.Engine = "custom"
+				choice.Fallback = true
+				choice.Reason = reason
+			}
+		default:
+			choice.Engine = "custom"
+		}
+		return choice, nil
+	}
+
+	protocol := strings.ToLower(strings.TrimSpace(p.Protocol))
+	supported := false
+	switch engine {
+	case "custom":
+		choice.Profile.Core = CoreSingBox
+		supported = singBoxProtocols[protocol]
+	case "upstream":
+		choice.Profile.Core = CoreSingBox
+		supported = singBoxProtocols[protocol] && upstreamUnsupportedReason(p) == ""
+	case "xray":
+		choice.Profile.Core = CoreXray
+		supported = xrayProtocols[protocol]
+	case "mihomo":
+		choice.Profile.Core = CoreMihomo
+		supported = mihomoProtocols[protocol]
+	}
+	if supported {
+		return choice, nil
+	}
+	if !singBoxProtocols[protocol] {
+		return coreChoice{}, fmt.Errorf("protocol %q needs rawOutbound JSON", protocol)
+	}
+	choice.Profile.Core = CoreSingBox
+	choice.Engine = "custom"
+	choice.Fallback = true
+	choice.Reason = fmt.Sprintf("protocol %q is not supported by %s", protocol, engine)
+	return choice, nil
+}
+
 // validateProfileForSave rejects profiles the builders cannot route,
 // so bad input fails fast at save instead of slowly at Connect/Test
 // (integration BUG-007 port, BUG-011 protocol). Profiles carrying a raw
@@ -441,9 +564,9 @@ var mihomoProtocols = map[string]bool{
 // (a rawOutbound-only profile with empty address/port is backend-legal).
 func validateProfileForSave(p Profile) error {
 	if p.RawOutbound == "" {
-		// Aether two-hop profiles (gool/mim/wg-over-masque) name outer
-		// and inner hops and no single endpoint: port unused.
-		if !(p.Protocol == "aether" && aetherIsTwoHops(aetherEnumDefault(aetherProtocols, p.Aether.Protocol, "wg"))) {
+		// Aether two-hop and carrier-only profiles name no single
+		// endpoint the engine dials: port unused.
+		if !aetherPortUnused(p) {
 			if p.Port < 1 || p.Port > 65535 {
 				return fmt.Errorf("port must be 1..65535 (got %d)", p.Port)
 			}
@@ -452,18 +575,8 @@ func validateProfileForSave(p Profile) error {
 		// spoof engine only accepts trojan/vless, but that is
 		// enforced at Start (clear error), not at save, so the JSON
 		// editor never blocks the user's draft.
-		if !p.Core.IsSpoof() {
-			supported := singBoxProtocols
-			coreName := "sing-box"
-			switch {
-			case p.Core.IsXray():
-				supported, coreName = xrayProtocols, "xray"
-			case p.Core.IsMihomo():
-				supported, coreName = mihomoProtocols, "mihomo"
-			}
-			if !supported[p.Protocol] {
-				return fmt.Errorf("protocol %q needs rawOutbound JSON for %s", p.Protocol, coreName)
-			}
+		if !p.Core.IsSpoof() && !singBoxProtocols[strings.ToLower(strings.TrimSpace(p.Protocol))] {
+			return fmt.Errorf("protocol %q needs rawOutbound JSON", p.Protocol)
 		}
 		// Mux/fragment/fingerprint ride the mapped builders (raw JSON
 		// bypasses them, so raw profiles skip these checks — the fields
@@ -575,6 +688,12 @@ func (a *App) SaveSettings(s Settings) error {
 		return fmt.Errorf("logLevel must be one of debug, info, warn, error")
 	}
 	s.LogLevel = normalizeLogLevel(s.LogLevel)
+	if s.ConsoleLogLimit != nil && *s.ConsoleLogLimit < 0 {
+		return fmt.Errorf("consoleLogLimit must be zero or greater")
+	}
+	if s.ConsoleLogLimit == nil {
+		s.ConsoleLogLimit = intPtr(defaultConsoleLogLimit)
+	}
 	// TUN stack (CPU audit #1): fail fast on values sing-tun would
 	// reject; empty normalizes to the default ("system") so configs
 	// written before the setting existed converge on the cheap stack.
@@ -622,17 +741,11 @@ func (a *App) SaveSettings(s Settings) error {
 	s.FragmentMode = strings.ToLower(strings.TrimSpace(s.FragmentMode))
 	s.FragmentLength = strings.TrimSpace(s.FragmentLength)
 	s.FingerprintValue = normalizeFingerprint(s.FingerprintValue)
-	// CoreEngine must be "custom" (default, Thrift RPC core) or
-	// "upstream" (CLI-only official sing-box.exe). Empty normalizes to
-	// "custom"; anything else rejects the save.
-	switch s.CoreEngine {
-	case "", "custom":
-		s.CoreEngine = "custom"
-	case "upstream":
-		// valid
-	default:
-		return fmt.Errorf("coreEngine must be one of custom, upstream")
+	engine, err := normalizeCoreEngine(s.CoreEngine)
+	if err != nil {
+		return err
 	}
+	s.CoreEngine = engine
 	// The two sing-box engines are two binaries with two settings:
 	// corePath is the custom nekobox_core.exe, upstreamCorePath the
 	// official sing-box.exe. A setting naming the other engine's binary
@@ -650,10 +763,29 @@ func (a *App) SaveSettings(s Settings) error {
 	if err := normalizeChainPsiphon(&s); err != nil {
 		return err
 	}
+	if err := normalizeChainTor(&s); err != nil {
+		return err
+	}
+	// One exit chain per leg. A leg has one listener and one child, so a
+	// config that arms both drivers is not a choice to weigh: Psiphon
+	// wins and the switch that lost is cleared, with the log saying so
+	// instead of the UI showing a Tor toggle that does nothing.
+	for _, note := range resolveChainDrivers(&s) {
+		a.emitLog("chain", "warn", "[chain] "+note)
+	}
+	// The Reconnect button's mode is a closed set; a config that says
+	// anything else means the shape the button has always had.
+	if err := normalizeReconnectMode(&s); err != nil {
+		return err
+	}
 	old := a.store.GetSettings()
 	if err := a.store.SaveSettings(s); err != nil {
 		return err
 	}
+	// A theme switch has to reach the tray too: its menu is native UI
+	// that only follows the app mode Windows was last told
+	// (tray_theme_windows.go).
+	applyTrayTheme(s.Theme)
 	a.singbox.setCorePath(s.CorePath)
 	a.xray.setXrayPath(s.XrayPath)
 	if s.GeoIPDBPath != old.GeoIPDBPath {
@@ -668,29 +800,42 @@ func (a *App) SaveSettings(s Settings) error {
 // The busy flag covers the whole probe so the UI/tray can disable
 // competing actions; a racing Disconnect aborts the probe via the
 // CoreManager epoch instead of deadlocking behind it.
-func (a *App) Connect(id string) error {
+func (a *App) Connect(id string) (retErr error) {
+	settings := a.store.GetSettings()
+	activeAtStart := settings.ActiveProfileID
 	// One Connect at a time. A second one used to run a parallel Start:
 	// both bump the CoreManager epoch, and the loser's abort path then
 	// stopped whatever was current — including the winner's fresh core,
 	// leaving the UI "connected" with nothing running.
-	if !a.tryBeginConnect() {
+	epoch, claimed := a.tryBeginConnect()
+	if !claimed {
 		a.emitLog("gui", "warn", "Connect: another connect is already in progress")
 		return fmt.Errorf("a connect is already in progress")
 	}
-	defer a.setConnectBusy(false)
 	defer a.refreshTray()
+	defer a.setConnectBusy(false)
+	a.refreshTray()
+	defer func() {
+		if a.connectCurrent(epoch) {
+			return
+		}
+		_ = a.cores.Stop()
+		a.revertSystemProxyOnExit("cancelled connect")
+		retErr = errConnectAborted
+	}()
 	// A stray core from a crashed session can hold the mixed/API
 	// ports. The startup orphan scan reaps those; wait for it (the
 	// scan runs in the background so the window appears immediately)
 	// so a port conflict can never reach the first Connect.
 	a.waitOrphanScan()
+	if !a.connectCurrent(epoch) {
+		return errConnectAborted
+	}
 	p, ok := a.store.GetProfile(id)
 	if !ok {
 		a.emitLog("gui", "error", fmt.Sprintf("Connect: profile %q not found", id))
 		return fmt.Errorf("profile %q not found", id)
 	}
-	a.emitLog("gui", "info", fmt.Sprintf("Connect: starting %q via %s", p.Name, p.Core.String()))
-	settings := a.store.GetSettings()
 	// Legacy loopback dead-end rescue (Windows: the engine ships as
 	// sni-spoof.exe). A loopback config imported before the SNI
 	// auto-detect (e.g. trojan://...@127.0.0.1:40443 ws) has no local
@@ -709,7 +854,7 @@ func (a *App) Connect(id string) error {
 			p = saved
 		}
 	}
-	// Direct-domain rescue (prompt.txt Test-CF): an eligible
+	// Direct-domain rescue (the Test-CF fixture): an eligible
 	// direct-domain profile imported before the domain auto-detect
 	// sits on sing-box and DPI-blocks every direct dial. Convert it
 	// here through the SAME path as the SNI tab's Start
@@ -723,19 +868,17 @@ func (a *App) Connect(id string) error {
 			p = saved
 		}
 	}
-	// Upstream pre-flight: the official sing-box binary is compiled
-	// without the NekoGo-only transports, so a profile that needs one
-	// cannot run there. Refuse now with an actionable message instead of
-	// letting the core fail 15s later on a decode error. Xray and mihomo
-	// profiles never use a sing-box binary; every other core (plain, SNI
-	// spoof, aether) runs the selected engine's sing-box as its transport.
-	if settings.CoreEngine == "upstream" && !p.Core.IsXray() && !p.Core.IsMihomo() {
-		if reason := upstreamUnsupportedReason(&p); reason != "" {
-			a.emitLog("gui", "error", fmt.Sprintf("Connect: upstream core refused profile %q: %s", p.Name, reason))
-			a.noteError(upstreamUnsupportedProfileMessage)
-			return errors.New(upstreamUnsupportedProfileMessage)
-		}
-		a.emitLog("gui", "info", fmt.Sprintf("Connect: sing-box engine = official sing-box.exe (upstream, core %s)", p.Core.String()))
+	choice, err := resolveProfileCore(&p, settings)
+	if err != nil {
+		msg := fmt.Sprintf("Connect: core selection failed: %v", err)
+		a.emitLog("gui", "error", msg)
+		a.noteError(msg)
+		return err
+	}
+	p = choice.Profile
+	a.emitLog("gui", "info", fmt.Sprintf("Connect: starting %q via %s", p.Name, p.Core.String()))
+	if choice.Fallback {
+		a.emitLog("gui", "warn", fmt.Sprintf("Connect: %s; using NekoBox Core for this connection", choice.Reason))
 	}
 	// Elevation pre-flight (Windows): the TUN inbound creates a Wintun
 	// adapter and the SNI spoof engine loads WinDivert — both need an
@@ -746,18 +889,28 @@ func (a *App) Connect(id string) error {
 	// resumes it through --connect. Xray ignores both, so proxy-only users
 	// are never gated.
 	if msg := elevationMessage(&p, settings); msg != "" {
-		if err := a.store.SetActiveProfileID(id); err != nil {
+		if _, err := a.store.SetActiveProfileIDIfUnchanged(id, activeAtStart); err != nil {
 			a.emitLog("gui", "error", fmt.Sprintf("Connect: persist elevation target: %v", err))
 		}
 		a.emitLog("gui", "error", msg)
 		a.noteError(msg)
 		return errors.New(msg)
 	}
+	for _, note := range idleChainNotes(&p, settings) {
+		a.emitLog("chain", "warn", "[chain] "+note)
+	}
+	if !a.connectCurrent(epoch) {
+		return errConnectAborted
+	}
 	start := a.cores.Start
 	if a.coreStarter != nil {
 		start = a.coreStarter
 	}
 	if err := start(&p, settings); err != nil {
+		if !a.connectCurrent(epoch) || errors.Is(err, errConnectAborted) {
+			a.revertSystemProxyOnExit("cancelled connect")
+			return errConnectAborted
+		}
 		a.emitLog("gui", "error", fmt.Sprintf("Connect: core start failed: %v", err))
 		// Start tore the previous group down before probing this one, and
 		// a deliberate stop reports no EngineExit, so noteFault never runs.
@@ -768,11 +921,14 @@ func (a *App) Connect(id string) error {
 		}
 		return tunStartHint(err, &p, settings)
 	}
+	if !a.connectCurrent(epoch) {
+		return errConnectAborted
+	}
 	ports := a.ActiveProxyPorts()
 	// Mode sync, per connect: TUN and the OS proxy are two ways to feed
 	// traffic into the tunnel, so the rendered mode decides which one is
 	// used. When the config carries the TUN inbound (tunEnabled or the
-	// SNI spoof → Psiphon chain, which always needs TUN) the OS proxy is
+	// SNI spoof → exit-chain leg, which always needs TUN) the OS proxy is
 	// left off — a proxy pointing at our mixed port would duplicate every
 	// connection and route the proxy's own traffic back through the
 	// tunnel. An auto-set proxy from a previous connect is cleared; a
@@ -799,6 +955,9 @@ func (a *App) Connect(id string) error {
 	} else {
 		a.emitLog("gui", "info", "auto system proxy skipped (SystemProxy=false in settings)")
 	}
+	if !a.connectCurrent(epoch) {
+		return errConnectAborted
+	}
 	// BUG-040: persistence failures must not masquerade as success.
 	// The core is running, but restart/auto-connect state would be
 	// silently lost — aggregate the errors and return them.
@@ -814,7 +973,7 @@ func (a *App) Connect(id string) error {
 		a.emitLog("gui", "error", msg)
 		persistErrs = append(persistErrs, err)
 	}
-	if err := a.store.SetActiveProfileID(id); err != nil {
+	if _, err := a.store.SetActiveProfileIDIfUnchanged(id, activeAtStart); err != nil {
 		msg := fmt.Sprintf("Connect: save active profile failed: %v", err)
 		a.emitLog("gui", "error", msg)
 		persistErrs = append(persistErrs, err)
@@ -829,9 +988,12 @@ func (a *App) Connect(id string) error {
 			port = a.spoofMgr.GetListenPort()
 		}
 		a.emitLog("spoof", "info", fmt.Sprintf("[spoof] connect complete (profile %q, port %d)", p.Name, port))
-		if chain, chainPort := a.cores.PsiphonChain(); chain {
-			a.emitLog("psiphon", "info", fmt.Sprintf("[psiphon] chain up (socks 127.0.0.1:%d)", chainPort))
+		if chain, driver, chainPort := a.cores.ChainRun(); chain {
+			a.emitLog(driver, "info", fmt.Sprintf("[%s] chain up (socks 127.0.0.1:%d)", driver, chainPort))
 		}
+	}
+	if !a.connectCurrent(epoch) {
+		return errConnectAborted
 	}
 	a.clearError()
 	if len(persistErrs) > 0 {
@@ -960,15 +1122,72 @@ func tunStartHint(err error, p *Profile, settings Settings) error {
 // untouched. The GUI owns the proxy, so no running core is needed to
 // revert it.
 func (a *App) Disconnect() error {
+	return a.disconnectCores(false)
+}
+
+// disconnectCores takes the group down. keepChain is the sticky
+// reconnect's ask: the SNI spoof chain's exit leg survives the teardown
+// and the next connect adopts it. Every other caller passes false, so no
+// plain Disconnect can leave a Psiphon or Tor child standing.
+func (a *App) disconnectCores(keepChain bool) error {
+	a.invalidateConnect()
 	if a.getAutoProxy() {
 		if err := a.ClearSystemProxy(); err != nil {
 			a.emitLog("gui", "error", fmt.Sprintf("auto system proxy disable failed: %v", err))
 		}
 		a.setAutoProxy(false)
 	}
-	err := a.cores.Stop()
+	var err error
+	if keepChain {
+		err = a.cores.StopWithChainKeep()
+	} else {
+		err = a.cores.Stop()
+	}
 	a.refreshTray()
 	return err
+}
+
+// Reconnect restarts the tunnel on the profile the UI says is running.
+// What happens to the exit chain in between is Settings.ReconnectMode:
+// "restart" (the default, and what the button has always done) takes
+// every leg down and raises them again, "sticky" hands the SNI spoof
+// chain's Psiphon/Tor child to the connect that follows instead of
+// reaping it — a cold Psiphon handshake or Tor consensus fetch is
+// minutes, and the thing a person presses this over is the tunnel
+// underneath it. "off" is the UI's business (the button is not rendered);
+// the call stays a plain reconnect rather than an error, so a stale click
+// can never be worse than Connect.
+//
+// The Aether leg is never in the offer: its chain runs inside the aether
+// engine process, so stopping the engine stops the chain with it.
+func (a *App) Reconnect(id string) error {
+	keep := reconnectKeepsChain(a.store.GetSettings().ReconnectMode)
+	if keep {
+		if active, driver, port := a.cores.ChainRun(); active {
+			a.emitLog("chain", "info", fmt.Sprintf("[chain] reconnect: keeping the %s leg on 127.0.0.1:%d", driver, port))
+		} else {
+			a.emitLog("chain", "info", "[chain] reconnect: no exit chain is up, so everything starts fresh")
+		}
+	}
+	// A Stop that reports a problem is not a reason to give up: the point
+	// of this button is to recover a connection, and Connect stops and
+	// replaces whatever is current on its own.
+	if err := a.disconnectCores(keep); err != nil {
+		a.emitLog("gui", "warn", fmt.Sprintf("Reconnect: stop reported %v, connecting anyway", err))
+	}
+	connectErr := a.Connect(id)
+	if connectErr != nil && keep {
+		// A connect that never reached the cores (unknown profile, the
+		// busy guard, a pre-flight refusal) leaves the handed-over leg
+		// owned by nothing: no group is up, and chainActive would keep
+		// reporting a chain the GUI no longer runs. Take it down. A leg
+		// that something running does own is left alone — that group is
+		// not this call's to reap.
+		if _, _, running := a.cores.Status(); !running {
+			a.cores.retireChainLeg()
+		}
+	}
+	return connectErr
 }
 
 // RelaunchAsAdmin restarts NekoGo elevated, resuming the active
@@ -1041,10 +1260,12 @@ type SpoofStatus struct {
 	StartedAt  string  `json:"startedAt"`
 	Uptime     float64 `json:"uptime"`
 	LastError  string  `json:"lastError"`
-	// Chain reports the SNI spoof → Psiphon chain on a live connect;
-	// ChainPort is Psiphon's local SOCKS listener.
-	Chain     bool `json:"chain"`
-	ChainPort int  `json:"chainPort"`
+	// Chain reports the SNI spoof → exit-chain leg on a live connect;
+	// ChainDriver names it ("psiphon" or "tor") and ChainPort is that
+	// chain's local SOCKS listener.
+	Chain       bool   `json:"chain"`
+	ChainDriver string `json:"chainDriver"`
+	ChainPort   int    `json:"chainPort"`
 }
 
 // SpoofGetStatus reports the engine state. It NEVER returns an error
@@ -1067,7 +1288,7 @@ func (a *App) SpoofGetStatus() (SpoofStatus, error) {
 		}
 	}
 	if a.cores != nil {
-		st.Chain, st.ChainPort = a.cores.PsiphonChain()
+		st.Chain, st.ChainDriver, st.ChainPort = a.cores.ChainRun()
 	}
 	return st, nil
 }
@@ -1865,6 +2086,13 @@ func (a *App) EditSubscription(oldURL, newURL, name string) (*LinkImportResult, 
 			return nil, err
 		}
 		res.Invalid = invalid
+		rollbackNewRecord := func() error {
+			if alreadyRecorded {
+				return nil
+			}
+			_, err := a.store.DeleteSubscription(newURL)
+			return err
+		}
 		// A transport/status/empty-body failure already bailed above. This
 		// is the quieter one: a typo'd path, a rotated token page or a
 		// Clash-YAML answer returns 200 with "://" in the body and parses
@@ -1873,13 +2101,12 @@ func (a *App) EditSubscription(oldURL, newURL, name string) (*LinkImportResult, 
 		// the dead URL. importSubscription recorded that URL too, so undo
 		// that unless it was a feed in its own right before this call.
 		if len(added) == 0 {
-			if !alreadyRecorded {
-				if _, delErr := a.store.DeleteSubscription(newURL); delErr != nil {
-					return res, delErr
-				}
+			if err := rollbackNewRecord(); err != nil {
+				return res, err
 			}
 			return res, fmt.Errorf("the new address yielded no usable profiles (%d links rejected); the feed stays on its old address", invalid)
 		}
+		saveFailures := 0
 		known := map[string]bool{}
 		for _, e := range a.store.ListProfiles() {
 			known[dedupeKey(&e)] = true
@@ -1894,10 +2121,17 @@ func (a *App) EditSubscription(oldURL, newURL, name string) (*LinkImportResult, 
 			saved, err := a.saveImportedProfile(p)
 			if err != nil {
 				res.Invalid++
+				saveFailures++
 				continue
 			}
 			known[dedupeKey(&saved)] = true
 			res.Profiles = append(res.Profiles, saved)
+		}
+		if saveFailures > 0 && len(res.Profiles) == 0 {
+			if err := rollbackNewRecord(); err != nil {
+				return res, err
+			}
+			return res, fmt.Errorf("none of the new profiles could be saved (%d links rejected); the feed stays on its old address", res.Invalid)
 		}
 	}
 	// A URL change records the feed under its host name, so keep the
@@ -1925,16 +2159,12 @@ func (a *App) EditSubscription(oldURL, newURL, name string) (*LinkImportResult, 
 	}
 	// Profiles imported before the rename still carry the old group
 	// name — move them over so the Proxies tab shows one coherent
-	// group per feed.
+	// group per feed. Only the ones this feed owns: matching the name
+	// alone used to re-file a second feed sharing that display name and
+	// every hand-picked profile in a remark group of the same name.
 	if effName != "" && oldName != "" && effName != oldName {
-		for _, e := range a.store.ListProfiles() {
-			if e.Group != oldName {
-				continue
-			}
-			e.Group = effName
-			if _, err := a.store.SaveProfile(e); err != nil {
-				a.emitLog("gui", "error", fmt.Sprintf("regroup profiles: %v", err))
-			}
+		if _, err := a.store.RenameFeedProfiles(newURL, oldName, effName); err != nil {
+			a.emitLog("gui", "error", fmt.Sprintf("regroup profiles: %v", err))
 		}
 	}
 	label := effName
@@ -2551,6 +2781,45 @@ func (a *App) MihomoVersion() string {
 	return v
 }
 
+// AetherVersion runs "<resolved aether path> -v" and returns the first
+// non-empty stdout line, cached per resolved path like the other cores
+// (a transient "" is never cached, so the next call retries). aether.exe
+// is the binary that carries Tor — arti is linked into it — and Psiphon,
+// so this is the answer to "is Tor here, and which one": measured on
+// 2.3.0, -v prints "aether 2.3.0" on stdout and exits 0. Empty when no
+// aether.exe resolves; the engine is optional and only the Aether
+// profiles and the two exit chains need it.
+func (a *App) AetherVersion() string {
+	if a.aetherMgr == nil || a.store == nil {
+		return ""
+	}
+	bin, err := a.aetherMgr.resolveAetherExe(a.store.GetSettings())
+	if err != nil {
+		return ""
+	}
+	a.aetherVer.mu.Lock()
+	if a.aetherVer.path != bin {
+		a.aetherVer.version = ""
+		a.aetherVer.path = bin
+	}
+	cached := a.aetherVer.version
+	a.aetherVer.mu.Unlock()
+	if cached != "" {
+		return cached
+	}
+	// exeVersionQuery rather than runVersionQuery: the same stub the
+	// updater's smoke verify uses, so this row is testable without a
+	// binary that answers.
+	v := exeVersionQuery(bin, "-v")
+	a.aetherVer.mu.Lock()
+	if v != "" {
+		a.aetherVer.version = v
+	}
+	a.aetherVer.path = bin
+	a.aetherVer.mu.Unlock()
+	return v
+}
+
 // RuntimeInfo reports the GUI process platform for the About diagnostics
 // card. The cores report their own versions above, and the GUI's Go
 // toolchain is not one a user can act on, so it is not reported.
@@ -2685,6 +2954,7 @@ func (a *App) Shutdown() {
 	}
 	a.quitting = true
 	a.mu.Unlock()
+	a.invalidateConnect()
 	a.waitCountryRefresh()
 	a.revertSystemProxyOnExit("shutdown")
 	_ = a.cores.SetSystemDNS(true)
@@ -2843,26 +3113,42 @@ func rawCoreOverride(overrides map[string]json.RawMessage) (map[string]any, bool
 	return full, true, nil
 }
 
-// resolveConfigTarget picks the profile and core the section editors
-// follow: the live connection when running, otherwise the stored
-// active profile (else the first profile) so the editors still render
-// defaults while idle.
-func (a *App) resolveConfigTarget() (*Profile, Settings) {
+// resolveConfigTarget picks the effective profile and core the config
+// editors follow: the live connection when running, otherwise the preferred
+// core for the stored active profile (else the first profile).
+func (a *App) resolveConfigTarget() (*Profile, Settings, error) {
 	settings := a.store.GetSettings()
-	if _, id, running := a.cores.Status(); running {
+	if core, id, running := a.cores.Status(); running {
 		if p, ok := a.store.GetProfile(id); ok {
-			return &p, settings
+			switch core {
+			case CoreXray.String():
+				p.Core = CoreXray
+			case CoreMihomo.String():
+				p.Core = CoreMihomo
+			case CoreSingBox.String():
+				p.Core = CoreSingBox
+			}
+			return &p, settings, nil
 		}
 	}
+	var p Profile
+	found := false
 	if id := settings.ActiveProfileID; id != "" {
-		if p, ok := a.store.GetProfile(id); ok {
-			return &p, settings
+		p, found = a.store.GetProfile(id)
+	}
+	if !found {
+		if all := a.store.ListProfiles(); len(all) > 0 {
+			p, found = all[0], true
 		}
 	}
-	if all := a.store.ListProfiles(); len(all) > 0 {
-		return &all[0], settings
+	if !found {
+		return nil, settings, nil
 	}
-	return nil, settings
+	choice, err := resolveProfileCore(&p, settings)
+	if err != nil {
+		return nil, settings, err
+	}
+	return &choice.Profile, settings, nil
 }
 
 // defaultConfigSection renders the manager default for one section
@@ -2909,7 +3195,10 @@ func (a *App) GetCoreConfigSection(section string) (string, error) {
 	if !validCoreSection(section) {
 		return "", fmt.Errorf("unknown section %q (want route|dns|inbound|experimental)", section)
 	}
-	p, settings := a.resolveConfigTarget()
+	p, settings, err := a.resolveConfigTarget()
+	if err != nil {
+		return "", err
+	}
 	if p == nil {
 		return "", fmt.Errorf("no profiles: add a profile first")
 	}
@@ -3143,7 +3432,7 @@ const mihomoConfigEditorMessage = "The mihomo core renders its own Clash Meta do
 // renderActiveConfig renders the exact config JSON the given profile
 // would receive on the next Connect, overrides merged in.
 func renderActiveConfig(p *Profile, settings Settings) (string, error) {
-	if p.Core.IsXray() {
+	if p.Core.IsXray() || spoofTransportXray(p, settings) {
 		addr := settings.XrayAPIAddress
 		if addr == "" {
 			addr = "127.0.0.1:10085"
@@ -3167,6 +3456,15 @@ func (a *App) ViewRawConfig() (string, error) {
 	p, ok := a.store.GetProfile(id)
 	if !ok {
 		return "", nil
+	}
+	core, _, _ := a.cores.Status()
+	switch core {
+	case CoreXray.String():
+		p.Core = CoreXray
+	case CoreMihomo.String():
+		p.Core = CoreMihomo
+	case CoreSingBox.String():
+		p.Core = CoreSingBox
 	}
 	if p.Core.IsMihomo() {
 		// The document the running child was actually given: mihomo's
@@ -3210,7 +3508,10 @@ func validateRawConfig(v map[string]any) error {
 // profile, every Phase E override (and the raw override itself)
 // already merged in, as pretty-printed JSON.
 func (a *App) GetRawConfig() (string, error) {
-	p, settings := a.resolveConfigTarget()
+	p, settings, err := a.resolveConfigTarget()
+	if err != nil {
+		return "", err
+	}
 	if p == nil {
 		return "", fmt.Errorf("no profiles: add a profile first")
 	}

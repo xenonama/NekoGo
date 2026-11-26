@@ -52,7 +52,7 @@ func TestAetherStartupExitFailsFastWithLastWords(t *testing.T) {
 	exited := make(chan error, 1)
 	exited <- errors.New("exit status 1")
 	start := time.Now()
-	err := m.waitSocksOrExit(1, 30*time.Second, exited, nil)
+	err := m.waitSocksOrExit(1, 30*time.Second, exited, nil, func() bool { return true })
 	if err == nil {
 		t.Fatal("expected start error")
 	}

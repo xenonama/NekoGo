@@ -341,15 +341,20 @@ type Settings struct {
 	// override: the binaries are separate and must not resolve to each
 	// other's file.
 	MihomoPath string `json:"mihomoPath,omitempty"`
-	// CoreEngine selects which sing-box binary runs sing-box profiles and
-	// every sing-box transport (plain, SNI spoof, Aether).
-	// "custom" = nekobox_core.exe (NekoBox fork with Thrift RPC).
-	// "upstream" = official sing-box.exe (CLI only: stats/connections via
-	// its Clash API).
+	// CoreEngine is the preferred core: custom (nekobox_core), upstream
+	// (official sing-box), xray, or mihomo. Unsupported protocols fall back
+	// to custom; raw outbound formats and SNI spoof keep their special routing.
 	CoreEngine string `json:"coreEngine,omitempty"`
 	AetherPath string `json:"aetherPath,omitempty"` // aether.exe override
-	Language   string `json:"language"`             // en, zh, fa, ru...
-	LogLevel   string `json:"logLevel"`             // debug | info | warn | error (legacy "warning" migrates to "warn" on save)
+	// TorPath is the standalone tor.exe override. It is separate from
+	// AetherPath: aether carries Arti, which is not the Tor Project's
+	// own daemon, and the two binaries must never resolve to each other.
+	TorPath  string `json:"torPath,omitempty"`
+	Language string `json:"language"` // en, zh, fa, ru...
+	LogLevel string `json:"logLevel"` // debug | info | warn | error (legacy "warning" migrates to "warn" on save)
+	// ConsoleLogLimit is the newest number of buffered entries shown in the
+	// Console. Nil keeps the legacy default; zero shows the whole buffer.
+	ConsoleLogLimit *int `json:"consoleLogLimit,omitempty"`
 	// LogOutputPath, when set, makes the GUI append every log line to
 	// that file in addition to the in-memory buffer (Advanced Phase H).
 	// Empty keeps the current in-memory-only behavior.
@@ -414,6 +419,12 @@ type Settings struct {
 	// the TUN inbound and leaves through Psiphon. Only Connect runs the
 	// chain (the SNI tab's standalone engine start never does).
 	SpoofPsiphon bool `json:"spoofPsiphon,omitempty"`
+	// SpoofTor is the same chain with Tor as the exit hop instead of
+	// Psiphon: the spoofed tunnel carries Tor's relays, traffic enters
+	// through the TUN inbound and leaves through a Tor circuit. One exit
+	// chain per leg, so SaveSettings keeps whichever of the two switches
+	// was already there and says which one it dropped.
+	SpoofTor bool `json:"spoofTor,omitempty"`
 	// SpoofXray runs a plain CoreSpoof connect on the Xray transport
 	// instead of sing-box (nekobox_core). The spoof engine stays the
 	// route; only the transport core changes. The SNI spoof + Psiphon
@@ -430,6 +441,11 @@ type Settings struct {
 	// through the tunnel, and the app keeps dialling the Psiphon
 	// listener. A profile that names its own Psiphon mode keeps it.
 	AetherPsiphon bool `json:"aetherPsiphon,omitempty"`
+	// AetherTor runs Tor on top of an Aether connect through the core's
+	// own chain mode: Tor's relays are dialled through the tunnel, and
+	// the app keeps dialling the Tor listener. A profile that names its
+	// own Tor mode keeps it.
+	AetherTor bool `json:"aetherTor,omitempty"`
 	// Chain Psiphon options (Settings → Chain, advanced mode). They
 	// drive the two chain legs only — the SNI-spoof→Psiphon leg (a plain
 	// psiphon-only aether run) and the Aether→Psiphon leg — and never a
@@ -446,6 +462,27 @@ type Settings struct {
 	ChainPsiphonCDN  string `json:"chainPsiphonCdnIps,omitempty"`
 	ChainPsiphonSNI  string `json:"chainPsiphonCdnSni,omitempty"`
 	ChainPsiphonSets string `json:"chainPsiphonCdnSets,omitempty"`
+	// Chain Tor options (Settings → Chain, advanced mode), the Tor
+	// sibling of the Psiphon ones above: they drive the two Tor chain
+	// legs and never a profile's own tunnel.
+	// ChainTorBridges is how the leg reaches the Tor network: auto tries
+	// Tor plainly and turns to fetched bridges where it is blocked,
+	// first goes to bridges at once, never uses none, own uses the lines
+	// below.
+	ChainTorBridges string `json:"chainTorBridges,omitempty"`
+	// ChainTorRelays adds onionoo's running relays to the bridge pool:
+	// auto (alongside bridgedb) | only | off. Consulted only while
+	// bridges are fetched.
+	ChainTorRelays string `json:"chainTorRelays,omitempty"`
+	// ChainTorBridgeLines holds the user's own bridge lines, one per
+	// line, in the shape a torrc uses. Read when ChainTorBridges is own.
+	ChainTorBridgeLines string `json:"chainTorBridgeLines,omitempty"`
+	// ReconnectMode is the Reconnect button: "off" hides it, "restart"
+	// (the default, and what a config without the key meant) takes every
+	// leg down and raises them again, "sticky" hands the SNI-spoof
+	// chain's exit hop to the next connect instead of reaping it. See
+	// reconnect.go.
+	ReconnectMode string `json:"reconnectMode,omitempty"`
 	// SNIConfig holds the sni-spoof engine options. Empty/zero values
 	// mean "engine default" and are omitted from the generated
 	// config JSON. Only used when a profile selects CoreSpoof.
@@ -470,6 +507,10 @@ type Settings struct {
 	// kept, newest-last. They survive tab switches and restarts; the
 	// scan APIs update this list atomically.
 	AetherScanResults []AetherScanResult `json:"aetherScanResults,omitempty"`
+	// AetherKeys are the WARP-key renewal knobs of the Aether tab. The
+	// identities themselves live in TOML files beside the core, never in
+	// config.json.
+	AetherKeys aetherKeysSettings `json:"aetherKeys,omitempty"`
 }
 
 // SNIConfig mirrors the sni-spoof engine tuning knobs
@@ -563,6 +604,10 @@ type SpoofRanked struct {
 // state must differ from an explicit false.
 func boolPtr(v bool) *bool { return &v }
 
+func intPtr(v int) *int { return &v }
+
+const defaultConsoleLogLimit = 300
+
 func DefaultSettings() Settings {
 	return Settings{
 		Theme:          "light",
@@ -576,6 +621,7 @@ func DefaultSettings() Settings {
 		// "warn" keeps that churn off the default path. debug/info stay
 		// valid values in config.json for troubleshooting.
 		LogLevel:         defaultLogLevel,
+		ConsoleLogLimit:  intPtr(defaultConsoleLogLimit),
 		Language:         "en",
 		CloseToTray:      true,
 		URLTestIntervalS: 300,
@@ -600,6 +646,9 @@ func DefaultSettings() Settings {
 		// SNI spoofing defaults to enabled; the toggle turns the engine
 		// off so SNI Spoofing profiles dial their own address.
 		SpoofEnabled: boolPtr(true),
+		// The Reconnect button restarts every leg, which is what it did
+		// before the mode existed; the chain handoff is opt-in.
+		ReconnectMode: reconnectRestart,
 	}
 }
 

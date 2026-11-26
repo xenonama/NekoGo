@@ -2,12 +2,15 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 )
+
+var errConnectAborted = errors.New("connect aborted (concurrent stop)")
 
 // CoreManager routes Start/Stop/Stats calls to the sing-box or Xray
 // manager based on the active profile, per the
@@ -39,6 +42,12 @@ type CoreManager struct {
 	// aetherActive marks a connect that also runs the aether engine;
 	// Stop/stopLocked then stop the engine with the transport.
 	aetherActive bool
+	// aetherTorActive marks an Aether connect that put its Tor hop on a
+	// second child — the standalone daemon behind the tunnel — instead of
+	// inside the engine. It is the group's own record, because a death
+	// report reaches handleEngineExit after the manager that owned the
+	// child already cleared its running flag.
+	aetherTorActive bool
 	// onFault receives an unexpected engine death (PattN SessionEnded)
 	// after the group state flips and before the teardown runs. App uses
 	// it to log, surface LastError and revert the auto system proxy.
@@ -51,6 +60,9 @@ type CoreManager struct {
 	// is not a regression test. Production leaves it nil.
 	faultRaceHook func()
 
+	// startHook pauses initial startup in lifecycle tests; nil in production.
+	startHook func()
+
 	singboxMgr *SingBoxManager
 	xrayMgr    *XrayManager
 	// spoofMgr owns the sni-spoof.exe child process (CoreSpoof).
@@ -62,13 +74,25 @@ type CoreManager struct {
 	// one auxiliary process a connect runs; PattNG parity). Started
 	// before the main core, which dials its SOCKS listener.
 	aetherMgr *AetherManager
-	// psiphonMgr owns the second aether.exe child of the SNI spoof →
-	// Psiphon chain, run in psiphon-only mode with its upstream set to
-	// the spoof transport. psiphonActive marks it as a member of the
-	// committed CoreSpoof group so Stop and fault teardown cover it.
-	psiphonMgr    *AetherManager
-	psiphonActive bool
-	psiphonPort   int
+	// psiphonMgr and torMgr own the second aether.exe child of the SNI
+	// spoof chain, run in psiphon-only or tor-only mode with its
+	// upstream set to the spoof transport. One of them runs per connect,
+	// whichever Settings armed; chainActive marks it as a member of the
+	// committed CoreSpoof group so Stop and fault teardown cover it, and
+	// chainKind says which one it was.
+	psiphonMgr  *AetherManager
+	torMgr      *AetherManager
+	chainActive bool
+	chainKind   string
+	chainPort   int
+	// chainUpstreamPort is the loopback inbound the chain's own dials
+	// return through, paired with chainPort. A sticky reconnect needs
+	// both to hand the same child to the next connect; see reconnect.go.
+	chainUpstreamPort int
+	// chainKeep is the one-shot a sticky reconnect arms so Stop spares
+	// the exit leg. Stop always clears it, in the same critical section
+	// that reads it.
+	chainKeep bool
 	// spoofXray records which transport the committed CoreSpoof group
 	// runs on: Xray when Settings.SpoofXray selected it, sing-box
 	// otherwise (always sing-box for the Psiphon chain).
@@ -173,7 +197,11 @@ func (m *CoreManager) engineInGroupLocked(engine string) bool {
 	case "aether":
 		return m.aetherActive
 	case "psiphon":
-		return m.psiphonActive
+		return m.chainActive && m.chainKind == chainDriverPsiphon
+	case "tor":
+		// Two legs can run the daemon: the spoof chain's exit leg and the
+		// Aether hop behind the tunnel. Either death takes its group down.
+		return (m.chainActive && m.chainKind == chainDriverTor) || m.aetherTorActive
 	case "spoof":
 		// The SNI engine is the group's front: sing-box/xray only feed it.
 		return m.activeCore == CoreSpoof
@@ -302,12 +330,34 @@ func (m *CoreManager) SetPsiphonManager(mgr *AetherManager) {
 	}
 }
 
-// PsiphonChain reports the chain leg of the committed CoreSpoof group:
-// whether Psiphon runs and the local SOCKS port it listens on.
-func (m *CoreManager) PsiphonChain() (active bool, port int) {
+// SetTorManager attaches the Tor-only aether instance the SNI spoof
+// chain runs. Called once from NewApp; a nil manager makes a Tor chain
+// fail fast, exactly as a nil Psiphon one does.
+func (m *CoreManager) SetTorManager(mgr *AetherManager) {
+	m.mu.Lock()
+	m.torMgr = mgr
+	m.mu.Unlock()
+	if mgr != nil {
+		mgr.SetExitHandler(m.handleEngineExit)
+	}
+}
+
+// chainMgrLocked returns the manager that owns the [driver] chain leg.
+// Caller holds m.mu.
+func (m *CoreManager) chainMgrLocked(driver string) *AetherManager {
+	if driver == chainDriverTor {
+		return m.torMgr
+	}
+	return m.psiphonMgr
+}
+
+// ChainRun reports the chain leg of the committed CoreSpoof group:
+// whether an exit chain runs, which driver it is, and the local SOCKS
+// port it listens on.
+func (m *CoreManager) ChainRun() (active bool, driver string, port int) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	return m.psiphonActive, m.psiphonPort
+	return m.chainActive, m.chainKind, m.chainPort
 }
 
 // aetherDriverProfile reports whether [p] needs the aether engine to
@@ -323,35 +373,84 @@ func aetherDriverProfile(p *Profile) bool {
 // but the multi-second engine probe runs UNLOCKED. A Stop racing the
 // probe bumps the epoch, so the commit below aborts (tearing down what
 // was just started) instead of publishing a stale connection.
-func (m *CoreManager) Start(profile *Profile, settings Settings) error {
-	if profile == nil {
-		return fmt.Errorf("nil profile")
-	}
+func (m *CoreManager) Start(profile *Profile, settings Settings) (err error) {
 	m.mu.Lock()
+	m.epoch++
+	epoch := m.epoch
+	m.mu.Unlock()
+	defer func() {
+		if err == nil {
+			return
+		}
+		m.mu.RLock()
+		stale := m.epoch != epoch
+		m.mu.RUnlock()
+		if stale {
+			err = errConnectAborted
+		}
+	}()
+	if m.startHook != nil {
+		m.startHook()
+	}
+	choice, err := resolveProfileCore(profile, settings)
+	if err != nil {
+		return err
+	}
+	profile = &choice.Profile
+	m.mu.Lock()
+	if m.epoch != epoch {
+		m.mu.Unlock()
+		return errConnectAborted
+	}
 	if m.running {
 		if err := m.stopLocked(); err != nil {
 			m.mu.Unlock()
 			return fmt.Errorf("stop previous core: %w", err)
 		}
 	}
-	m.epoch++
-	epoch := m.epoch
 	wantXray := profile.Core.IsXray()
 	wantSpoof := spoofConnectEnabled(profile, settings)
 	wantAether := aetherDriverProfile(profile)
-	wantUpstream := settings.CoreEngine == "upstream"
-	// A mihomo profile never runs a sing-box binary, so the CoreEngine
-	// choice is inert for it — exactly as it is for Xray.
+	wantUpstream := choice.Engine == "upstream"
 	wantMihomo := profile.Core.IsMihomo()
 	if wantMihomo {
 		wantUpstream = false
 	}
 	aetherMgr := m.aetherMgr
+	torMgr := m.torMgr
 	upstreamMgr := m.upstreamMgr
 	mihomoMgr := m.mihomoMgr
 	m.mu.Unlock()
+	m.mu.RLock()
+	stale := m.epoch != epoch
+	m.mu.RUnlock()
+	if stale {
+		return errConnectAborted
+	}
 
-	var err error
+	// A chain leg a sticky reconnect left standing can only be adopted by
+	// a spoof-chain connect (startSpoofLocked adopts it, or retires it if
+	// the driver changed). Every other group — an aether profile, a plain
+	// spoof profile, mihomo or xray — has no chain to inherit, so the
+	// leftover child is reaped here rather than serving a port no config
+	// names any more.
+	if !wantSpoof || !spoofChain(profile, settings) {
+		m.retireChainLeg()
+	}
+
+	// Every port this connect names is checked before any child exists,
+	// whichever leg turns out to need it: the Aether path starts its
+	// engine first and the spoof path its front, so a held inbound used to
+	// be reported only after a child had been spawned, probed and torn
+	// down — or behind that child's own unrelated error. The claim holds
+	// the same numbers for the rest of the connect, so the ports picked
+	// along the way (an RPC listener, a chain hop) cannot take one.
+	addrs, ports := planConnectPorts(profile, settings)
+	if err := waitBindPortsFree(addrs); err != nil {
+		return err
+	}
+	defer claimConnectPorts(ports)()
+
 	if wantAether {
 		if aetherMgr == nil {
 			return fmt.Errorf("aether manager not wired")
@@ -359,32 +458,76 @@ func (m *CoreManager) Start(profile *Profile, settings Settings) error {
 		// The engine first: it owns the listener the main core's
 		// outbound dials. A main-core failure below rolls the engine
 		// back so no orphan aether process survives the Connect.
-		// Settings.AetherPsiphon arms the engine's own chain mode
-		// (Psiphon on top of the tunnel) for a profile that names no
-		// Psiphon mode of its own.
-		engineProfile := aetherPsiphonChainProfile(profile, settings)
+		// Settings.AetherPsiphon / AetherTor arm the engine's own chain
+		// mode (Psiphon or Tor on top of the tunnel) for a profile that
+		// names no mode of its own. One driver per leg, so only one of
+		// the two copies anything.
+		//
+		// A Tor hop has two possible engines, and the choice is made
+		// before the tunnel starts: with a tor.exe on the machine the
+		// engine renders the tunnel alone and the daemon carries the hop
+		// behind it, because the arti client linked into the engine
+		// stops at 15% of its bootstrap on the networks this app ships
+		// to. hopProfile keeps the Tor options either way — they are what
+		// the daemon is handed when the split happens.
+		hopProfile := aetherTorChainProfile(aetherPsiphonChainProfile(profile, settings), settings)
+		daemonHop, hopNote := aetherTorHopDecision(hopProfile, settings, torMgr)
+		engineProfile := hopProfile
+		if daemonHop {
+			engineProfile = aetherTunnelOnlyProfile(hopProfile)
+		}
+		if hopNote != "" {
+			aetherMgr.log("info", hopNote)
+		}
 		port, token, startErr := aetherMgr.StartWithToken(engineProfile, settings)
 		if startErr != nil {
 			return startErr
 		}
+		// What the connect publishes and what the rollback unpublishes are
+		// one value: the tunnel's listener until the hop takes it over.
+		dialPort := port
+		var hopToken uint64
 		defer func() {
 			if err != nil {
-				// Stop only this Start's child: a newer Start may own the
-				// manager by now (its own spawn reaped ours), and the
-				// published port may already be the newer engine's.
+				// Stop only this Start's children: a newer Start may own
+				// either manager by now (its own spawn reaped ours), and
+				// the published port may already be the newer engine's.
+				// The hop goes first: it dials through the tunnel, so a
+				// daemon left behind would keep answering on a port whose
+				// front no longer exists.
+				_ = torMgr.StopToken(hopToken)
 				_ = aetherMgr.StopToken(token)
-				clearAetherActivePortIf(port)
+				clearAetherActivePortIf(dialPort)
 			}
 		}()
 		setAetherActivePort(port)
-		if aetherProfilePsiphonChain(engineProfile) {
+		switch {
+		case aetherProfilePsiphonChain(engineProfile):
 			// The Psiphon listener accepts a CONNECT before a tunnel
 			// exists; only a real payload round trip proves the chain.
-			if err = m.waitAetherPsiphonTunnel(port, psiphonChainWarmup, epoch, aetherMgr); err != nil {
+			if err = m.waitChainTunnel(chainDriverPsiphon, port, psiphonChainWarmup, epoch, aetherMgr); err != nil {
+				return err
+			}
+		case aetherProfileTorChain(engineProfile):
+			// The arti shape: Tor's listener answers a CONNECT while the
+			// circuit is still being built, for the same reason Psiphon's
+			// does, on a longer budget — a cold start fetches a directory
+			// consensus first. With a daemon on the machine the profile
+			// renders no tor mode at all and this case does not run.
+			if err = m.waitChainTunnel(chainDriverTor, port, torChainWarmup, epoch, aetherMgr); err != nil {
 				return err
 			}
 		}
-		if err = m.startAetherMainCore(profile, settings, wantXray, wantMihomo); err != nil {
+		if daemonHop {
+			// The second child, and the port that matters from here: the
+			// main core renders an outbound to tor.exe, which dials the
+			// tunnel started above as its own front.
+			if dialPort, hopToken, err = m.startAetherTorHop(torMgr, settings, hopProfile,
+				port, aetherMgr.Running); err != nil {
+				return err
+			}
+		}
+		if err = m.startAetherMainCore(profile, settings, choice.Engine, wantXray, wantMihomo); err != nil {
 			return err
 		}
 		m.mu.Lock()
@@ -394,7 +537,7 @@ func (m *CoreManager) Start(profile *Profile, settings Settings) error {
 			// Named err: the deferred rollback above is what unpublishes
 			// this connect's engine port and stops exactly its child, and
 			// it only fires on a non-nil one.
-			err = fmt.Errorf("connect aborted (concurrent stop)")
+			err = errConnectAborted
 			return err
 		}
 		// The engine can die between its readiness probe and this
@@ -412,6 +555,14 @@ func (m *CoreManager) Start(profile *Profile, settings Settings) error {
 			err = fmt.Errorf("core exited during connect")
 			return err
 		}
+		// And for a hop that rides the tunnel: it passed its own gate
+		// seconds ago, and a daemon that died in the render window would
+		// otherwise be published as a listener nothing answers on.
+		if daemonHop && !torMgr.Running() {
+			_ = m.stopLocked()
+			err = fmt.Errorf("tor hop exited during connect")
+			return err
+		}
 		switch {
 		case wantMihomo:
 			m.activeCore = CoreMihomo
@@ -423,7 +574,12 @@ func (m *CoreManager) Start(profile *Profile, settings Settings) error {
 		m.running = true
 		m.activeID = profile.ID
 		m.aetherActive = true
-		m.upstreamActive = !wantXray && !wantMihomo && settings.CoreEngine == "upstream"
+		// Which engine carries the hop is group state, not manager state:
+		// the daemon's death report arrives once its own manager has
+		// already forgotten it, and only the group knows the connect had a
+		// second child worth tearing down.
+		m.aetherTorActive = daemonHop
+		m.upstreamActive = !wantXray && !wantMihomo && choice.Engine == "upstream"
 		m.setTunSessionLocked(tunModeFor(profile, settings))
 		return nil
 	}
@@ -459,7 +615,7 @@ func (m *CoreManager) Start(profile *Profile, settings Settings) error {
 		// A Stop raced our probe: take down what we just started and
 		// refuse to publish it.
 		_ = m.stopLocked()
-		return fmt.Errorf("connect aborted (concurrent stop)")
+		return errConnectAborted
 	}
 	if !m.groupMemberAlive(wantSpoof, wantXray, wantUpstream, wantMihomo) {
 		_ = m.stopLocked()
@@ -484,6 +640,7 @@ func (m *CoreManager) Start(profile *Profile, settings Settings) error {
 	m.running = true
 	m.activeID = profile.ID
 	m.aetherActive = false
+	m.aetherTorActive = false
 	m.setTunSessionLocked(tunModeFor(profile, settings))
 	return nil
 }
@@ -505,20 +662,21 @@ func (m *CoreManager) setTunSessionLocked(on bool) {
 	}
 }
 
-// waitAetherPsiphonTunnel blocks until the aether engine's Psiphon chain
-// carries real traffic (a SOCKS CONNECT plus TLS handshake through it).
-// psiphon-tunnel-core answers its SOCKS listener before a tunnel exists,
-// so a listener-only check would publish a group whose every page hangs.
-// It aborts on a racing Stop (epoch) or a dead engine, and gives up
-// after timeout.
-func (m *CoreManager) waitAetherPsiphonTunnel(port int, timeout time.Duration, epoch uint64, aetherMgr *AetherManager) error {
+// waitChainTunnel blocks until the aether engine's exit chain carries
+// real traffic (a SOCKS CONNECT plus TLS handshake through it). Both
+// drivers answer their SOCKS listener before a tunnel exists —
+// psiphon-tunnel-core immediately, Tor while the circuit is still being
+// built — so a listener-only check would publish a group whose every
+// page hangs. It aborts on a racing Stop (epoch) or a dead engine, and
+// gives up after timeout.
+func (m *CoreManager) waitChainTunnel(driver string, port int, timeout time.Duration, epoch uint64, aetherMgr *AetherManager) error {
 	deadline := time.Now().Add(timeout)
 	for {
 		m.mu.RLock()
 		stale := m.epoch != epoch
 		m.mu.RUnlock()
 		if stale {
-			return fmt.Errorf("connect aborted (concurrent stop)")
+			return errConnectAborted
 		}
 		if aetherMgr == nil || !aetherMgr.Running() {
 			return fmt.Errorf("aether engine exited during connect")
@@ -527,7 +685,7 @@ func (m *CoreManager) waitAetherPsiphonTunnel(port int, timeout time.Duration, e
 			return nil
 		}
 		if time.Now().After(deadline) {
-			return fmt.Errorf("psiphon chain on the aether tunnel did not carry traffic in %s", timeout)
+			return fmt.Errorf("%s chain on the aether tunnel did not carry traffic in %s", driver, timeout)
 		}
 		time.Sleep(time.Second)
 	}
@@ -536,8 +694,6 @@ func (m *CoreManager) waitAetherPsiphonTunnel(port int, timeout time.Duration, e
 // transportAlive reports whether the transport a pending (or committed)
 // group chose is still running. Caller holds m.mu; the managers' locks
 // are leaves, so the nesting cannot deadlock.
-// transportAlive reports whether the engine a pending Start just probed
-// is still running at commit time, for the aether group's main core.
 func (m *CoreManager) transportAlive(xray, upstream, mihomo bool) bool {
 	switch {
 	case mihomo:
@@ -560,10 +716,11 @@ func (m *CoreManager) groupMemberAlive(spoof, xray, upstream, mihomo bool) bool 
 		if m.spoofMgr == nil || !m.spoofMgr.IsRunning() {
 			return false
 		}
-		if m.psiphonActive {
-			// The chain's Psiphon exit keeps answering after its transport
+		if m.chainActive {
+			// The chain's exit hop keeps answering after its transport
 			// died; both legs must be up for the connect to mean anything.
-			if m.psiphonMgr == nil || !m.psiphonMgr.Running() {
+			mgr := m.chainMgrLocked(m.chainKind)
+			if mgr == nil || !mgr.Running() {
 				return false
 			}
 			return m.transportAlive(m.spoofXray, m.spoofUpstream, false)
@@ -580,10 +737,8 @@ func (m *CoreManager) groupMemberAlive(spoof, xray, upstream, mihomo bool) bool 
 	}
 }
 
-// startAetherMainCore starts the transport that dials the running
-// engine: mihomo or xray per the profile's core choice, the official
-// sing-box CLI when CoreEngine=upstream, the custom core otherwise.
-func (m *CoreManager) startAetherMainCore(profile *Profile, settings Settings, wantXray, wantMihomo bool) error {
+// startAetherMainCore starts the resolved transport that dials the running engine.
+func (m *CoreManager) startAetherMainCore(profile *Profile, settings Settings, engine string, wantXray, wantMihomo bool) error {
 	if wantMihomo {
 		if m.mihomoMgr == nil {
 			return fmt.Errorf("mihomo manager not wired")
@@ -596,7 +751,7 @@ func (m *CoreManager) startAetherMainCore(profile *Profile, settings Settings, w
 		return m.xrayMgr.Start(profile, settings)
 	}
 	m.activeCoreHint(false)
-	if settings.CoreEngine == "upstream" {
+	if engine == "upstream" {
 		if m.upstreamMgr == nil {
 			return fmt.Errorf("upstream sing-box manager not wired")
 		}
@@ -619,13 +774,18 @@ func (m *CoreManager) startAetherMainCore(profile *Profile, settings Settings, w
 // alone.
 func (m *CoreManager) startSpoofLocked(profile *Profile, settings Settings) error {
 	m.mu.RLock()
-	spoofMgr, singboxMgr, xrayMgr, psiphonMgr := m.spoofMgr, m.singboxMgr, m.xrayMgr, m.psiphonMgr
+	spoofMgr, singboxMgr, xrayMgr := m.spoofMgr, m.singboxMgr, m.xrayMgr
+	psiphonMgr, torMgr := m.psiphonMgr, m.torMgr
 	upstreamMgr := m.upstreamMgr
 	m.mu.RUnlock()
 	if spoofMgr == nil {
 		return fmt.Errorf("sni-spoof manager not wired")
 	}
-	chain := spoofPsiphonChain(profile, settings)
+	driver := ""
+	if spoofChain(profile, settings) {
+		driver = spoofChainDriver(settings)
+	}
+	chain := driver != ""
 	// Settings.SpoofXray moves a plain spoof connect onto the Xray
 	// transport. The chain never follows: its TUN inbound exists only
 	// in the sing-box rendering.
@@ -679,13 +839,17 @@ func (m *CoreManager) startSpoofLocked(profile *Profile, settings Settings) erro
 		}
 	}()
 	if chain {
-		if psiphonMgr == nil {
+		if driver == chainDriverTor {
+			if torMgr == nil {
+				return fmt.Errorf("tor chain manager not wired")
+			}
+		} else if psiphonMgr == nil {
 			return fmt.Errorf("psiphon chain manager not wired")
 		}
 		// The chain lives in the rendered config; a full raw override
 		// replaces that config and would leave the chain unreachable.
 		if _, full, err := rawCoreOverride(settings.CoreOverrides); err == nil && full {
-			return fmt.Errorf("the SNI spoof + Psiphon chain needs the rendered core config: clear the full raw core override first")
+			return fmt.Errorf("the SNI spoof + %s chain needs the rendered core config: clear the full raw core override first", driver)
 		}
 	}
 	if err := spoofMgr.Start(profile, settings); err != nil {
@@ -701,36 +865,138 @@ func (m *CoreManager) startSpoofLocked(profile *Profile, settings Settings) erro
 		committed = true
 		return nil
 	}
-	// Psiphon's listener and the inbound its own dials take are chosen
-	// before rendering: the transport config must name both.
-	psiphonPort, upstreamPort, err := allocateSpoofChainPorts(settings, spoofMgr.GetListenPort())
-	if err != nil {
-		_ = spoofMgr.Stop()
-		clearSpoofFrontPort()
-		return err
+	// The chain's listener and the inbound its own dials take are chosen
+	// before rendering: the transport config must name both, and name the
+	// hop they belong to. A leg a sticky reconnect handed over keeps its
+	// pair — the child already listens on one and dials the other, so the
+	// new transport has to name the same two numbers or the reuse is just
+	// a cold start behind different addresses.
+	var chainPort, upstreamPort int
+	kept := false
+	if port, up, ok := m.chainHandoff(driver); ok {
+		chainPort, upstreamPort, kept = port, up, true
+	} else {
+		// Not this connect's leg (no keep armed, the other driver, or a
+		// child that died on its own): reap whatever the previous group
+		// left standing before taking new ports.
+		m.retireChainLeg()
+		var allocErr error
+		chainPort, upstreamPort, allocErr = allocateSpoofChainPorts(settings, spoofMgr.GetListenPort())
+		if allocErr != nil {
+			_ = spoofMgr.Stop()
+			clearSpoofFrontPort()
+			return allocErr
+		}
 	}
-	setSpoofChainPorts(psiphonPort, upstreamPort)
-	startErr := transportStart()
+	claimPickedConnectPorts(chainPort, upstreamPort)
+	setSpoofChainPorts(driver, chainPort, upstreamPort)
+	transportErr := transportStart()
 	// The config is rendered and accepted; ephemeral test cores must
 	// never see the chain afterwards.
 	clearSpoofChainPorts()
-	if startErr != nil {
+	if transportErr != nil {
 		_ = spoofMgr.Stop()
 		clearSpoofFrontPort()
-		return startErr
+		// A connect that failed names no chain ports at all, so the
+		// handed-over child has nothing left to serve.
+		if kept {
+			m.retireChainLeg()
+		}
+		return transportErr
 	}
-	if _, err := psiphonMgr.StartPsiphonOnly(settings, psiphonPort, upstreamPort, psiphonChainWarmup); err != nil {
+	warmup := chainWarmup(driver)
+	var startErr error
+	switch {
+	case kept:
+		// No spawn, no home-server handshake, no consensus fetch: that is
+		// the whole point of the keep. The child's tunnels are already
+		// built and its streams resume as the transport's upstream inbound
+		// starts listening again, seconds later.
+	case driver == chainDriverTor:
+		startErr = m.startTorChainLeg(torMgr, settings, chainPort, upstreamPort, warmup)
+	default:
+		_, startErr = psiphonMgr.StartPsiphonOnly(settings, chainPort, upstreamPort, warmup)
+	}
+	if startErr != nil {
 		_ = transportStop()
 		_ = spoofMgr.Stop()
 		clearSpoofFrontPort()
-		return fmt.Errorf("psiphon chain: %w", err)
+		if kept {
+			m.retireChainLeg()
+		}
+		return fmt.Errorf("%s chain: %w", driver, startErr)
 	}
 	m.mu.Lock()
-	m.psiphonActive = true
-	m.psiphonPort = psiphonPort
+	m.chainActive = true
+	m.chainKind = driver
+	m.chainPort = chainPort
+	m.chainUpstreamPort = upstreamPort
 	m.mu.Unlock()
 	committed = true
 	return nil
+}
+
+// startTorChainLeg runs the chain's Tor hop, and picks the Tor
+// implementation that carries it.
+//
+// There are two: the Tor Project's tor.exe and the arti client linked
+// into aether.exe. The daemon is the one that bootstraps on the spoofed
+// path — arti stops at 15% there, where a fronted tor.exe reached 100%
+// and carried traffic on the machine this ships to — so it runs whenever
+// the machine has one, and its error is returned as it came: after an
+// installed tor.exe has failed, falling through to arti would hide that
+// failure behind a second engine's whole readiness budget. Only a machine
+// with no tor.exe at all takes the arti leg, which is the shape that ran
+// before the daemon existed. Either way the run says which engine carried
+// the hop, because the two answer to different version numbers and one
+// word, "tor", for both is how a compare-the-two-connects user ends up
+// chasing the wrong binary.
+func (m *CoreManager) startTorChainLeg(torMgr *AetherManager, settings Settings, chainPort, upstreamPort int, warmup time.Duration) error {
+	exe, whyArti := standaloneTorFor(settings)
+	if exe != "" {
+		_, _, err := torMgr.StartStandaloneTor(settings, chainPort, upstreamPort,
+			standaloneTorWarmup(torMgr, warmup), nil)
+		return err
+	}
+	torMgr.log("info", fmt.Sprintf("tor chain: %s; running the hop on aether.exe's arti client instead", whyArti))
+	_, err := torMgr.StartTorOnly(settings, chainPort, upstreamPort, warmup)
+	return err
+}
+
+// startAetherTorHop runs the Aether leg's Tor hop on the standalone
+// daemon: [torMgr] owns the child, [hop] is the profile the engine would
+// have carried the hop with (its Tor options are the daemon's bridges),
+// [tunnelPort] the listener the daemon dials through and [tunnelAlive]
+// the engine's own answer, which ends the wait when the tunnel the hop
+// depends on goes away — the same rule waitChainTunnel keeps for the
+// arti shape, where a dead front would otherwise cost the connect its
+// whole bootstrap budget.
+//
+// The daemon's listener is what the connect publishes: the main core's
+// outbound has to dial Tor, and the tunnel becomes the daemon's own
+// front. Nothing is published on the way out, so a hop that failed
+// leaves the rollback to unpublish the tunnel it did start.
+func (m *CoreManager) startAetherTorHop(torMgr *AetherManager, settings Settings, hop *Profile,
+	tunnelPort int, tunnelAlive func() bool) (int, uint64, error) {
+	// The engine holds tunnelPort already, so the probe cannot hand it
+	// back; TCP and UDP both, because a WARP or scan listener can sit on
+	// the number's UDP side alone.
+	daemonPort, err := freePortTCPAndUDP()
+	if err != nil {
+		return 0, 0, err
+	}
+	claimPickedConnectPorts(daemonPort)
+	listen, token, err := torMgr.StartStandaloneTor(aetherTorHopSettings(settings, hop),
+		daemonPort, tunnelPort, standaloneTorWarmup(torMgr, torChainWarmup), tunnelAlive)
+	if err != nil {
+		return 0, token, err
+	}
+	if !tunnelAlive() {
+		_ = torMgr.StopToken(token)
+		return 0, 0, fmt.Errorf("the aether tunnel exited while %s was bootstrapping, so the hop has no front to dial", torExeName)
+	}
+	setAetherActivePort(listen)
+	return listen, token, nil
 }
 
 // activeCoreHintSpoof records a pending spoof Start like
@@ -802,24 +1068,42 @@ func (m *CoreManager) Stop() error {
 	xrayMgr, singboxMgr, spoofMgr, aetherMgr, core := m.xrayMgr, m.singboxMgr, m.spoofMgr, m.aetherMgr, m.activeCore
 	upstreamMgr, upstreamActive := m.upstreamMgr, m.upstreamActive
 	mihomoMgr := m.mihomoMgr
-	psiphonMgr, spoofXray := m.psiphonMgr, m.spoofXray
+	psiphonMgr, torMgr, spoofXray := m.psiphonMgr, m.torMgr, m.spoofXray
 	spoofUpstream := m.spoofUpstream
 	aetherWasActive := m.aetherActive
+	// A sticky reconnect arms the keep for exactly this teardown; reading
+	// and clearing it here is what stops a later plain Disconnect from
+	// inheriting it. Only a committed spoof chain has a leg worth keeping.
+	keepChain := m.chainKeep && m.chainActive && m.activeCore == CoreSpoof
+	m.chainKeep = false
+	var keepMgr *AetherManager
+	if keepChain {
+		keepMgr = m.chainMgrLocked(m.chainKind)
+	} else {
+		m.chainActive = false
+		m.chainKind = ""
+		m.chainPort = 0
+		m.chainUpstreamPort = 0
+	}
 	m.aetherActive = false
-	m.psiphonActive = false
-	m.psiphonPort = 0
+	m.aetherTorActive = false
 	m.spoofXray = false
 	m.spoofUpstream = false
 	m.mu.Unlock()
 	var err error
-	// The chain's Psiphon leg is stopped unconditionally, whatever core
-	// the group reports: a Disconnect landing while the chain was still
-	// warming never committed psiphonActive, and a stale leg from an
-	// earlier group must not keep serving after the disconnect. Stop on an
-	// idle manager is a no-op.
-	if psiphonMgr != nil {
-		if pErr := psiphonMgr.Stop(); pErr != nil && err == nil {
-			err = pErr
+	// The chain's Psiphon/Tor leg is stopped unconditionally, whatever
+	// core the group reports: a Disconnect landing while the chain was
+	// still warming never committed chainActive, and a stale leg from an
+	// earlier group must not keep serving after the disconnect. Asking
+	// both managers is always safe — the one that never started is idle,
+	// and Stop on an idle manager is a no-op. The exception is the leg a
+	// sticky reconnect handed over, which the next connect adopts.
+	for _, chainMgr := range []*AetherManager{psiphonMgr, torMgr} {
+		if chainMgr == nil || chainMgr == keepMgr {
+			continue
+		}
+		if cErr := chainMgr.Stop(); cErr != nil && err == nil {
+			err = cErr
 		}
 	}
 	if aetherWasActive {
@@ -919,15 +1203,20 @@ func (m *CoreManager) Stop() error {
 func (m *CoreManager) stopLocked() error {
 	var err error
 	// Unconditional, like Stop: a half-started chain or a stale leg from
-	// an earlier group must not outlive the group it belonged to. Stop on
-	// an idle manager is a no-op.
-	if m.psiphonMgr != nil {
-		if pErr := m.psiphonMgr.Stop(); pErr != nil && err == nil {
-			err = pErr
+	// an earlier group must not outlive the group it belonged to. Asking
+	// both managers is always safe — the one that never started is idle,
+	// and Stop on an idle manager is a no-op.
+	for _, chainMgr := range []*AetherManager{m.psiphonMgr, m.torMgr} {
+		if chainMgr == nil {
+			continue
+		}
+		if cErr := chainMgr.Stop(); cErr != nil && err == nil {
+			err = cErr
 		}
 	}
 	if m.aetherActive {
 		m.aetherActive = false
+		m.aetherTorActive = false
 		clearAetherActivePort()
 		if m.aetherMgr != nil {
 			if e2 := m.aetherMgr.Stop(); e2 != nil && err == nil {
@@ -949,10 +1238,13 @@ func (m *CoreManager) stopLocked() error {
 			err = m.mihomoMgr.Stop()
 		}
 	case CoreSpoof:
-		// Psiphon (the exit) is already stopped above; then the
-		// transport, then the engine.
-		m.psiphonActive = false
-		m.psiphonPort = 0
+		// The exit chain (Psiphon or Tor) is already stopped above; then
+		// the transport, then the engine. A pending connect never keeps a
+		// leg for the next one: this rollback reaps what it did not commit.
+		m.chainActive = false
+		m.chainKind = ""
+		m.chainPort = 0
+		m.chainUpstreamPort = 0
 		// The transport is whichever SpoofXray / CoreEngine selected; the
 		// other's Stop is a no-op.
 		if m.spoofXray {
@@ -1226,14 +1518,16 @@ func (m *CoreManager) beginAetherProbe(profile *Profile, settings Settings) (int
 	if aetherMgr == nil {
 		return 0, noRestore, fmt.Errorf("aether manager not wired")
 	}
-	// The connected profile reuses the live engine. Port() is the
-	// engine's own listener; the published port holds the same value and
-	// is what the live config dials.
+	// The connected profile reuses the live engine, and the probe dials
+	// what the live config dials: the published port. With a tor.exe hop
+	// behind the tunnel that is the daemon's front, not the tunnel's own
+	// listener — taking Port() first measured WARP alone and reported it
+	// as the chain's latency.
 	if running && aetherActive && profile.ID != "" && activeID == profile.ID && aetherMgr.Running() {
-		if p := aetherMgr.Port(); p > 0 {
+		if p, ok := currentAetherActivePort(); ok {
 			return p, noRestore, nil
 		}
-		if p, ok := currentAetherActivePort(); ok {
+		if p := aetherMgr.Port(); p > 0 {
 			return p, noRestore, nil
 		}
 		return 0, noRestore, fmt.Errorf("aether engine is running but its listener port is unknown")
@@ -1376,9 +1670,11 @@ func startEphemeralProbe(ctx context.Context, prepare func() (func(), error), st
 // owner-scoped context, so StopEphemeralTests(owner) aborts exactly the
 // probes it owns.
 func (m *CoreManager) EphemeralURLTest(profile *Profile, settings Settings, url string, timeoutMs int, owner string) (*TestResult, error) {
-	if profile == nil {
-		return nil, fmt.Errorf("nil profile")
+	choice, err := resolveProfileCore(profile, settings)
+	if err != nil {
+		return nil, err
 	}
+	profile = &choice.Profile
 	if owner == "" {
 		owner = probeOwnerProxies
 	}
@@ -1416,7 +1712,7 @@ func (m *CoreManager) EphemeralURLTest(profile *Profile, settings Settings, url 
 
 	m.mu.RLock()
 	xrayMgr, singboxMgr, spoofMgr := m.xrayMgr, m.singboxMgr, m.spoofMgr
-	mihomoMgr := m.mihomoMgr
+	mihomoMgr, upstreamMgr := m.mihomoMgr, m.upstreamMgr
 	m.mu.RUnlock()
 
 	// A plain spoof connect may run on either transport
@@ -1525,6 +1821,29 @@ func (m *CoreManager) EphemeralURLTest(profile *Profile, settings Settings, url 
 			return nil, err
 		}
 		return &TestResult{OutboundTag: "proxy", LatencyMs: int32(d.Milliseconds())}, nil
+	}
+
+	if choice.Engine == "upstream" {
+		if upstreamMgr == nil {
+			return nil, fmt.Errorf("upstream sing-box manager is nil")
+		}
+		probe := NewUpstreamSingBoxManager(upstreamMgr.logCh)
+		m.ephProbeAddStop(gen, probe.StopEphemeral)
+		defer probe.StopEphemeral()
+		port, teardown, err := startEphemeralProbe(ctx, prepare, func(mixedPort int) (int, error) {
+			return probe.EphemeralRun(probeProfile, settings, mixedPort)
+		})
+		if teardown != nil {
+			defer teardown()
+		}
+		if err != nil {
+			return nil, err
+		}
+		d, err := proxiedHeadOrGetCtx(ctx, "127.0.0.1:"+strconv.Itoa(port), url, timeout)
+		if err != nil {
+			return nil, err
+		}
+		return &TestResult{OutboundTag: clashProxyTag, LatencyMs: int32(d.Milliseconds())}, nil
 	}
 
 	if singboxMgr == nil {

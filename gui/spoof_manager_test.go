@@ -268,7 +268,7 @@ func TestSpoofManagerStartValidation(t *testing.T) {
 
 func TestBuildSpoofConfigJSON(t *testing.T) {
 	p := spoofTestProfile()
-	p.Address = "www.calmlunch.com"
+	p.Address = "www.node.example"
 	p.Port = 8443
 	s := DefaultSettings()
 	s.SNIConfig = SNIConfig{Method: "wrong_seq", Fingerprint: "chrome_120", QUICMode: "block", IPMode: "ipv4"}
@@ -321,7 +321,7 @@ func TestSpoofEndpointPortLoopback(t *testing.T) {
 	if got := spoofEndpointPort(loop); got != 443 {
 		t.Fatalf("spoofEndpointPort(loopback:40443) = %d, want 443", got)
 	}
-	direct := &Profile{Address: "www.calmlunch.com", Port: 8443}
+	direct := &Profile{Address: "www.node.example", Port: 8443}
 	if got := spoofEndpointPort(direct); got != 8443 {
 		t.Fatalf("spoofEndpointPort(direct:8443) = %d, want 8443", got)
 	}
@@ -341,8 +341,8 @@ func TestResolveSNITargetLoopbackFallsBackToProfile(t *testing.T) {
 	s.SNISNIs = nil
 	p := &Profile{
 		ID: "appxa", Name: "APPXA", Core: CoreSpoof, Protocol: "trojan",
-		Address: "127.0.0.1", Port: 40443, IDOrPassword: "humanity",
-		ServerName: "www.calmlunch.com", Host: "www.calmlunch.com",
+		Address: "127.0.0.1", Port: 40443, IDOrPassword: "pw",
+		ServerName: "www.node.example", Host: "www.node.example",
 		Network: "ws", TLS: true,
 	}
 	// Stub DNS: resolveDomainToCFIP does real lookup; point the pin
@@ -352,8 +352,8 @@ func TestResolveSNITargetLoopbackFallsBackToProfile(t *testing.T) {
 	if err != nil {
 		t.Fatalf("resolveSNITarget loopback: %v", err)
 	}
-	if ip != "104.21.0.1" || sni != "www.calmlunch.com" || port != 443 {
-		t.Fatalf("resolveSNITarget = %s/%s/%d, want 104.21.0.1/www.calmlunch.com/443", ip, sni, port)
+	if ip != "104.21.0.1" || sni != "www.node.example" || port != 443 {
+		t.Fatalf("resolveSNITarget = %s/%s/%d, want 104.21.0.1/www.node.example/443", ip, sni, port)
 	}
 	// Manual SNI pin wins over the profile's.
 	s.SNISelectedSNI = "decoy.example.com"
@@ -379,18 +379,18 @@ func TestResolveSNITargetLoopbackFallsBackToProfile(t *testing.T) {
 	}
 }
 
-// Regression (prompt.txt Test-CF): a direct-CF trojan+TLS+WS profile
+// Regression (Test-CF): a direct-CF trojan+TLS+WS profile
 // must honor the SNI tab's decoy pins exactly like loopback does.
 // Previously the direct branch ignored the pins — FAKE_SNIS[0] was
-// the profile's own SNI (www.calmlunch.com), so the engine faked the
+// the profile's own SNI (www.node.example), so the engine faked the
 // REAL identity at DPI and Test-CF failed while APPXA (loopback,
 // pin-first) worked. Uses a CF IP literal as the profile address so
 // no DNS lookup happens.
 func TestResolveSNITargetDirectHonorsPins(t *testing.T) {
 	p := &Profile{
 		ID: "test-cf", Name: "Test-CF", Core: CoreSpoof, Protocol: "trojan",
-		Address: "104.21.0.1", Port: 443, IDOrPassword: "humanity",
-		ServerName: "www.calmlunch.com", Host: "www.calmlunch.com",
+		Address: "104.21.0.1", Port: 443, IDOrPassword: "pw",
+		ServerName: "www.node.example", Host: "www.node.example",
 		Network: "ws", TLS: true,
 	}
 	// Pinned decoy pair wins over the profile's own SNI/endpoint.
@@ -422,8 +422,8 @@ func TestResolveSNITargetDirectHonorsPins(t *testing.T) {
 	if err != nil {
 		t.Fatalf("resolveSNITarget direct bare: %v", err)
 	}
-	if ip3 != "104.21.0.1" || sni3 != "www.calmlunch.com" || port3 != 443 {
-		t.Fatalf("resolveSNITarget = %s/%s/%d, want 104.21.0.1/www.calmlunch.com/443", ip3, sni3, port3)
+	if ip3 != "104.21.0.1" || sni3 != "www.node.example" || port3 != 443 {
+		t.Fatalf("resolveSNITarget = %s/%s/%d, want 104.21.0.1/www.node.example/443", ip3, sni3, port3)
 	}
 }
 
@@ -489,7 +489,7 @@ func TestPickSpoofEndpointIP(t *testing.T) {
 // The engine config must carry the curated lists as failover pools,
 // primary first.
 func TestBuildSpoofConfigRendersPools(t *testing.T) {
-	p := &Profile{Address: "www.calmlunch.com", Port: 443}
+	p := &Profile{Address: "www.node.example", Port: 443}
 	s := DefaultSettings()
 	s.SNIIPs = []SNIIP{{IP: "104.21.0.2"}, {IP: "104.21.0.2"}, {IP: "162.158.0.9"}}
 	s.SNISNIs = []SNISNI{{Host: "b.example.com"}, {Host: "B.EXAMPLE.COM."}}
@@ -562,7 +562,7 @@ func TestApplySNIFrontSingBox(t *testing.T) {
 	clearSpoofFrontPort()
 	setSpoofFrontPort(40543)
 	defer clearSpoofFrontPort()
-	direct := &Profile{ID: "x", Core: CoreSingBox, Protocol: "trojan", Address: "www.calmlunch.com", Port: 443, IDOrPassword: "pw"}
+	direct := &Profile{ID: "x", Core: CoreSingBox, Protocol: "trojan", Address: "www.node.example", Port: 443, IDOrPassword: "pw"}
 	raw2, err := BuildSingBoxConfig(direct, s)
 	if err != nil {
 		t.Fatalf("BuildSingBoxConfig direct: %v", err)
@@ -582,7 +582,7 @@ func TestApplySNIFrontXray(t *testing.T) {
 			map[string]any{
 				"tag": "proxy", "protocol": "trojan",
 				"settings": map[string]any{
-					"servers": []any{map[string]any{"address": "www.calmlunch.com", "port": 443}},
+					"servers": []any{map[string]any{"address": "www.node.example", "port": 443}},
 				},
 			},
 		},

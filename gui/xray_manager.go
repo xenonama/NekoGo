@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"log"
 	"net"
@@ -13,7 +12,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 )
 
@@ -123,31 +121,6 @@ func (m *XrayManager) resolveXray() (string, error) {
 	return "", fmt.Errorf("xray executable not found (place it in bin\\ next to nekogo.exe or set xrayPath in settings)")
 }
 
-// checkPortFree bind-tests one TCP address and releases it immediately.
-// An occupied port yields the zombie-hint error (HOTFIX Bug 2); any other
-// failure is returned verbatim. Residual TOCTOU: another process may grab
-// the port between Close and xray's bind — the startup probe still catches
-// that case honestly.
-func checkPortFree(addr string) error {
-	l, err := net.Listen("tcp", addr)
-	if err != nil {
-		msg := strings.ToLower(err.Error())
-		if errors.Is(err, syscall.EADDRINUSE) ||
-			strings.Contains(msg, "in use") ||
-			strings.Contains(msg, "only one usage") ||
-			strings.Contains(msg, "already in use") {
-			_, port, splitErr := net.SplitHostPort(addr)
-			if splitErr != nil {
-				port = addr
-			}
-			return fmt.Errorf("port %s in use — is another xray still running? Kill it or pick a different port", port)
-		}
-		return fmt.Errorf("pre-flight listen %s: %w", addr, err)
-	}
-	_ = l.Close()
-	return nil
-}
-
 // startAborted reports whether the given Start epoch was invalidated by
 // a concurrent Stop (or a superseding Start). Callers must NOT hold m.mu.
 func (m *XrayManager) startAborted(epoch uint64) bool {
@@ -163,12 +136,9 @@ func (m *XrayManager) startAborted(epoch uint64) bool {
 // state commits under lock only on an unchanged epoch, otherwise the
 // child is torn down and Start reports an abort.
 func (m *XrayManager) Start(profile *Profile, settings Settings) error {
-	m.mu.Lock()
-	if m.running {
-		m.mu.Unlock()
+	if m.IsRunning() {
 		return fmt.Errorf("xray already running")
 	}
-	m.stopRequested = false
 	apiAddr := settings.XrayAPIAddress
 	if apiAddr == "" {
 		apiAddr = fmt.Sprintf("127.0.0.1:%d", xrayAPIDefaultPort)
@@ -180,10 +150,11 @@ func (m *XrayManager) Start(profile *Profile, settings Settings) error {
 	apiHost, apiPort := splitAPIAddr(apiAddr)
 	apiAddr = net.JoinHostPort(apiHost, strconv.Itoa(apiPort))
 	mixedPort := effectiveMixedPort(settings.MixedPort)
-	// HOTFIX (zombie xray): a crashed session leaves xray.exe holding
-	// these ports, so the next Connect would fail 5s later with a bare
-	// bind error. Fail fast with a clear message instead. Never silently
-	// pick another port: the UI documents these exact ports.
+	// A crashed session leaves xray.exe holding these ports, and the
+	// previous connect's own core can still be releasing them when the
+	// next Connect lands. Wait the release out before spawning, outside
+	// the lock so the window cannot stall Stop or the stats poll, and
+	// never silently pick another port: the UI documents these exact ones.
 	preflight := []string{fmt.Sprintf("127.0.0.1:%d", mixedPort)}
 	if mixedPort+1 <= 65535 {
 		preflight = append(preflight, fmt.Sprintf("127.0.0.1:%d", mixedPort+1))
@@ -191,12 +162,15 @@ func (m *XrayManager) Start(profile *Profile, settings Settings) error {
 	if apiHost == "127.0.0.1" || apiHost == "0.0.0.0" || apiHost == "::" || apiHost == "localhost" {
 		preflight = append(preflight, fmt.Sprintf("127.0.0.1:%d", apiPort))
 	}
-	for _, ap := range preflight {
-		if err := checkPortFree(ap); err != nil {
-			m.mu.Unlock()
-			return err
-		}
+	if err := waitBindPortsFree(preflight); err != nil {
+		return err
 	}
+	m.mu.Lock()
+	if m.running {
+		m.mu.Unlock()
+		return fmt.Errorf("xray already running")
+	}
+	m.stopRequested = false
 	bin, err := m.resolveXray()
 	if err != nil {
 		m.mu.Unlock()

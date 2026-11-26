@@ -18,3 +18,21 @@ var appIconPNG []byte
 //
 //go:embed app.ico
 var appIconICO []byte
+
+//go:embed assets/tray/show.png
+var trayShowIcon []byte
+
+//go:embed assets/tray/connect.png
+var trayConnectIcon []byte
+
+//go:embed assets/tray/reconnect.png
+var trayReconnectIcon []byte
+
+//go:embed assets/tray/disconnect.png
+var trayDisconnectIcon []byte
+
+//go:embed assets/tray/profiles.png
+var trayProfilesIcon []byte
+
+//go:embed assets/tray/quit.png
+var trayQuitIcon []byte

@@ -7,14 +7,16 @@ REM ============================================================
 REM  NekoGo - export source script
 REM  Copies ONLY GitHub-ready source files into source\
 REM  Usage:
-REM    export-source.bat        (folder only)
-REM    export-source.bat zip    (folder + zip in dist\)
+REM    export-source.bat                     (folder only)
+REM    export-source.bat zip                 (folder + zip in dist\)
+REM    export-source.bat "" D:\tmp\test-out  (folder to a scratch output,
+REM                      for checking the rules without touching source\)
 REM
 REM  Included: root build files + architecture docs (NEKOGO_PATTERNS.md,
 REM    PATTN_*.md), core/, gui/ (no build outputs, no frontend
 REM    node_modules/dist), third_party/ (local sing-box fork, needed to
 REM    build), aether-reference/ (CLI docs + Kotlin reference; binaries
-REM    excluded - see below), runtime/, docs/, script/, pages/,
+REM    excluded - see below), runtime/ docs/, script/, pages/,
 REM    .github/, plus the sibling projects (sni spoofing).
 REM  Skipped: xray/ (build.bat clones Xray-core when missing),
 REM    aether-reference/bin binaries (aether.exe, pt/, zip - add them
@@ -24,6 +26,17 @@ REM    dist/, gui/build/, node_modules, frontend dist/, Rust target/
 REM    dirs, scratch files (prompt.txt, chat.txt, go_files.txt,
 REM    source*/), AGENT_LOG.md (internal development log), and all
 REM    binaries/logs.
+REM  ALSO SKIPPED - these were exported until Nov 2026 and must not be:
+REM    sni spoofing\spoof_config.txt (a subscription DUMP: thousands of
+REM      live trojan/vless links with real passwords and UUIDs. It is the
+REM      user's data and stays on disk; it must never reach a public
+REM      tree. Any sibling *.txt is not build input, so the whole
+REM      extension is skipped there.)
+REM    gui/assets/*.mmdb (MaxMind-licensed data, downloaded by build.bat)
+REM    .gitmodules - dropped from the root-file list. It is the Qt NekoBox
+REM      one (src/3rdparty/qjs, src/3rdparty/cpr), paths this tree has never
+REM      contained, and it was published: git clone && git submodule update
+REM      --init fails on a tree that declares submodules it cannot resolve.
 REM ============================================================
 
 REM ---------- Resolve root ----------
@@ -31,6 +44,10 @@ set "ROOT=%~dp0"
 if "%ROOT:~-1%"=="\" set "ROOT=%ROOT:~0,-1%"
 set "SRC=%ROOT%\source"
 set "DIST=%ROOT%\dist"
+REM  A second argument redirects the output. Checking the include/exclude
+REM  rules should not mean deleting the real source\ first, so a scratch
+REM  path can be given (export-source.bat "" D:\tmp\export-check).
+if not "%~2"=="" set "SRC=%~2"
 
 echo.
 echo ============================================================
@@ -41,7 +58,7 @@ echo ============================================================
 echo.
 
 REM ---------- 1. Clean ----------
-echo [1/7] Cleaning source\ ...
+echo [1/6] Cleaning source\ ...
 if exist "%SRC%" rmdir /s /q "%SRC%"
 mkdir "%SRC%" >nul 2>nul
 if not exist "%SRC%" (echo   [ERR] cannot create source\ folder & goto :fail)
@@ -49,8 +66,8 @@ echo   [ok] source\ is empty
 
 REM ---------- 2. Root files ----------
 echo.
-echo [2/7] Copying root files ...
-for %%F in (build.bat export-source.bat installer.nsi README.md LICENSE VERSION BUILD_NOTES.md NEKOGO_PATTERNS.md PATTN_BACKEND_PATTERNS.md PATTN_DEEP_DIVE_PATTERNS.md PATTN_VS_NEKOGO_GAP_ANALYSIS.md .gitignore .gitmodules) do (
+echo [2/6] Copying root files ...
+for %%F in (build.bat export-source.bat installer.nsi README.md LICENSE VERSION BUILD_NOTES.md NEKOGO_PATTERNS.md PATTN_BACKEND_PATTERNS.md PATTN_DEEP_DIVE_PATTERNS.md PATTN_VS_NEKOGO_GAP_ANALYSIS.md .gitignore) do (
     if exist "%ROOT%\%%F" (
         copy /Y "%ROOT%\%%F" "%SRC%\%%F" >nul
         echo   [ok] %%F
@@ -61,7 +78,7 @@ for %%F in (build.bat export-source.bat installer.nsi README.md LICENSE VERSION 
 
 REM ---------- 3. Go sources (core + gui) ----------
 echo.
-echo [3/7] Copying Go sources ...
+echo [3/6] Copying Go sources ...
 if exist "%ROOT%\core" (
     robocopy "%ROOT%\core" "%SRC%\core" /E /XD bin dist /XF *.exe *.dll *.log *.tmp >nul
     echo   [ok] core
@@ -69,7 +86,10 @@ if exist "%ROOT%\core" (
     echo   [skip] core not found
 )
 if exist "%ROOT%\gui" (
-    robocopy "%ROOT%\gui" "%SRC%\gui" /E /XD build node_modules dist .vite .cache source /XF *.exe *.dll *.sys *.syso *.log *.tmp build_out.txt build_err.txt >nul
+    REM  *.mmdb / *.db are downloaded GeoIP/GeoSite data (MaxMind terms),
+    REM  not source: build.bat fetches them. Shipping them also bloats the
+    REM  repo by megabytes for a file that goes stale.
+    robocopy "%ROOT%\gui" "%SRC%\gui" /E /XD build node_modules dist .vite .cache source /XF *.exe *.dll *.sys *.syso *.log *.tmp *.mmdb *.db build_out.txt build_err.txt >nul
     echo   [ok] gui ^(no build outputs^)
 ) else (
     echo   [skip] gui not found
@@ -77,7 +97,7 @@ if exist "%ROOT%\gui" (
 
 REM ---------- 4. Frontend (no node_modules / dist / tmp) ----------
 echo.
-echo [4/7] Trimming frontend artifacts ...
+echo [4/6] Trimming frontend artifacts ...
 if exist "%SRC%\gui\frontend\node_modules" (
     rmdir /s /q "%SRC%\gui\frontend\node_modules" >nul 2>nul
     echo   [ok] dropped node_modules ^(npm install recreates it^)
@@ -93,7 +113,7 @@ for /d %%D in ("%SRC%\gui\frontend\.bindings-tmp-*") do (
 
 REM ---------- 5. Vendored deps + support dirs ----------
 echo.
-echo [5/7] Copying vendored deps and support dirs ...
+echo [5/6] Copying vendored deps and support dirs ...
 if exist "%ROOT%\third_party" (
     robocopy "%ROOT%\third_party" "%SRC%\third_party" /E /XD .git /XF *.exe *.dll *.log >nul
     echo   [ok] third_party
@@ -123,12 +143,12 @@ if exist "%ROOT%\xray\go.mod" (
 
 REM ---------- 6. Sibling projects (source only) ----------
 echo.
-echo [6/7] Copying sibling projects ...
+echo [6/6] Copying sibling projects ...
 call :copy_sibling "sni spoofing"
 
-REM ---------- 7. Summary ----------
+REM ---------- Summary ----------
 echo.
-echo [7/7] Summary ...
+echo ---------- summary ----------
 set "COUNT=0"
 for /f %%A in ('dir /s /b /a-d "%SRC%" ^| "%SystemRoot%\System32\find.exe" /c /v ""') do set "COUNT=%%A"
 echo   Files: !COUNT!
@@ -195,7 +215,11 @@ if not exist "%ROOT%\%~1" (
     echo   [skip] %~1 not found
     exit /b 0
 )
-robocopy "%ROOT%\%~1" "%SRC%\%~1" /E /XD target dist build bin obj source node_modules .vite .cache .vs .vscode .idea .git /XF *.exe *.dll *.sys *.pdb *.syso *.zip *.map *.log *.tmp config.json chat.txt prompt.txt go_files.txt >nul
+REM  *.txt covers the whole class: chat/prompt/go_files scratch notes and,
+REM  critically, spoof_config.txt - a dump of live proxy links with real
+REM  passwords. None of it is build input for a Rust or Go sibling, so the
+REM  extension is skipped rather than the files being named one by one.
+robocopy "%ROOT%\%~1" "%SRC%\%~1" /E /XD target dist build bin obj source node_modules .vite .cache .vs .vscode .idea .git /XF *.exe *.dll *.sys *.pdb *.syso *.zip *.map *.log *.tmp *.txt config.json >nul
 if errorlevel 8 (
     echo   [warn] %~1 copy had errors ^(robocopy !errorlevel!^)
 ) else (

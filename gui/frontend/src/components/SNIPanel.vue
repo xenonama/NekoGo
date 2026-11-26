@@ -134,10 +134,13 @@
       “Xray for SNI spoofing” in Settings applies to plain spoof connects only — the chain always runs on
       sing-box, whose TUN inbound is what feeds it. This is not the Aether tab's Psiphon chain, which rides
       the Aether tunnel instead.
+      Tor is the other exit chain this leg can run — the Chain tab (advanced mode) picks between them, and
+      turning Psiphon on here replaces it.
       This applies to <strong>Connect</strong> (Home / Proxies) — the SNI tab no longer starts the engine on its own.
     </p>
     <div v-if="status.chain" class="muted">
-      Chain active — Psiphon listening on <span class="mono">127.0.0.1:{{ status.chainPort }}</span>.
+      Chain active — {{ status.chainDriver === 'tor' ? 'Tor' : 'Psiphon' }} listening on
+      <span class="mono">127.0.0.1:{{ status.chainPort }}</span>.
     </div>
     <div v-if="chainOn && !status.running" class="toolbar" style="padding: 12px 0 0">
       <button
@@ -605,7 +608,8 @@ const rateClass = computed(() => {
   return 'lat-bad'
 })
 const filteredLogs = computed(() =>
-  logFilter.value ? logs.value.filter((l) => l.level === logFilter.value) : logs.value,
+  logs.value.filter((l) => l.id > connection.sniLogsClearedThrough
+    && (!logFilter.value || l.level === logFilter.value)),
 )
 
 function barWidth(rate: number): string {
@@ -676,10 +680,12 @@ function numOrUndef(v: unknown): number | undefined {
 // overlapping refreshes read the same log cursor and append the same chunk
 // twice. The connection and aether stores guard the same way.
 let refreshInFlight = false
+let logGeneration = 0
 
 async function refresh() {
   if (refreshInFlight) return
   refreshInFlight = true
+  const generation = logGeneration
   try {
     try {
       status.value = await backend.spoofGetStatus()
@@ -689,7 +695,7 @@ async function refresh() {
     } catch { stats.value = null }
     try {
       const chunk = await backend.spoofGetLogs(logCursor)
-      if (chunk.length > 0) {
+      if (generation === logGeneration && chunk.length > 0) {
         // Cursor is the newest log ID, not a count: the backend buffer is a
         // 2000-entry ring, so an offset drifts and then stops advancing.
         logCursor = chunk.reduce((max, e) => Math.max(max, Number(e.id ?? 0)), logCursor)
@@ -722,6 +728,11 @@ async function saveChain() {
   busy.value = true
   err.value = ''
   chainMsg.value = ''
+  // A leg runs one exit chain, so arming Psiphon drops this leg's Tor.
+  // The backend applies that rule on save and the store's copy is never
+  // re-read afterwards, so the clear has to happen here too — otherwise
+  // the Chain tab goes on showing a driver disk no longer holds.
+  if (chainOn.value) settings.settings.spoofTor = false
   try {
     await settings.save()
     chainMsg.value = chainOn.value
@@ -1231,8 +1242,18 @@ async function resetLists() {
   } catch (e) { err.value = String(e) } finally { busy.value = false }
 }
 
-function clearLogs() {
+async function clearLogs() {
+  logGeneration += 1
+  const through = logs.value.reduce((max, l) => Math.max(max, Number(l.id ?? 0)), logCursor)
   logs.value = []
+  logCursor = through
+  connection.clearSniLogs(through)
+  try {
+    const latest = await backend.recentLogs(1)
+    const newest = latest.reduce((max, l) => Math.max(max, Number(l.id ?? 0)), through)
+    logCursor = Math.max(logCursor, newest)
+    connection.clearSniLogs(newest)
+  } catch { /* keep the local watermark when the backend is unavailable */ }
 }
 
 let timer = 0

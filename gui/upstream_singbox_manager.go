@@ -336,6 +336,32 @@ func (m *UpstreamSingBoxManager) IsRunning() bool {
 	return m.running
 }
 
+func (m *UpstreamSingBoxManager) EphemeralRun(profile *Profile, settings Settings, mixedPort int) (int, error) {
+	_ = m.Stop()
+	es := settings
+	if mixedPort <= 0 {
+		port, err := freePort()
+		if err != nil {
+			return 0, err
+		}
+		mixedPort = port
+	}
+	es.MixedPort = mixedPort
+	es.InboundAddress = aetherLoopback
+	es.TunEnabled = false
+	if err := m.Start(profile, es); err != nil {
+		return 0, err
+	}
+	m.mu.Lock()
+	port := m.socksPort
+	m.mu.Unlock()
+	return port, nil
+}
+
+func (m *UpstreamSingBoxManager) StopEphemeral() {
+	_ = m.Stop()
+}
+
 // GetStats reads GET /connections from the injected Clash API and folds
 // the byte counters into the shared monotonic ledger.
 func (m *UpstreamSingBoxManager) GetStats() (*Stats, error) {
@@ -619,10 +645,6 @@ var upstreamUnsupportedProtocols = map[string]bool{
 	"juicity":     true,
 	"trusttunnel": true,
 }
-
-// upstreamUnsupportedProfileMessage is the Connect-time refusal shown
-// when the opt-in upstream core is asked to run a NekoGo-only profile.
-const upstreamUnsupportedProfileMessage = "This profile uses a protocol the upstream sing-box core cannot run. Switch to the Custom core in Settings → Connection, or use a different profile."
 
 // upstreamUnsupportedReason reports why p cannot run on the official
 // sing-box build ("" when it can). Detection is deliberately narrow and

@@ -37,6 +37,13 @@ export function ActiveProxyPorts(): $CancellablePromise<$models.ProxyPorts> {
 }
 
 /**
+ * AetherCancelKeys aborts the renewal in flight, if any.
+ */
+export function AetherCancelKeys(): $CancellablePromise<void> {
+    return $Call.ByID(2739430386);
+}
+
+/**
  * AetherCancelScan aborts the scan in flight, if any.
  */
 export function AetherCancelScan(): $CancellablePromise<void> {
@@ -51,10 +58,62 @@ export function AetherClearScanResults(): $CancellablePromise<void> {
 }
 
 /**
+ * AetherCommandPreview renders the engine line a profile's settings
+ * produce, for the Aether tab's command box: the same shaping a connect
+ * applies, the hand-written command left out (the box compares against
+ * it), and the port a command that names no listener gets. The listen
+ * port a connect really uses is picked then, so this one is the
+ * placeholder the command reader would supply.
+ */
+export function AetherCommandPreview(p: $models.Profile): $CancellablePromise<string> {
+    return $Call.ByID(1465695991, p);
+}
+
+/**
+ * AetherKeysList reports the WARP identities NekoGo holds, one row per
+ * key file, present or not.
+ */
+export function AetherKeysList(): $CancellablePromise<$models.AetherKeyInfo[]> {
+    return $Call.ByID(740158720).then(($result: any) => {
+        return $$createType2($result);
+    });
+}
+
+/**
+ * AetherKeysPreview renders the registration line [s] builds, for the
+ * card's command box. The hand-written command is left out: the box
+ * compares against this to tell one from the other.
+ */
+export function AetherKeysPreview(s: $models.aetherKeysSettings): $CancellablePromise<string> {
+    return $Call.ByID(535181948, s);
+}
+
+/**
+ * AetherKeysProgress reports the live renewal progress.
+ */
+export function AetherKeysProgress(): $CancellablePromise<$models.AetherKeysStatus> {
+    return $Call.ByID(1004652779).then(($result: any) => {
+        return $$createType3($result);
+    });
+}
+
+/**
  * AetherListScanResults returns the persisted scan results.
  */
 export function AetherListScanResults(): $CancellablePromise<$models.AetherScanResult[]> {
     return $Call.ByID(943964821).then(($result: any) => {
+        return $$createType5($result);
+    });
+}
+
+/**
+ * AetherRenewKeys registers new WARP keys of the kind [s] asks for and
+ * puts them in place of the ones in use, once every file of that kind is
+ * there. Until then the working keys are untouched, so a failure, a
+ * cancel or the app being killed leaves them in use.
+ */
+export function AetherRenewKeys(s: $models.aetherKeysSettings): $CancellablePromise<$models.AetherKeyInfo[]> {
+    return $Call.ByID(1585679385, s).then(($result: any) => {
         return $$createType2($result);
     });
 }
@@ -68,7 +127,7 @@ export function AetherListScanResults(): $CancellablePromise<$models.AetherScanR
  */
 export function AetherSaveScanResultAsConfig(index: number, name: string): $CancellablePromise<$models.AetherConfig> {
     return $Call.ByID(4167439847, index, name).then(($result: any) => {
-        return $$createType3($result);
+        return $$createType6($result);
     });
 }
 
@@ -80,7 +139,7 @@ export function AetherSaveScanResultAsConfig(index: number, name: string): $Canc
  */
 export function AetherScan(p: $models.Profile): $CancellablePromise<$models.AetherScanResult | null> {
     return $Call.ByID(1505509261, p).then(($result: any) => {
-        return $$createType4($result);
+        return $$createType7($result);
     });
 }
 
@@ -97,7 +156,7 @@ export function AetherScanCancel(): $CancellablePromise<void> {
  */
 export function AetherScanEndpoints(count: number, timeoutMs: number): $CancellablePromise<$models.AetherScanResult[]> {
     return $Call.ByID(2215568821, count, timeoutMs).then(($result: any) => {
-        return $$createType2($result);
+        return $$createType5($result);
     });
 }
 
@@ -107,7 +166,7 @@ export function AetherScanEndpoints(count: number, timeoutMs: number): $Cancella
  */
 export function AetherScanLogs(sinceID: number): $CancellablePromise<$models.LogEntry[]> {
     return $Call.ByID(833732846, sinceID).then(($result: any) => {
-        return $$createType6($result);
+        return $$createType9($result);
     });
 }
 
@@ -118,7 +177,7 @@ export function AetherScanLogs(sinceID: number): $CancellablePromise<$models.Log
  */
 export function AetherScanProfileEndpoints(p: $models.Profile, count: number, timeoutMs: number): $CancellablePromise<$models.AetherScanResult[]> {
     return $Call.ByID(4020931224, p, count, timeoutMs).then(($result: any) => {
-        return $$createType2($result);
+        return $$createType5($result);
     });
 }
 
@@ -127,8 +186,22 @@ export function AetherScanProfileEndpoints(p: $models.Profile, count: number, ti
  */
 export function AetherScanStatus(): $CancellablePromise<$models.AetherScanStatus> {
     return $Call.ByID(533360919).then(($result: any) => {
-        return $$createType7($result);
+        return $$createType10($result);
     });
+}
+
+/**
+ * AetherVersion runs "<resolved aether path> -v" and returns the first
+ * non-empty stdout line, cached per resolved path like the other cores
+ * (a transient "" is never cached, so the next call retries). aether.exe
+ * is the binary that carries Tor — arti is linked into it — and Psiphon,
+ * so this is the answer to "is Tor here, and which one": measured on
+ * 2.3.0, -v prints "aether 2.3.0" on stdout and exits 0. Empty when no
+ * aether.exe resolves; the engine is optional and only the Aether
+ * profiles and the two exit chains need it.
+ */
+export function AetherVersion(): $CancellablePromise<string> {
+    return $Call.ByID(2873812736);
 }
 
 /**
@@ -189,7 +262,7 @@ export function CancelSNIScan(): $CancellablePromise<void> {
  */
 export function CheckUpdates(): $CancellablePromise<$models.UpdatableComponent[]> {
     return $Call.ByID(2263355335).then(($result: any) => {
-        return $$createType9($result);
+        return $$createType12($result);
     });
 }
 
@@ -265,7 +338,7 @@ export function DeleteSubscription(url: string, alsoProfiles: boolean): $Cancell
  */
 export function DetectCountry(id: string): $CancellablePromise<$models.Profile | null> {
     return $Call.ByID(4211373600, id).then(($result: any) => {
-        return $$createType10($result);
+        return $$createType13($result);
     });
 }
 
@@ -298,7 +371,7 @@ export function Disconnect(): $CancellablePromise<void> {
  */
 export function EditSubscription(oldURL: string, newURL: string, name: string): $CancellablePromise<$models.LinkImportResult | null> {
     return $Call.ByID(3892794040, oldURL, newURL, name).then(($result: any) => {
-        return $$createType12($result);
+        return $$createType15($result);
     });
 }
 
@@ -327,7 +400,7 @@ export function ExportAllData(): $CancellablePromise<string> {
  */
 export function GenWgKeyPair(): $CancellablePromise<$models.WgKeyPair | null> {
     return $Call.ByID(2544996626).then(($result: any) => {
-        return $$createType14($result);
+        return $$createType17($result);
     });
 }
 
@@ -336,7 +409,7 @@ export function GenWgKeyPair(): $CancellablePromise<$models.WgKeyPair | null> {
  */
 export function GeoIPStatus(): $CancellablePromise<$models.GeoIPStatus | null> {
     return $Call.ByID(3477145149).then(($result: any) => {
-        return $$createType16($result);
+        return $$createType19($result);
     });
 }
 
@@ -372,7 +445,7 @@ export function GetRawConfig(): $CancellablePromise<string> {
  */
 export function GetSettings(): $CancellablePromise<$models.Settings> {
     return $Call.ByID(2554697378).then(($result: any) => {
-        return $$createType17($result);
+        return $$createType20($result);
     });
 }
 
@@ -381,7 +454,7 @@ export function GetSettings(): $CancellablePromise<$models.Settings> {
  */
 export function GetStats(): $CancellablePromise<$models.Stats | null> {
     return $Call.ByID(2859423874).then(($result: any) => {
-        return $$createType19($result);
+        return $$createType22($result);
     });
 }
 
@@ -414,7 +487,7 @@ export function ImportAllData(blob: string): $CancellablePromise<void> {
  */
 export function ImportLinks(text: string): $CancellablePromise<$models.LinkImportResult | null> {
     return $Call.ByID(3624920349, text).then(($result: any) => {
-        return $$createType12($result);
+        return $$createType15($result);
     });
 }
 
@@ -458,7 +531,7 @@ export function LastError(): $CancellablePromise<string> {
  */
 export function LastNetworkResults(): $CancellablePromise<$models.LastNetworkResults | null> {
     return $Call.ByID(828270889).then(($result: any) => {
-        return $$createType21($result);
+        return $$createType24($result);
     });
 }
 
@@ -470,7 +543,7 @@ export function LastNetworkResults(): $CancellablePromise<$models.LastNetworkRes
  */
 export function ListConnections(): $CancellablePromise<$models.ConnectionList | null> {
     return $Call.ByID(786053378).then(($result: any) => {
-        return $$createType23($result);
+        return $$createType26($result);
     });
 }
 
@@ -479,7 +552,7 @@ export function ListConnections(): $CancellablePromise<$models.ConnectionList | 
  */
 export function ListProfiles(): $CancellablePromise<$models.Profile[]> {
     return $Call.ByID(1957526603).then(($result: any) => {
-        return $$createType24($result);
+        return $$createType27($result);
     });
 }
 
@@ -488,7 +561,7 @@ export function ListProfiles(): $CancellablePromise<$models.Profile[]> {
  */
 export function ListSubscriptions(): $CancellablePromise<$models.Subscription[]> {
     return $Call.ByID(740620337).then(($result: any) => {
-        return $$createType26($result);
+        return $$createType29($result);
     });
 }
 
@@ -498,7 +571,7 @@ export function ListSubscriptions(): $CancellablePromise<$models.Subscription[]>
  */
 export function ListUpdatables(): $CancellablePromise<$models.UpdatableComponent[]> {
     return $Call.ByID(3240550730).then(($result: any) => {
-        return $$createType9($result);
+        return $$createType12($result);
     });
 }
 
@@ -536,7 +609,7 @@ export function OpenURL(raw: string): $CancellablePromise<void> {
  */
 export function PreviewLinks(text: string): $CancellablePromise<$models.LinkImportResult | null> {
     return $Call.ByID(1147800640, text).then(($result: any) => {
-        return $$createType12($result);
+        return $$createType15($result);
     });
 }
 
@@ -545,8 +618,27 @@ export function PreviewLinks(text: string): $CancellablePromise<$models.LinkImpo
  */
 export function RecentLogs(n: number): $CancellablePromise<$models.LogEntry[]> {
     return $Call.ByID(2546983805, n).then(($result: any) => {
-        return $$createType6($result);
+        return $$createType9($result);
     });
+}
+
+/**
+ * Reconnect restarts the tunnel on the profile the UI says is running.
+ * What happens to the exit chain in between is Settings.ReconnectMode:
+ * "restart" (the default, and what the button has always done) takes
+ * every leg down and raises them again, "sticky" hands the SNI spoof
+ * chain's Psiphon/Tor child to the connect that follows instead of
+ * reaping it — a cold Psiphon handshake or Tor consensus fetch is
+ * minutes, and the thing a person presses this over is the tunnel
+ * underneath it. "off" is the UI's business (the button is not rendered);
+ * the call stays a plain reconnect rather than an error, so a stale click
+ * can never be worse than Connect.
+ * 
+ * The Aether leg is never in the offer: its chain runs inside the aether
+ * engine process, so stopping the engine stops the chain with it.
+ */
+export function Reconnect(id: string): $CancellablePromise<void> {
+    return $Call.ByID(3863412110, id);
 }
 
 /**
@@ -558,7 +650,7 @@ export function RecentLogs(n: number): $CancellablePromise<$models.LogEntry[]> {
  */
 export function RefreshAllCountries(): $CancellablePromise<$models.CountryRefreshResult | null> {
     return $Call.ByID(20662175).then(($result: any) => {
-        return $$createType28($result);
+        return $$createType31($result);
     });
 }
 
@@ -568,7 +660,7 @@ export function RefreshAllCountries(): $CancellablePromise<$models.CountryRefres
  */
 export function RefreshCountriesProgress(): $CancellablePromise<$models.RefreshProgress> {
     return $Call.ByID(2518894873).then(($result: any) => {
-        return $$createType29($result);
+        return $$createType32($result);
     });
 }
 
@@ -589,6 +681,14 @@ export function RelaunchAsAdmin(): $CancellablePromise<void> {
  */
 export function ReloadCoreNow(): $CancellablePromise<void> {
     return $Call.ByID(4109062701);
+}
+
+export function RemoveProxyGroup(name: string): $CancellablePromise<void> {
+    return $Call.ByID(3168810194, name);
+}
+
+export function RenameProxyGroup(oldName: string, newName: string): $CancellablePromise<void> {
+    return $Call.ByID(2688809148, oldName, newName);
 }
 
 /**
@@ -626,8 +726,15 @@ export function ResetToDefaults(confirm: string): $CancellablePromise<void> {
  */
 export function RuntimeInfo(): $CancellablePromise<{ [_ in string]?: string }> {
     return $Call.ByID(1014147495).then(($result: any) => {
-        return $$createType30($result);
+        return $$createType33($result);
     });
+}
+
+/**
+ * SaveAetherKeysSettings persists the WARP keys card's settings.
+ */
+export function SaveAetherKeysSettings(s: $models.aetherKeysSettings): $CancellablePromise<void> {
+    return $Call.ByID(220836196, s);
 }
 
 /**
@@ -635,7 +742,7 @@ export function RuntimeInfo(): $CancellablePromise<{ [_ in string]?: string }> {
  */
 export function SaveProfile(p: $models.Profile): $CancellablePromise<$models.Profile> {
     return $Call.ByID(406053493, p).then(($result: any) => {
-        return $$createType3($result);
+        return $$createType6($result);
     });
 }
 
@@ -655,7 +762,7 @@ export function SaveSettings(s: $models.Settings): $CancellablePromise<void> {
  */
 export function ScanSNIPairs(ips: string[], snis: string[]): $CancellablePromise<$models.SNIPairResult[]> {
     return $Call.ByID(2095776161, ips, snis).then(($result: any) => {
-        return $$createType32($result);
+        return $$createType35($result);
     });
 }
 
@@ -664,7 +771,7 @@ export function ScanSNIPairs(ips: string[], snis: string[]): $CancellablePromise
  */
 export function ScanSNIStatus(): $CancellablePromise<$models.SNIScanStatus> {
     return $Call.ByID(2720764494).then(($result: any) => {
-        return $$createType33($result);
+        return $$createType36($result);
     });
 }
 
@@ -768,7 +875,7 @@ export function Shutdown(): $CancellablePromise<void> {
  */
 export function SpoofGetConfig(): $CancellablePromise<$models.SNIConfig> {
     return $Call.ByID(2618895244).then(($result: any) => {
-        return $$createType34($result);
+        return $$createType37($result);
     });
 }
 
@@ -782,7 +889,7 @@ export function SpoofGetConfig(): $CancellablePromise<$models.SNIConfig> {
  */
 export function SpoofGetLogs(sinceID: number): $CancellablePromise<$models.LogEntry[]> {
     return $Call.ByID(834062945, sinceID).then(($result: any) => {
-        return $$createType6($result);
+        return $$createType9($result);
     });
 }
 
@@ -791,7 +898,7 @@ export function SpoofGetLogs(sinceID: number): $CancellablePromise<$models.LogEn
  */
 export function SpoofGetStats(): $CancellablePromise<$models.SpoofStats | null> {
     return $Call.ByID(640968337).then(($result: any) => {
-        return $$createType36($result);
+        return $$createType39($result);
     });
 }
 
@@ -804,7 +911,7 @@ export function SpoofGetStats(): $CancellablePromise<$models.SpoofStats | null> 
  */
 export function SpoofGetStatus(): $CancellablePromise<$models.SpoofStatus> {
     return $Call.ByID(243433356).then(($result: any) => {
-        return $$createType37($result);
+        return $$createType40($result);
     });
 }
 
@@ -850,7 +957,7 @@ export function SpoofStop(): $CancellablePromise<void> {
  */
 export function SpoofUseProfile(profileID: string): $CancellablePromise<$models.Profile> {
     return $Call.ByID(1878066210, profileID).then(($result: any) => {
-        return $$createType3($result);
+        return $$createType6($result);
     });
 }
 
@@ -860,7 +967,7 @@ export function SpoofUseProfile(profileID: string): $CancellablePromise<$models.
  */
 export function StartIPTest(): $CancellablePromise<$models.IPTestResult | null> {
     return $Call.ByID(3352228422).then(($result: any) => {
-        return $$createType39($result);
+        return $$createType42($result);
     });
 }
 
@@ -870,7 +977,7 @@ export function StartIPTest(): $CancellablePromise<$models.IPTestResult | null> 
  */
 export function StartSpeedTest(): $CancellablePromise<$models.SpeedTestResult | null> {
     return $Call.ByID(4087771042).then(($result: any) => {
-        return $$createType41($result);
+        return $$createType44($result);
     });
 }
 
@@ -883,7 +990,7 @@ export function StartSpeedTest(): $CancellablePromise<$models.SpeedTestResult | 
  */
 export function StartURLTest(url: string, timeoutMs: number): $CancellablePromise<$models.URLTestResult | null> {
     return $Call.ByID(1003176084, url, timeoutMs).then(($result: any) => {
-        return $$createType43($result);
+        return $$createType46($result);
     });
 }
 
@@ -893,7 +1000,7 @@ export function StartURLTest(url: string, timeoutMs: number): $CancellablePromis
  */
 export function Status(): $CancellablePromise<{ [_ in string]?: any }> {
     return $Call.ByID(2836613335).then(($result: any) => {
-        return $$createType44($result);
+        return $$createType47($result);
     });
 }
 
@@ -922,8 +1029,18 @@ export function StopTest(): $CancellablePromise<void> {
  */
 export function TestProfile(id: string, timeoutMs: number): $CancellablePromise<$models.TestResult | null> {
     return $Call.ByID(4060449302, id, timeoutMs).then(($result: any) => {
-        return $$createType46($result);
+        return $$createType49($result);
     });
+}
+
+/**
+ * TorVersion answers "<exe> --version" for the standalone binary, cached
+ * per resolved path the way every other engine is. The flag matters:
+ * "tor -v" is a malformed option that drops the daemon into its startup
+ * path, while "--version" prints one line and exits.
+ */
+export function TorVersion(): $CancellablePromise<string> {
+    return $Call.ByID(534341558);
 }
 
 /**
@@ -932,7 +1049,7 @@ export function TestProfile(id: string, timeoutMs: number): $CancellablePromise<
  */
 export function UpdateComponent(id: string): $CancellablePromise<$models.UpdatableComponent | null> {
     return $Call.ByID(3747493819, id).then(($result: any) => {
-        return $$createType47($result);
+        return $$createType50($result);
     });
 }
 
@@ -942,7 +1059,7 @@ export function UpdateComponent(id: string): $CancellablePromise<$models.Updatab
  */
 export function UpdateSubscriptions(): $CancellablePromise<$models.LinkImportResult | null> {
     return $Call.ByID(586842178).then(($result: any) => {
-        return $$createType12($result);
+        return $$createType15($result);
     });
 }
 
@@ -977,50 +1094,53 @@ export function XrayVersion(): $CancellablePromise<string> {
 
 // Private type creation functions
 const $$createType0 = $models.ProxyPorts.createFrom;
-const $$createType1 = $models.AetherScanResult.createFrom;
+const $$createType1 = $models.AetherKeyInfo.createFrom;
 const $$createType2 = $Create.Array($$createType1);
-const $$createType3 = $models.Profile.createFrom;
-const $$createType4 = $Create.Nullable($$createType1);
-const $$createType5 = $models.LogEntry.createFrom;
-const $$createType6 = $Create.Array($$createType5);
-const $$createType7 = $models.AetherScanStatus.createFrom;
-const $$createType8 = $models.UpdatableComponent.createFrom;
+const $$createType3 = $models.AetherKeysStatus.createFrom;
+const $$createType4 = $models.AetherScanResult.createFrom;
+const $$createType5 = $Create.Array($$createType4);
+const $$createType6 = $models.Profile.createFrom;
+const $$createType7 = $Create.Nullable($$createType4);
+const $$createType8 = $models.LogEntry.createFrom;
 const $$createType9 = $Create.Array($$createType8);
-const $$createType10 = $Create.Nullable($$createType3);
-const $$createType11 = $models.LinkImportResult.createFrom;
-const $$createType12 = $Create.Nullable($$createType11);
-const $$createType13 = $models.WgKeyPair.createFrom;
-const $$createType14 = $Create.Nullable($$createType13);
-const $$createType15 = $models.GeoIPStatus.createFrom;
-const $$createType16 = $Create.Nullable($$createType15);
-const $$createType17 = $models.Settings.createFrom;
-const $$createType18 = $models.Stats.createFrom;
+const $$createType10 = $models.AetherScanStatus.createFrom;
+const $$createType11 = $models.UpdatableComponent.createFrom;
+const $$createType12 = $Create.Array($$createType11);
+const $$createType13 = $Create.Nullable($$createType6);
+const $$createType14 = $models.LinkImportResult.createFrom;
+const $$createType15 = $Create.Nullable($$createType14);
+const $$createType16 = $models.WgKeyPair.createFrom;
+const $$createType17 = $Create.Nullable($$createType16);
+const $$createType18 = $models.GeoIPStatus.createFrom;
 const $$createType19 = $Create.Nullable($$createType18);
-const $$createType20 = $models.LastNetworkResults.createFrom;
-const $$createType21 = $Create.Nullable($$createType20);
-const $$createType22 = $models.ConnectionList.createFrom;
-const $$createType23 = $Create.Nullable($$createType22);
-const $$createType24 = $Create.Array($$createType3);
-const $$createType25 = $models.Subscription.createFrom;
-const $$createType26 = $Create.Array($$createType25);
-const $$createType27 = $models.CountryRefreshResult.createFrom;
-const $$createType28 = $Create.Nullable($$createType27);
-const $$createType29 = $models.RefreshProgress.createFrom;
-const $$createType30 = $Create.Map($Create.Any, $Create.Any);
-const $$createType31 = $models.SNIPairResult.createFrom;
-const $$createType32 = $Create.Array($$createType31);
-const $$createType33 = $models.SNIScanStatus.createFrom;
-const $$createType34 = $models.SNIConfig.createFrom;
-const $$createType35 = $models.SpoofStats.createFrom;
-const $$createType36 = $Create.Nullable($$createType35);
-const $$createType37 = $models.SpoofStatus.createFrom;
-const $$createType38 = $models.IPTestResult.createFrom;
+const $$createType20 = $models.Settings.createFrom;
+const $$createType21 = $models.Stats.createFrom;
+const $$createType22 = $Create.Nullable($$createType21);
+const $$createType23 = $models.LastNetworkResults.createFrom;
+const $$createType24 = $Create.Nullable($$createType23);
+const $$createType25 = $models.ConnectionList.createFrom;
+const $$createType26 = $Create.Nullable($$createType25);
+const $$createType27 = $Create.Array($$createType6);
+const $$createType28 = $models.Subscription.createFrom;
+const $$createType29 = $Create.Array($$createType28);
+const $$createType30 = $models.CountryRefreshResult.createFrom;
+const $$createType31 = $Create.Nullable($$createType30);
+const $$createType32 = $models.RefreshProgress.createFrom;
+const $$createType33 = $Create.Map($Create.Any, $Create.Any);
+const $$createType34 = $models.SNIPairResult.createFrom;
+const $$createType35 = $Create.Array($$createType34);
+const $$createType36 = $models.SNIScanStatus.createFrom;
+const $$createType37 = $models.SNIConfig.createFrom;
+const $$createType38 = $models.SpoofStats.createFrom;
 const $$createType39 = $Create.Nullable($$createType38);
-const $$createType40 = $models.SpeedTestResult.createFrom;
-const $$createType41 = $Create.Nullable($$createType40);
-const $$createType42 = $models.URLTestResult.createFrom;
-const $$createType43 = $Create.Nullable($$createType42);
-const $$createType44 = $Create.Map($Create.Any, $Create.Any);
-const $$createType45 = $models.TestResult.createFrom;
+const $$createType40 = $models.SpoofStatus.createFrom;
+const $$createType41 = $models.IPTestResult.createFrom;
+const $$createType42 = $Create.Nullable($$createType41);
+const $$createType43 = $models.SpeedTestResult.createFrom;
+const $$createType44 = $Create.Nullable($$createType43);
+const $$createType45 = $models.URLTestResult.createFrom;
 const $$createType46 = $Create.Nullable($$createType45);
-const $$createType47 = $Create.Nullable($$createType8);
+const $$createType47 = $Create.Map($Create.Any, $Create.Any);
+const $$createType48 = $models.TestResult.createFrom;
+const $$createType49 = $Create.Nullable($$createType48);
+const $$createType50 = $Create.Nullable($$createType11);

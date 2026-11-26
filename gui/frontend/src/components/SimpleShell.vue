@@ -4,13 +4,23 @@
 <template>
   <div class="nb-simple">
     <div class="nb-shell">
-      <Sidebar :mode="mode" :model-value="view" @update:model-value="onNav" @exit="onExitRequest" />
+      <Sidebar
+        :mode="mode"
+        :model-value="view"
+        @update:model-value="onNav"
+        @exit="onExitRequest"
+        @settings-error="settingsError = $event"
+      />
       <!-- visible gates the workspace timers; the shell itself stays
            mounted so tab/scroll state survives a mode switch. -->
       <main v-if="visible" class="nb-center">
         <div v-if="startupError" class="nb-warn-banner nb-dismissible">
           <span>{{ startupError }}</span>
           <button class="nb-banner-x" title="Dismiss" @click="$emit('dismiss-error')">✕</button>
+        </div>
+        <div v-if="settingsError" class="nb-warn-banner nb-dismissible" role="alert">
+          <span>{{ settingsError }}</span>
+          <button class="nb-banner-x" title="Dismiss" @click="settingsError = ''">✕</button>
         </div>
         <!-- Home -->
         <template v-if="view === 'home'">
@@ -129,9 +139,6 @@
         </template>
         <!-- Settings -->
         <template v-else-if="view === 'settings'">
-          <div class="nb-card nb-page">
-            <h3>Settings</h3>
-          </div>
           <SettingsPanel />
           <RoutingRules />
           <template v-if="advanced">
@@ -300,6 +307,7 @@ const connection = useConnectionStore()
 const confirmBox = useConfirmStore()
 const editing = ref(false)
 const editingProfile = ref<Profile | null>(null)
+const settingsError = ref('')
 const subUrl = ref('')
 // Subscriptions live in the shared store so mode switches keep the
 // same feeds and in-flight state.
@@ -519,7 +527,12 @@ function onGoto(key: 'proxies') {
 
 async function onExitRequest() {
   if (!(await confirmLeaveConfig(null))) return
-  void settings.setAdvancedMode(false)
+  settingsError.value = ''
+  try {
+    await settings.setAdvancedMode(false)
+  } catch (e) {
+    settingsError.value = String(e)
+  }
 }
 
 // The Chain tab only exists in Advanced; leaving the mode while it is
@@ -568,8 +581,8 @@ async function saved() {
 async function onSelectServer(id: string) {
   try {
     await settings.setActiveProfileId(id)
-  } catch {
-    // Persistence failed and the action reverted the set; stay put.
+  } catch (e) {
+    settingsError.value = String(e)
     return
   }
   if (view.value === 'proxies') view.value = 'home'

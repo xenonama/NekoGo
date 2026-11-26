@@ -9,7 +9,7 @@ Unicode true
 ; Fallback for a bare `makensis installer.nsi`; build.bat always passes
 ; /DAPP_VERSION from the VERSION file, so keep this in step with it.
 !ifndef APP_VERSION
-  !define APP_VERSION "1.0.0-beta.3"
+  !define APP_VERSION "1.0.0-beta.4"
 !endif
 ; VIProductVersion only accepts 4 plain numbers; build.bat derives this
 ; from the version tag ("1.0.0-beta.1" -> "1.0.0.0").
@@ -137,6 +137,17 @@ Section "Install"
   SetOutPath "$INSTDIR\bin\pt"
   File /nonfatal "${PORTABLE_STAGE}\bin\pt\lyrebird.exe"
   File /nonfatal "${PORTABLE_STAGE}\bin\pt\psiphon-tunnel-core.exe"
+  ; The Tor Project's standalone tor.exe (optional; the Updates → Tor row
+  ; installs it). Its own pluggable_transports\ is what the bundle ships,
+  ; so a bridge line works without the pt\ folder aether uses.
+  SetOutPath "$INSTDIR\bin\tor"
+  File /nonfatal "${PORTABLE_STAGE}\bin\tor\tor.exe"
+  File /nonfatal "${PORTABLE_STAGE}\bin\tor\tor-gencert.exe"
+  File /nonfatal "${PORTABLE_STAGE}\bin\tor\NEKOGO-BUNDLE.txt"
+  SetOutPath "$INSTDIR\bin\tor\pluggable_transports"
+  File /nonfatal "${PORTABLE_STAGE}\bin\tor\pluggable_transports\lyrebird.exe"
+  File /nonfatal "${PORTABLE_STAGE}\bin\tor\pluggable_transports\conjure-client.exe"
+  File /nonfatal "${PORTABLE_STAGE}\bin\tor\pluggable_transports\pt_config.json"
   SetOutPath "$INSTDIR"
   ; Drop the pre-bin copy so an upgrade cannot leave two databases.
   Delete "$INSTDIR\GeoLite2-Country.mmdb"
@@ -183,6 +194,14 @@ Section "Uninstall"
   Delete "$INSTDIR\bin\pt\lyrebird.exe"
   Delete "$INSTDIR\bin\pt\psiphon-tunnel-core.exe"
   RMDir  "$INSTDIR\bin\pt"
+  Delete "$INSTDIR\bin\tor\tor.exe"
+  Delete "$INSTDIR\bin\tor\tor-gencert.exe"
+  Delete "$INSTDIR\bin\tor\NEKOGO-BUNDLE.txt"
+  Delete "$INSTDIR\bin\tor\pluggable_transports\lyrebird.exe"
+  Delete "$INSTDIR\bin\tor\pluggable_transports\conjure-client.exe"
+  Delete "$INSTDIR\bin\tor\pluggable_transports\pt_config.json"
+  RMDir  "$INSTDIR\bin\tor\pluggable_transports"
+  RMDir  "$INSTDIR\bin\tor"
   Delete "$INSTDIR\bin\WinDivert.dll"
   Delete "$INSTDIR\bin\WinDivert64.sys"
   Delete "$INSTDIR\bin\GeoLite2-Country.mmdb"

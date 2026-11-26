@@ -4,11 +4,26 @@ import (
 	"bytes"
 	"fmt"
 	"os"
+	"regexp"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 )
+
+// ansiSeqRe matches an ANSI control sequence (ESC [ params final). Rust's
+// tracing subscriber — arti's logger, and any core that thinks its output
+// goes to a terminal — colours every line with these, and they landed in
+// the log viewer and in failure reports as "\x1b[2m2026-11-14T…\x1b[0m".
+var ansiSeqRe = regexp.MustCompile("\x1b\\[[0-9;?]*[a-zA-Z]")
+
+// stripANSI removes those sequences so a log line reads as text.
+func stripANSI(s string) string {
+	if !strings.ContainsRune(s, '\x1b') {
+		return s
+	}
+	return ansiSeqRe.ReplaceAllString(s, "")
+}
 
 // logLevelEnvName is the child-core env var carrying the GUI log level
 // (Advanced Phase H). The child reads it at startup; when it ignores the
@@ -201,7 +216,7 @@ func (w *logWriter) Write(p []byte) (int, error) {
 			if i < 0 {
 				break
 			}
-			line := strings.TrimSpace(string(b[:i]))
+			line := strings.TrimSpace(stripANSI(string(b[:i])))
 			w.buf.Next(i + 1)
 			if line != "" {
 				if w.ring != nil {

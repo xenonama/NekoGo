@@ -5,6 +5,7 @@ package main
 import (
 	"fmt"
 	"os"
+	"strconv"
 	"strings"
 	"syscall"
 	"unsafe"
@@ -44,6 +45,9 @@ var relaunchElevated = func(args ...string) error {
 	if err != nil {
 		return fmt.Errorf("resolve exe path: %w", err)
 	}
+	// Added only by the real launcher, preserving mocked call expectations.
+	// The child waits for Shutdown/os.Exit, then competes for the normal mutex.
+	args = append(append([]string(nil), args...), "--wait-for-parent", strconv.Itoa(os.Getpid()))
 	verb, _ := syscall.UTF16PtrFromString("runas")
 	file, _ := syscall.UTF16PtrFromString(exe)
 	params, _ := syscall.UTF16PtrFromString(quoteElevateArgs(args))

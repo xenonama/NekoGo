@@ -1,5 +1,5 @@
 <template>
-  <div class="panel">
+  <div class="panel routing-rules">
     <p class="muted">Routing rules are stored per profile via raw config passthrough:</p>
     <ul>
       <li><b>sing-box</b> profiles: put extra <code>route.rules</code> by embedding a full outbound in <i>Raw outbound JSON</i>, or extend <code>BuildSingBoxConfig</code> defaults.</li>
@@ -12,15 +12,17 @@
     </button>
     <p v-if="error" class="latency-bad">{{ error }}</p>
     <p v-if="truncated" class="muted">showing first 500 (server truncated the list)</p>
-    <table class="grid" style="margin-top: 8px">
-      <thead><tr><th>Dest</th><th>Outbound</th><th>Net</th><th>Up</th><th>Down</th></tr></thead>
-      <tbody>
-        <tr v-for="c in conns" :key="c.id">
-          <td>{{ c.dest || c.domain }}</td><td>{{ c.outbound }}</td><td>{{ c.network }}</td>
-          <td>{{ c.upload }}</td><td>{{ c.download }}</td>
-        </tr>
-      </tbody>
-    </table>
+    <div class="routing-rules-scroll" style="margin-top: 8px">
+      <table class="grid">
+        <thead><tr><th>Dest</th><th>Outbound</th><th>Net</th><th>Up</th><th>Down</th></tr></thead>
+        <tbody>
+          <tr v-for="c in conns" :key="c.id">
+            <td>{{ c.dest || c.domain }}</td><td>{{ c.outbound }}</td><td>{{ c.network }}</td>
+            <td>{{ c.upload }}</td><td>{{ c.download }}</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
   </div>
 </template>
 

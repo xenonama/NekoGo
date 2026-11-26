@@ -53,8 +53,8 @@ Until you publish a release, the fork's rows report:
 
 4. **Tag with the version from `VERSION`:**
    The current version is the `VERSION` file at the repo root
-   (e.g. `1.0.0-beta.3`). Tag the release with that version — a leading
-   `v` is accepted, so `v1.0.0-beta.3` matches `1.0.0-beta.3`. The tag is
+   (e.g. `1.0.0-beta.4`). Tag the release with that version — a leading
+   `v` is accepted, so `v1.0.0-beta.4` matches `1.0.0-beta.4`. The tag is
    what the GUI compares against its own link-time `appVersion`, and a
    local build that is ahead of the published tag gets
    `Notes="This build is newer than the published release"`.
@@ -64,7 +64,7 @@ Until you publish a release, the fork's rows report:
 
 5. **Verify:** open NekoGo → Updates → Check. Each row logs
    `[update:<id>] source=<repo> latest=<tag>` (e.g.
-   `[update:nekobox] source=xenonama/NekoGo latest=1.0.0-beta.3`).
+   `[update:nekobox] source=xenonama/NekoGo latest=1.0.0-beta.4`).
    `nekobox` / `xray` replace the engine binaries in place — the updater
    refuses while a core is running, so disconnect first — and the GUI
    installer downloads to `%APPDATA%\NekoGo\updates\`, where it is run

@@ -26,5 +26,31 @@ func TestMain(m *testing.M) {
 		fakeSingBoxMain(os.Args)
 		return
 	}
+	if isFakeXrayInvocation() {
+		fakeXrayMain(os.Args)
+		return
+	}
+	if isFakeMihomoInvocation() {
+		fakeMihomoMain(os.Args)
+		return
+	}
+	// Copied to tor.exe it stands in for the Tor daemon (see
+	// fake_tor_test.go): its SOCKS port opens before the bootstrap
+	// finishes, which is the behaviour the standalone driver gates on.
+	if isFakeTorInvocation() {
+		fakeTorMain(os.Args)
+		return
+	}
+	// Copied to aether.exe it stands in for the Aether engine (see
+	// fake_aether_test.go): a pinned dead endpoint never answers, and the
+	// words that end a session arrive while the process lives.
+	if isFakeAetherInvocation() {
+		fakeAetherMain(os.Args)
+		return
+	}
+	// The argv builders resolve the shipped Psiphon list, which unpacks
+	// beside the WARP identities. No test may write there: pin a scratch
+	// path for the package, and let a test that cares override it.
+	psiphonEntriesPath = func() string { return psiphonTestEntriesPath }
 	os.Exit(m.Run())
 }

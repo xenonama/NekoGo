@@ -181,6 +181,18 @@ func resolveMihomo(settings Settings) (string, error) {
 // readiness probe runs UNLOCKED so Stop/IsRunning stay responsive, and
 // the running state commits under lock only on an unchanged epoch.
 func (m *MihomoManager) Start(profile *Profile, settings Settings) error {
+	if m.IsRunning() {
+		return fmt.Errorf("mihomo already running")
+	}
+	mixedPort := effectiveMixedPort(settings.MixedPort)
+	// A crashed session can leave mihomo.exe holding the mixed port, and
+	// the previous connect's own core can still be releasing it. Wait the
+	// release out before spawning, outside the lock so the window cannot
+	// stall Stop or the stats poll, and never silently pick another port:
+	// the UI documents this exact one.
+	if err := waitBindPortsFree([]string{net.JoinHostPort("127.0.0.1", strconv.Itoa(mixedPort))}); err != nil {
+		return err
+	}
 	m.mu.Lock()
 	if m.running {
 		m.mu.Unlock()
@@ -189,15 +201,6 @@ func (m *MihomoManager) Start(profile *Profile, settings Settings) error {
 	m.stopRequested = false
 	m.startEpoch++
 	epoch := m.startEpoch
-	mixedPort := effectiveMixedPort(settings.MixedPort)
-	// A crashed session can leave mihomo.exe holding the mixed port, so
-	// the next Connect would fail seconds later with a bare bind error.
-	// Fail fast with the zombie hint instead, and never silently pick
-	// another port: the UI documents this exact one.
-	if err := checkPortFree(net.JoinHostPort("127.0.0.1", strconv.Itoa(mixedPort))); err != nil {
-		m.mu.Unlock()
-		return err
-	}
 	bin, err := resolveMihomo(settings)
 	if err != nil {
 		m.mu.Unlock()

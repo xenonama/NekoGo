@@ -97,18 +97,23 @@ func TestSaveSettingsRejectsCrossWiredCorePaths(t *testing.T) {
 }
 
 // TestCoreImageOwner: each updater row owns exactly its own binary name,
-// so an install can never land on another row's file.
+// so an install can never land on another row's file. Tor and Psiphon
+// are two protocols with two binaries, so they own two names: aether.exe
+// is the Psiphon engine's file and tor.exe the Tor Project's.
 func TestCoreImageOwner(t *testing.T) {
 	cases := map[string]string{
-		`C:\app\sing-box.exe`:       "singbox",
-		`C:\app\SING-BOX.EXE`:       "singbox",
-		`C:\app\nekobox_core.exe`:   "nekobox",
-		`C:\app\xray.exe`:           "xray",
-		`C:\app\aether.exe`:         "",
-		`C:\app\nekogo.exe`:         "",
-		`c:/app/pt/lyrebird.exe`:    "",
-		`C:\app\sing-box.json`:      "",
-		`C:\cores\nekobox_core.bak`: "",
+		`C:\app\sing-box.exe`:           "singbox",
+		`C:\app\SING-BOX.EXE`:           "singbox",
+		`C:\app\nekobox_core.exe`:       "nekobox",
+		`C:\app\xray.exe`:               "xray",
+		`C:\app\aether.exe`:             "psiphon",
+		`C:\app\tor.exe`:                "tor",
+		`C:\app\tor\tor-gencert.exe`:    "",
+		`C:\app\nekogo.exe`:             "",
+		`c:/app/pt/lyrebird.exe`:        "",
+		`c:/app/pluggable_transports/x`: "",
+		`C:\app\sing-box.json`:          "",
+		`C:\cores\nekobox_core.bak`:     "",
 	}
 	for in, want := range cases {
 		if got := coreImageOwner(in); got != want {

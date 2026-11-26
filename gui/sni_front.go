@@ -168,7 +168,7 @@ func shouldRescueLoopbackProfile(p *Profile, settings Settings) bool {
 
 // shouldRescueDirectSpoofProfile reports whether Connect should
 // convert an eligible DIRECT-domain profile to the SNI spoof core on
-// the fly (prompt.txt Test-CF: imported before the domain
+// the fly (Test-CF: imported before the domain
 // auto-detect, sitting on sing-box, DPI-blocked on every direct
 // dial). True when the profile is engine-eligible, not already
 // spoof, and addressed at a bare domain — the exact import

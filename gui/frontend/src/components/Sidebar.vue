@@ -5,7 +5,7 @@
 <template>
   <aside class="nb-sidebar">
     <div class="nb-logo">
-      <img class="nb-logo-img" :src="appIcon" alt="NekoGo" />
+      <img class="nb-logo-img" :src="appIcon" alt="NekoGo" draggable="false" />
       <span class="nb-logo-text">NekoGo</span>
       <button
         class="nb-icon-btn nb-logo-toggle"
@@ -23,7 +23,8 @@
         :class="{ active: modelValue === item.key }"
         @click="$emit('update:modelValue', item.key)"
       >
-        <Icon :name="item.icon" :size="20" />
+        <img v-if="item.key === 'aether'" class="nb-aether-logo" :src="aetherLogo" width="20" height="20" alt="" draggable="false" />
+        <Icon v-else :name="item.icon" :size="20" />
         <span v-if="settings.settings.sidebarLabels !== false">{{ item.label }}</span>
       </button>
     </nav>
@@ -61,6 +62,7 @@
 import { computed, onMounted, onUnmounted } from 'vue'
 import Icon, { type IconName } from './Icon.vue'
 import appIcon from '../assets/app.png'
+import aetherLogo from '../assets/aether_logo.png'
 import { useSettingsStore } from '../stores/settings'
 import { useProfilesStore } from '../stores/profiles'
 import { useConnectionStore } from '../stores/connection'
@@ -87,6 +89,7 @@ const props = withDefaults(
 const emit = defineEmits<{
   (e: 'update:modelValue', v: NavKey): void
   (e: 'exit'): void
+  (e: 'settings-error', message: string): void
 }>()
 
 const settings = useSettingsStore()
@@ -138,18 +141,26 @@ const modeTitle = computed(() =>
 onMounted(() => connection.acquire())
 onUnmounted(() => connection.release())
 
-function toggleTheme() {
-  void settings.setTheme(isDark.value ? 'light' : 'dark')
+async function toggleTheme() {
+  try {
+    await settings.setTheme(isDark.value ? 'light' : 'dark')
+  } catch (e) {
+    emit('settings-error', String(e))
+  }
 }
 
 /** Mode switch: on means Advanced. Entering is saved here; leaving is
  *  confirmed by the shell. */
-function toggleMode() {
+async function toggleMode() {
   if (isAdvancedMode.value) {
     emit('exit')
     return
   }
-  void settings.setAdvancedMode(true)
+  try {
+    await settings.setAdvancedMode(true)
+  } catch (e) {
+    emit('settings-error', String(e))
+  }
 }
 
 /** Same toggle as the Home power button / Advanced status dot: never
@@ -164,7 +175,8 @@ async function toggleConn() {
   if (!id) return
   try {
     await settings.setActiveProfileId(id)
-  } catch {
+  } catch (e) {
+    emit('settings-error', String(e))
     return
   }
   await connection.connect(id)

@@ -23,10 +23,6 @@
       />
       <label>Name</label><input v-model="draft.name" placeholder="Aether" />
       <AetherFields :model="draft" />
-      <template v-if="!twoHops">
-        <label>Address</label><input v-model="draft.address" placeholder="host (scan or type it)" />
-        <label>Port</label><input v-model.number="draft.port" type="number" min="1" max="65535" />
-      </template>
       <template v-if="warpUsed">
         <label>Scan</label>
         <div class="toolbar" style="padding: 0">
@@ -74,8 +70,12 @@
         servers are dialled through the tunnel and NekoGo keeps dialling Psiphon's local listener.
         Connect waits until the chain carries real traffic before the transport starts.
         A profile that sets its own Psiphon mode above keeps it. Applies on the next Connect.
+        Tor is the other exit chain this leg can run — the Chain tab (advanced mode) picks between them,
+        and turning Psiphon on here replaces it.
       </p>
     </div>
+
+    <AetherKeys :tunnel-running="aetherRunning" :scan-running="scanning" />
 
     <div class="nb-card" style="margin-top: 14px">
       <div class="toolbar" style="padding: 0">
@@ -109,13 +109,13 @@
 
     <div class="nb-card" style="margin-top: 14px">
       <div class="toolbar" style="padding: 0">
-        <strong>Scan log</strong>
+        <strong>Aether log</strong>
         <span class="muted">{{ aether.scanLogs.length }} lines</span>
         <button class="nb-act nb-act--ghost" :disabled="aether.scanLogs.length === 0" @click="aether.clearLogs()">
           <Icon name="trash" :size="14" />Clear log
         </button>
       </div>
-      <div v-if="aether.scanLogs.length === 0" class="muted">No Aether scan logs yet.</div>
+      <div v-if="aether.scanLogs.length === 0" class="muted">No Aether engine logs yet.</div>
       <div v-else ref="logBox" class="sni-log">
         <div v-for="l in aether.scanLogs" :key="l.id" class="sni-log-line">
           <span class="sni-log-time">{{ fmtTime(l.time) }}</span>
@@ -130,11 +130,13 @@
 <script setup lang="ts">
 import { computed, nextTick, onMounted, onUnmounted, reactive, ref, watch } from 'vue'
 import { backendAvailable } from '../api'
+import { aetherPortUnused, aetherWarpUsed } from '../aether'
 import { useAetherStore } from '../stores/aether'
 import { useProfilesStore } from '../stores/profiles'
 import { useSettingsStore } from '../stores/settings'
 import { useConnectionStore } from '../stores/connection'
 import AetherFields from './AetherFields.vue'
+import AetherKeys from './AetherKeys.vue'
 import Icon from './Icon.vue'
 import PickSelect from './PickSelect.vue'
 import type { AetherScanResult, AetherSettings, Profile } from '../types'
@@ -174,8 +176,7 @@ const profileOptions = computed(() => [
   { value: '', label: 'New Aether profile' },
   ...aetherProfiles.value.map((p) => ({ value: p.id, label: p.name || p.address || 'Aether' })),
 ])
-const twoHops = computed(() => ['gool', 'mim', 'wg-over-masque'].includes(draft.aether?.protocol || 'wg'))
-const warpUsed = computed(() => draft.aether?.psiphon !== 'only' && draft.aether?.tor !== 'only')
+const warpUsed = computed(() => aetherWarpUsed(draft.aether))
 // The RUNNING profile decides whether an Aether tunnel is up: the rail
 // lets the selection move to a non-Aether profile while the tunnel keeps
 // running, which used to re-enable Scan behind a live engine (the backend
@@ -201,6 +202,10 @@ const aetherChainOn = computed({
 
 async function saveAetherChain() {
   err.value = ''
+  // One exit chain per leg: the backend clears this leg's Tor when
+  // Psiphon is armed, and the store's copy is not re-read after a save,
+  // so the Chain tab would keep showing Tor as the driver.
+  if (aetherChainOn.value) settings.settings.aetherTor = false
   try {
     await settings.save()
   } catch (e) {
@@ -307,11 +312,14 @@ async function saveResult(index: number) {
 async function save(connect: boolean) {
   if (saving.value || scanning.value) return
   err.value = ''
-  if (!twoHops.value) {
-    if (!draft.address.trim()) {
-      err.value = 'Address is required (scan or type it).'
-      return
-    }
+  if (!draft.name.trim()) {
+    err.value = 'Name is required.'
+    return
+  }
+  // A blank endpoint is legal: the engine scans for one, which is what
+  // PattN's "leave blank to scan" offers. The port still has to be one
+  // the profile could carry, since an endpoint typed later uses it.
+  if (!aetherPortUnused(draft.protocol, draft.aether)) {
     const port = Number(draft.port)
     if (!Number.isInteger(port) || port < 1 || port > 65535) {
       err.value = `Port must be 1..65535 (got ${draft.port})`

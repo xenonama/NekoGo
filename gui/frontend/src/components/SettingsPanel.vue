@@ -9,7 +9,7 @@
         <p>How NekoGo starts, listens and connects</p>
       </div>
       <Icon name="cloud" :size="28" class="stg-hero-cloud" />
-      <img class="stg-hero-cat" :src="appIcon" alt="" />
+      <img class="stg-hero-cat" :src="appIcon" alt="" draggable="false" />
     </div>
 
     <div class="stg-tabs" role="tablist">
@@ -557,7 +557,12 @@ async function flip(field: BoolKey) {
 async function setStr(field: StrKey, value: string) {
   // Theme must go through the single shared code path (instant apply + persist).
   if (field === 'theme') {
-    await store.setTheme(value as 'light' | 'dark')
+    saveErr.value = ''
+    try {
+      await store.setTheme(value as 'light' | 'dark')
+    } catch (e) {
+      saveErr.value = String(e)
+    }
     return
   }
   const prev = store.settings[field] ?? ''
@@ -907,16 +912,15 @@ const tabs: TabDef[] = [
     key: 'connection', label: 'Connection', icon: 'wifi',
     head: 'Connection', headSub: 'Core engine, TUN, auto-connect and the probe',
     rows: [
-      // Opt-in backend switch: "custom" is the bundled NekoBox core
-      // (Thrift RPC, full protocol set); "upstream" spawns the official
-      // sing-box.exe CLI and talks to its Clash API for stats.
       {
         key: 'core', icon: 'gear', title: 'Core engine',
-        sub: 'Applies on reconnect. Runs every sing-box transport (plain profiles, SNI spoof, Aether).',
+        sub: 'Applies on reconnect. Raw outbounds keep their required core; unsupported protocols use NekoBox Core. TUN remains sing-box-only.',
         kind: 'select', field: 'coreEngine',
         options: [
           { value: 'custom', label: 'NekoBox Core' },
           { value: 'upstream', label: 'sing-box' },
+          { value: 'xray', label: 'Xray' },
+          { value: 'mihomo', label: 'Mihomo' },
         ],
       },
       { key: 'tun', icon: 'shield', title: 'TUN mode', sub: 'Route all traffic through a virtual adapter — sing-box profiles only: an Xray or mihomo profile connects without it however this reads (applies on reconnect)', kind: 'toggle', field: 'tunEnabled' },

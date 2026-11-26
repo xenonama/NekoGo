@@ -4,7 +4,7 @@
   <div class="about">
     <!-- Card 1 — Hero / Identity -->
     <div class="about-hero">
-      <img class="about-hero-icon" :src="appIcon" alt="NekoGo" />
+      <img class="about-hero-icon" :src="appIcon" alt="NekoGo" draggable="false" />
       <div class="about-hero-text">
         <h2>NekoGo</h2>
         <p>A fork of NekoBox with a new GUI (Go + Wails3 + Vue 3).</p>
@@ -17,10 +17,10 @@
          neither place can drift from the running build. sing-box and
          NekoBox are separate rows because they are separate binaries:
          the fork is stamped with the NekoGo build version, so only the
-         official sing-box.exe reports a sing-box version. The engine
-         rows are Advanced-mode only — Simple mode picks no core and
-         shows no core path, so four binary versions would describe a
-         screen its user cannot reach. -->
+         official sing-box.exe reports a sing-box version. The versions
+         show in both modes, trimmed to the number a report asks for; the
+         "Engine" core path stays Advanced-mode only, because Simple mode
+         picks no core and shows no core files. -->
     <div class="about-card">
       <div class="about-title">Version stats</div>
       <dl v-if="statRows.length" class="about-stats">

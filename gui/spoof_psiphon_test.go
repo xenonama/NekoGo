@@ -14,7 +14,7 @@ import (
 func chainCfg(t *testing.T, s Settings) map[string]any {
 	t.Helper()
 	setSpoofFrontPort(40555)
-	setSpoofChainPorts(40556, 40557)
+	setSpoofChainPorts(chainDriverPsiphon, 40556, 40557)
 	t.Cleanup(func() {
 		clearSpoofFrontPort()
 		clearSpoofChainPorts()
@@ -154,7 +154,7 @@ func TestSpoofPsiphonChainPassesCoreCheck(t *testing.T) {
 	s := DefaultSettings()
 	s.SpoofPsiphon = true
 	setSpoofFrontPort(40555)
-	setSpoofChainPorts(40556, 40557)
+	setSpoofChainPorts(chainDriverPsiphon, 40556, 40557)
 	t.Cleanup(func() {
 		clearSpoofFrontPort()
 		clearSpoofChainPorts()
@@ -229,6 +229,8 @@ func TestPsiphonOnlyArgs(t *testing.T) {
 	// psiphonOnlyArgs with no chain options set is the pre-existing
 	// chain shape plus aether's own default mode; TestPsiphonOnlyArgs-
 	// CarriesChainOptions covers the options.
+	const entries = `C:\NekoGo\aether\psiphon-servers.txt`
+	withPsiphonEntries(t, entries)
 	got := psiphonOnlyArgs(1234, 5678, "debug", "", DefaultSettings())
 	want := []string{
 		"--bind", "127.0.0.1:1234",
@@ -236,6 +238,7 @@ func TestPsiphonOnlyArgs(t *testing.T) {
 		"--upstream", "socks5://127.0.0.1:5678",
 		"--log-level", "debug",
 		"--psiphon-mode", "auto",
+		"--psiphon-server-entries", entries,
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("psiphonOnlyArgs = %v, want %v", got, want)
@@ -265,7 +268,7 @@ func TestChainPsiphonDirs(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	old := time.Now().Add(-2 * chainPsiphonDirMaxAge)
+	old := time.Now().Add(-2 * chainDataDirMaxAge)
 	if err := os.Chtimes(stale, old, old); err != nil {
 		t.Fatal(err)
 	}
@@ -333,7 +336,7 @@ func TestTunRequirementForChain(t *testing.T) {
 	if tunActiveFor(p, s) {
 		t.Fatal("tunActiveFor = true before the chain ports are published")
 	}
-	setSpoofChainPorts(40556, 40557)
+	setSpoofChainPorts(chainDriverPsiphon, 40556, 40557)
 	defer clearSpoofChainPorts()
 	if !tunActiveFor(p, s) {
 		t.Fatal("tunActiveFor = false with the chain armed")
@@ -341,31 +344,39 @@ func TestTunRequirementForChain(t *testing.T) {
 }
 
 // TestStopLockedClearsChainState: a CoreSpoof group teardown drops the
-// chain bookkeeping even when the Psiphon child is already gone.
+// chain bookkeeping even when the chain child is already gone, for
+// whichever driver the leg ran.
 func TestStopLockedClearsChainState(t *testing.T) {
-	m := &CoreManager{
-		activeCore:    CoreSpoof,
-		running:       true,
-		psiphonActive: true,
-		psiphonPort:   40556,
-		psiphonMgr:    NewPsiphonManager(nil),
-	}
-	setSpoofChainPorts(40556, 40557)
-	setSpoofFrontPort(40555)
-	defer clearSpoofFrontPort()
-	_ = m.stopLocked() // singboxMgr nil, so an error is expected
-	if m.psiphonActive || m.psiphonPort != 0 {
-		t.Fatalf("chain state survived teardown: active=%v port=%d", m.psiphonActive, m.psiphonPort)
-	}
-	if _, _, ok := spoofChainPorts(); ok {
-		t.Fatal("chain ports survived teardown")
-	}
-	if _, ok := currentSpoofFrontPort(); ok {
-		t.Fatal("front port survived teardown")
-	}
-	active, port := m.PsiphonChain()
-	if active || port != 0 {
-		t.Fatalf("PsiphonChain = %v/%d after teardown", active, port)
+	for _, driver := range []string{chainDriverPsiphon, chainDriverTor} {
+		t.Run(driver, func(t *testing.T) {
+			m := &CoreManager{
+				activeCore:  CoreSpoof,
+				running:     true,
+				chainActive: true,
+				chainKind:   driver,
+				chainPort:   40556,
+				psiphonMgr:  NewPsiphonManager(nil),
+				torMgr:      NewTorManager(nil),
+			}
+			setSpoofChainPorts(driver, 40556, 40557)
+			setSpoofFrontPort(40555)
+			defer clearSpoofFrontPort()
+			_ = m.stopLocked() // singboxMgr nil, so an error is expected
+			if m.chainActive || m.chainPort != 0 || m.chainKind != "" {
+				t.Fatalf("chain state survived teardown: active=%v kind=%q port=%d",
+					m.chainActive, m.chainKind, m.chainPort)
+			}
+			if _, _, _, ok := spoofChainPorts(); ok {
+				t.Fatal("chain ports survived teardown")
+			}
+			if _, ok := currentSpoofFrontPort(); ok {
+				t.Fatal("front port survived teardown")
+			}
+			active, kind, port := m.ChainRun()
+			if active || kind != "" || port != 0 {
+				t.Fatalf("ChainRun = %v/%q/%d after teardown", active, kind, port)
+			}
+		})
 	}
 }
 

@@ -145,7 +145,7 @@ const activeProfile = computed(() =>
 const targetLabel = computed(() => {
   const p = activeProfile.value
   if (!p) return ''
-  const core = p.core === 1 ? 'Xray' : p.core === 3 ? 'Mihomo' : 'sing-box'
+  const core = p.core === 1 ? 'Xray' : p.core === 3 && p.rawOutbound?.trim() ? 'Mihomo' : 'sing-box'
   return `${p.name} (${core})`
 })
 
@@ -153,7 +153,7 @@ const targetLabel = computed(() => {
 // own Clash Meta document and never merges these overrides, so offering
 // an edit here would be an edit that cannot take effect. Gate on the
 // profile (as Go does), not the running core — it holds while idle too.
-const mihomoProfile = computed(() => activeProfile.value?.core === 3)
+const mihomoProfile = computed(() => !!activeProfile.value?.rawOutbound?.trim() && activeProfile.value?.core === 3)
 const mihomoNote =
   'mihomo renders its own Clash Meta document — these editors do not apply. Use Backup → View raw config to read what mihomo was given.'
 

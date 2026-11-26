@@ -1,7 +1,7 @@
 <!-- Bottom app info card of the right panel. -->
 <template>
   <button class="nb-appinfo" @click="$emit('open')">
-    <img class="avatar-img" :src="appIcon" alt="NekoGo" />
+    <img class="avatar-img" :src="appIcon" alt="NekoGo" draggable="false" />
     <span class="meta">
       <div class="t">NekoGo</div>
       <div class="v">v{{ version }}</div>

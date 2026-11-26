@@ -183,3 +183,72 @@ CLAUDE.md
 # MaxMind GeoLite2-Country DB (licensed, ~6 MB, user-provided;
 # build.bat stage 4b picks it up from gui/assets/)
 gui/assets/GeoLite2-Country.mmdb
+
+# ============================================================================
+# NekoGo publish rules (Nov 2026)
+#
+# Every rule above this line came from the Qt NekoBox tree, where nothing
+# named *.json was ever source. NekoGo is Go + Vue, and the blanket *.json
+# silently hollowed out the repo: gui/frontend/package.json,
+# package-lock.json, tsconfig.json and gui/wails.json were never committed,
+# so a fresh clone cannot npm install - and therefore cannot produce
+# gui/frontend/dist, which main.go embeds at compile time - nor run
+# wails3 generate bindings. The blanket *.dll hid runtime/WinDivert.dll for
+# the same reason: build.bat copies it with `if exist`, so a clone without it
+# prints BUILD OK and ships an install whose SNI-spoofing engine cannot load
+# its driver. Last rule wins, so this block re-includes what the build needs
+# and ignores the reference and scratch trees that a git add -A would sweep
+# in (PattN, the source* exports, backups and the upload output are
+# hundreds of megabytes of other people's trees and old copies).
+# ============================================================================
+
+# Build inputs the extension rules above were hiding. node_modules, target
+# and dist are excluded as directories further down, and git cannot
+# re-include a file whose parent directory is excluded, so these negations
+# reach the real source trees only.
+!**/package.json
+!**/package-lock.json
+!**/tsconfig*.json
+!**/wails.json
+!runtime/WinDivert.dll
+
+# The Psiphon server list gui/psiphon_servers.go embeds. Without it the
+# build cannot compile, and the "bundled server list" option has nothing
+# to hand the core.
+!gui/psiphon_servers.dat
+
+# Generated, and recreated by the build: npm run build, cargo build,
+# go generate (rsrc.syso) and build.bat itself
+node_modules/
+target/
+dist/
+gui/build/
+gui/dist/
+gui/frontend/dist/
+*.syso
+
+# Licensed data fetched by build.bat, never source
+*.mmdb
+
+# Not this project's source: a vendored clone (build.bat fetches Xray-core
+# when missing) and the reference trees read-only by policy
+/xray/
+/PattN/
+/Throne/
+/aether-reference/bin/
+
+# Local output and old copies of this tree, all regenerable
+/source*/
+/NekoGo-upload/
+/nekogo-backup/
+/dist/
+
+# Never publish: the user's own subscription data (spoof_config.txt is a dump
+# of live links with real passwords, and it sat inside the exported tree until
+# Nov 2026) and the machine-local upload settings, which carry a repo path and
+# a proxy endpoint.
+spoof_config.txt
+.uploadrc.json
+
+# Internal development log, not documentation for users
+AGENT_LOG.md

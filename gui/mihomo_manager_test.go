@@ -523,26 +523,24 @@ func TestMihomoIgnoresFragmentOverride(t *testing.T) {
 	}
 }
 
-// TestMihomoValidateProfileForSave: the save-time protocol gate knows the
-// mihomo set, so a bad protocol fails at save instead of at Connect.
+// TestMihomoValidateProfileForSave: protocols another core can render are
+// saved for compatibility fallback; unmapped protocols still need raw JSON.
 func TestMihomoValidateProfileForSave(t *testing.T) {
-	ok := Profile{
-		ID: "1", Name: "ok", Core: CoreMihomo, Protocol: "socks",
-		Address: "127.0.0.1", Port: 1080,
-	}
-	if err := validateProfileForSave(ok); err != nil {
-		t.Fatalf("a socks profile on mihomo was rejected: %v", err)
+	for _, protocol := range []string{"socks", "direct"} {
+		p := Profile{
+			ID: "1", Name: "ok", Core: CoreMihomo, Protocol: protocol,
+			Address: "127.0.0.1", Port: 1080,
+		}
+		if err := validateProfileForSave(p); err != nil {
+			t.Fatalf("a %s profile on mihomo was rejected: %v", protocol, err)
+		}
 	}
 	bad := Profile{
-		ID: "2", Name: "bad", Core: CoreMihomo, Protocol: "direct",
-		Address: "127.0.0.1", Port: 1080,
+		ID: "2", Name: "bad", Core: CoreMihomo, Protocol: "wireguard",
+		Address: "127.0.0.1", Port: 51820,
 	}
-	err := validateProfileForSave(bad)
-	if err == nil {
-		t.Fatal("a direct profile on mihomo was accepted")
-	}
-	if !strings.Contains(err.Error(), "mihomo") {
-		t.Fatalf("error %q does not name the mihomo core", err)
+	if err := validateProfileForSave(bad); err == nil {
+		t.Fatal("an unmapped profile without raw JSON was accepted")
 	}
 }
 

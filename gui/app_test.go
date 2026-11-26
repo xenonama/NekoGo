@@ -133,7 +133,7 @@ func testProxyApp(t *testing.T, s Settings, core CoreType) (*App, Profile) {
 		t.Fatal(err)
 	}
 	app := NewApp(store, make(chan LogEntry, 16))
-	saved, err := app.store.SaveProfile(Profile{Name: "p", Core: core, Address: "127.0.0.1", Port: 1})
+	saved, err := app.store.SaveProfile(Profile{Name: "p", Core: core, Protocol: "vless", Address: "127.0.0.1", Port: 1})
 	if err != nil {
 		t.Fatal(err)
 	}

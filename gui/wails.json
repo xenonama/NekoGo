@@ -1,0 +1,15 @@
+{
+  "$schema": "https://wails.app/schemas/config.v3.json",
+  "name": "NekoGo",
+  "description": "NekoGo — a NekoBox fork with sing-box + Xray cores and a Wails3 GUI",
+  "version": "1.0.0-beta.4",
+  "frontend": {
+    "dir": "frontend",
+    "install": "npm install",
+    "build": "npm run build",
+    "dev": "npm run dev"
+  },
+  "build": {
+    "binary": "nekogo"
+  }
+}

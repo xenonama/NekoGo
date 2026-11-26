@@ -7,7 +7,7 @@
          way to move or close the window, including while settings load. -->
     <TitleBar />
     <div v-if="!settings.loaded" class="nb-splash">
-      <img class="nb-logo-img" :src="appIcon" alt="NekoGo" />
+      <img class="nb-logo-img" :src="appIcon" alt="NekoGo" draggable="false" />
       <span class="nb-spin" title="Loading…" />
     </div>
     <SimpleShell

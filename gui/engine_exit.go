@@ -88,7 +88,7 @@ type lineRing struct {
 }
 
 func (r *lineRing) push(line string) {
-	line = strings.TrimSpace(line)
+	line = strings.TrimSpace(stripANSI(line))
 	if line == "" {
 		return
 	}

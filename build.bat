@@ -387,7 +387,8 @@ if exist "%RUNTIME%\WinDivert64.sys" copy /Y "%RUNTIME%\WinDivert64.sys" "%BUILD
 
 REM PattN-style layout: nekogo.exe in the root, every engine binary in
 REM bin\ (nekobox_core, sing-box, mihomo, xray, sni-spoof, aether + pt\,
-REM and the WinDivert runtime the cores load).
+REM tor + its pluggable_transports\, and the WinDivert runtime the cores
+REM load).
 set "PORTABLE_BIN=%PORTABLE_STAGE%\bin"
 mkdir "%PORTABLE_BIN%" >nul 2>nul
 
@@ -411,6 +412,15 @@ if exist "%BUILDBIN%\aether.exe" (
 if exist "%BUILDBIN%\pt\" (
     robocopy "%BUILDBIN%\pt" "%PORTABLE_BIN%\pt" /E /NFL /NDL /NJH /NJS /NC /NS >nul 2>nul
     if errorlevel 8 (echo   [ERR] pt\ copy into the portable stage failed ^(robocopy !errorlevel!^) & goto :fail)
+)
+REM The standalone Tor the Tor row installs: tor.exe plus its own
+REM pluggable_transports\ and the NEKOGO-BUNDLE.txt the row compares
+REM against. Staged by hand or by the updater in build\bin\tor\ - either
+REM way it must survive into the zip, or a fresh copy loses the binary the
+REM user just downloaded.
+if exist "%BUILDBIN%\tor\" (
+    robocopy "%BUILDBIN%\tor" "%PORTABLE_BIN%\tor" /E /NFL /NDL /NJH /NJS /NC /NS >nul 2>nul
+    if errorlevel 8 (echo   [ERR] tor\ copy into the portable stage failed ^(robocopy !errorlevel!^) & goto :fail)
 )
 
 REM One copy only, next to the engines: the detector resolves bin\ first,
@@ -473,6 +483,7 @@ REM README
     echo   bin\xray.exe         - Xray-core engine ^(gRPC stats^)
     echo   bin\sni-spoof.exe    - SNI spoofing engine
     echo   bin\aether.exe       - Aether WARP engine ^(optional; requires bin\pt\ next to it for Tor/Psiphon^)
+    echo   bin\tor\tor.exe      - the Tor Project's standalone tor.exe ^(optional; brings its own bin\tor\pluggable_transports\^)
     echo   bin\GeoLite2-Country.mmdb - GeoIP database ^(optional; next to the engines^)
     echo.
     echo Every engine lives in bin\; the GUI finds them there. Updating a

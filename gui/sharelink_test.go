@@ -165,7 +165,7 @@ func TestShareLinkSocks(t *testing.T) {
 // crosses the link format has to come back byte-for-byte.
 func TestShareLinkRoundTripAdversarial(t *testing.T) {
 	nasty := []string{
-		"@DeltaKroneckerGithub",
+		"@ExampleChannel",
 		"100%",
 		"a%41b",
 		"a+b/c=d",

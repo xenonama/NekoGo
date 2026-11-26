@@ -23,6 +23,12 @@ func saveUpdateBaseURL(t *testing.T) {
 	for k, v := range updateBaseURL {
 		old[k] = v
 	}
+	// Every CheckUpdates pass also checks the Psiphon server list. Tests
+	// that do not supply a fake for it must not reach Psiphon's S3 bucket,
+	// so point it at a local port that refuses at once.
+	if _, ok := updateBaseURL["psiphon-servers"]; !ok {
+		updateBaseURL["psiphon-servers"] = "http://127.0.0.1:1"
+	}
 	t.Cleanup(func() {
 		for k := range updateBaseURL {
 			delete(updateBaseURL, k)
@@ -54,7 +60,7 @@ func newUpdaterTestApp(t *testing.T) *App {
 	return app
 }
 
-// TestListUpdatablesNoFiles — no DBs, no cores, no externals: 7 rows,
+// TestListUpdatablesNoFiles — no DBs, no cores, no externals: 10 rows,
 // empty Current, no panic, no network.
 func TestListUpdatablesNoFiles(t *testing.T) {
 	a := newUpdaterTestApp(t)
@@ -62,10 +68,10 @@ func TestListUpdatablesNoFiles(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ListUpdatables: %v", err)
 	}
-	if len(rows) != 7 {
-		t.Fatalf("got %d rows, want 7", len(rows))
+	if len(rows) != 10 {
+		t.Fatalf("got %d rows, want 10", len(rows))
 	}
-	want := map[string]bool{"geoip": true, "geosite": true, "singbox": true, "nekobox": true, "xray": true, "mihomo": true, "gui": true}
+	want := map[string]bool{"geoip": true, "geosite": true, "singbox": true, "nekobox": true, "xray": true, "mihomo": true, "tor": true, "psiphon": true, "psiphon-servers": true, "gui": true}
 	for _, r := range rows {
 		if !want[r.ID] {
 			t.Fatalf("unexpected component %q", r.ID)

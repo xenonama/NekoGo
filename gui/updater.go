@@ -123,7 +123,7 @@ const downloadRetryCap = 20 * time.Second
 
 // UpdatableComponent is one row of the Updates panel.
 type UpdatableComponent struct {
-	ID          string `json:"id"` // "geoip" | "geosite" | "singbox" | "nekobox" | "xray" | "mihomo" | "gui"
+	ID          string `json:"id"` // "geoip" | "geosite" | "singbox" | "nekobox" | "xray" | "mihomo" | "tor" | "psiphon" | "psiphon-servers" | "gui"
 	Name        string `json:"name"`
 	Current     string `json:"current"`
 	Latest      string `json:"latest"`
@@ -139,8 +139,11 @@ type UpdatableComponent struct {
 
 // updatableIDs are the fixed rows. "singbox" is the official CLI
 // (upstream engine); "nekobox" is the Thrift core (custom engine);
-// "mihomo" is the Clash Meta engine.
-var updatableIDs = []string{"geoip", "geosite", "singbox", "nekobox", "xray", "mihomo", "gui"}
+// "mihomo" is the Clash Meta engine; "tor" is the Tor Project's own
+// tor.exe; "psiphon" is aether.exe, the engine carrying Psiphon (and,
+// with its Arti client, the fallback Tor hop); "psiphon-servers" is the
+// signed server list that engine starts from.
+var updatableIDs = []string{"geoip", "geosite", "singbox", "nekobox", "xray", "mihomo", "tor", "psiphon", "psiphon-servers", "gui"}
 
 // --- local state (no network) ---
 
@@ -240,6 +243,10 @@ func (a *App) localUpdatables() []UpdatableComponent {
 	nbCurrent, nbNote := a.coreDisplayVersion("nekobox", a.CoreVersion())
 	xrCurrent, xrNote := a.coreDisplayVersion("xray", a.XrayVersion())
 	mhCurrent, mhNote := a.coreDisplayVersion("mihomo", a.MihomoVersion())
+	torCurrent, torNote := a.coreDisplayVersion("tor", a.TorVersion())
+	torNote = a.torTransportNote(torNote)
+	psCurrent, psNote := a.coreDisplayVersion("psiphon", a.AetherVersion())
+	psNote = a.psiphonTransportNote(psNote)
 	out := []UpdatableComponent{
 		{ID: "geoip", Name: "GeoIP Database", Current: dataFileCurrent(geoPath)},
 		{ID: "geosite", Name: "GeoSite Rule-set", Current: dataFileCurrent(geoSitePath)},
@@ -247,6 +254,9 @@ func (a *App) localUpdatables() []UpdatableComponent {
 		{ID: "nekobox", Name: "NekoBox Core (nekobox_core)", Current: nbCurrent, Notes: nbNote},
 		{ID: "xray", Name: "Xray Core", Current: xrCurrent, Notes: xrNote},
 		{ID: "mihomo", Name: "mihomo Core (Clash Meta)", Current: mhCurrent, Notes: mhNote},
+		{ID: "tor", Name: "Tor (tor.exe, standalone)", Current: torCurrent, Notes: torNote},
+		{ID: "psiphon", Name: "Aether", Current: psCurrent, Notes: psNote},
+		psiphonServersRow(),
 		{ID: "gui", Name: "NekoGo GUI", Current: appVersion},
 	}
 	if _, err := os.Stat(geoPath); err != nil {
@@ -275,11 +285,78 @@ func (a *App) coreDisplayVersion(id, line string) (current, note string) {
 	return "", "Not installed"
 }
 
+// torTransportNote adds what is missing BESIDE tor.exe to the Tor row.
+// The standalone daemon speaks no obfs4 or webtunnel itself: it spawns
+// the transport named in its ClientTransportPlugin line. A tree without
+// lyrebird.exe starts Tor, fails to launch a transport for every bridge
+// line, and then sits in a bootstrap that reads as a network problem
+// rather than as the missing file it is.
+func (a *App) torTransportNote(note string) string {
+	bin := a.currentCorePath("tor")
+	missing := missingStandaloneTorTransports(bin)
+	if len(missing) == 0 {
+		return note
+	}
+	pt := fmt.Sprintf("pluggable_transports\\%s is missing next to %s — Tor bridges (obfs4, webtunnel) cannot launch",
+		strings.Join(missing, ", pluggable_transports\\"), filepath.Base(bin))
+	if note != "" {
+		return note + "; " + pt
+	}
+	return pt
+}
+
+// psiphonTransportNote is the same report for aether.exe, which carries
+// Psiphon in its own pt\ folder and runs its Arti client from there too.
+func (a *App) psiphonTransportNote(note string) string {
+	bin := a.currentCorePath("psiphon")
+	missing := missingTorTransports(bin)
+	if len(missing) == 0 {
+		return note
+	}
+	pt := fmt.Sprintf("pt\\%s is missing next to %s — Tor bridges (obfs4, webtunnel) cannot launch",
+		strings.Join(missing, ", pt\\"), filepath.Base(bin))
+	if note != "" {
+		return note + "; " + pt
+	}
+	return pt
+}
+
 // exeVersionQuery runs "<exe> args..." and returns the first stdout
 // line ("" on any error). A variable — not a direct runVersionQuery
 // call — so tests can stub the smoke-verify step without shipping a
 // real executable.
 var exeVersionQuery = runVersionQuery
+
+// psiphonServersLocal reports the list the Psiphon engine starts from: a
+// downloaded list when the one in the aether work dir is Psiphon's signed
+// list, the bundled list otherwise. The time is the downloaded list's
+// publication time (its mtime), and zero when there is no usable
+// downloaded list — an invalid one counts as none, so any signed list may
+// take its place.
+func psiphonServersLocal() (current string, published time.Time, note string) {
+	active := psiphonActiveListPath()
+	if data, err := os.ReadFile(active); err == nil {
+		if n, err := psiphonVerifyList(data, psiphonListKey); err == nil {
+			if st, err := os.Stat(active); err == nil {
+				published = st.ModTime().UTC()
+				return fmt.Sprintf("%d entries (%s)", n, published.Format("2006-01-02")), published, ""
+			}
+			return fmt.Sprintf("%d entries", n), time.Time{}, ""
+		}
+		return dataFileCurrent(active), time.Time{},
+			"The list in use is not Psiphon's signed server list — any signed list takes its place"
+	}
+	if text, err := psiphonUnpack(psiphonBundledList, psiphonSigningKey); err == nil {
+		current = fmt.Sprintf("Bundled list (%d entries)", psiphonEntryCount(text))
+	}
+	return current, time.Time{}, "No downloaded list — the list shipped with NekoGo is in use"
+}
+
+// psiphonServersRow is one Updates row built from local state only.
+func psiphonServersRow() UpdatableComponent {
+	current, _, note := psiphonServersLocal()
+	return UpdatableComponent{ID: "psiphon-servers", Name: "Psiphon Servers", Current: current, Notes: note}
+}
 
 // ListUpdatables returns the current local state of every updatable
 // component (no network).
@@ -377,6 +454,7 @@ func githubLatest(ownerRepo string) (*ghRelease, error) {
 //	| gui       | xenonama/NekoGo       | NekoGo-Setup-*.exe / NekoGo-Portable-*.zip | %APPDATA%/NekoGo/updates/ (manual open via Open installer button; never auto-opened) |
 //	| geoip     | Loyalsoldier/geoip    | Country.mmdb (@release)              | gui/assets/GeoLite2-Country.mmdb |
 //	| geosite   | Loyalsoldier/v2ray-rules-dat | geosite.dat                     | gui/assets/geosite.dat |
+//	| psiphon-servers | Psiphon (signed list) | psiphon_servers.dat (the list Psiphon publishes) | embedded in the app (gui/psiphon_servers.dat), unpacked into the aether work dir as psiphon-servers.txt |
 //
 // The NekoBox core row points at the app repo today; a dedicated core
 // repo is planned (nekoCoreOwnerRepo), and only that constant changes.
@@ -402,6 +480,24 @@ const mihomoOwnerRepo = "MetaCubeX/mihomo"
 // repo (forkOwnerRepo), which compared an Xray banner against a NekoGo
 // release tag and installed the xray.exe bundled with the app release.
 const xrayOwnerRepo = "XTLS/Xray-core"
+
+// aetherOwnerRepo publishes aether.exe — the engine that carries Tor
+// (arti is linked into it) and Psiphon, and so the only binary either
+// exit chain runs. build.bat fetches this same repo and asset when the
+// reference tree has none, so a from-source build and an in-app update
+// cannot drift onto different binaries.
+const aetherOwnerRepo = "CluvexStudio/Aether"
+
+// aetherAssetName is that release's Windows x86-64 archive. Measured
+// contents (2.3.0): aether.exe at the root, pt/lyrebird.exe and
+// pt/psiphon-tunnel-core.exe — the pluggable transports Tor's bridges and
+// Psiphon need — plus run-aether.bat, which NekoGo does not use.
+const aetherAssetName = "aether-windows-x86_64.zip"
+
+// aetherZipTransports are the pt\ entries of that archive NekoGo installs
+// beside the engine. A release that drops one is not a failed update: the
+// engine still installs and the row then reports the transport missing.
+var aetherZipTransports = []string{"lyrebird.exe", "psiphon-tunnel-core.exe"}
 
 // mihomoAsset picks the Windows archive for this arch from a stable
 // mihomo release, anchored to the exact name build.bat fetches. The
@@ -978,6 +1074,105 @@ func (a *App) checkMihomo(c *UpdatableComponent) {
 	}
 }
 
+// aetherAsset picks the Windows x86-64 archive from an Aether release.
+// The exact name is what build.bat fetches, so a from-source build and an
+// in-app update read the same asset; a release that versions the name is
+// still installable, and an archive for another platform is not (the
+// in-place installer unpacks zips only, and NekoGo ships the Windows
+// layout).
+func aetherAsset(assets []ghAsset) *ghAsset {
+	if runtime.GOOS != "windows" || runtime.GOARCH != "amd64" {
+		return nil
+	}
+	if a := pickAssetExact(assets, aetherAssetName); a != nil {
+		return a
+	}
+	for i := range assets {
+		n := strings.ToLower(assets[i].Name)
+		if strings.HasPrefix(n, "aether-windows-x86_64") && strings.HasSuffix(n, ".zip") {
+			return &assets[i]
+		}
+	}
+	return nil
+}
+
+// checkPsiphon resolves the Aether core row against the release that
+// publishes aether.exe — the id stays "psiphon" because that is the
+// binary's role in the tree, not its name. The row's Current is the
+// engine's own "-v" line, so a folder with no aether.exe reads as "Not
+// installed" and offers the update — which is the only way a user learns
+// that the Aether core was never there.
+func (a *App) checkPsiphon(c *UpdatableComponent) {
+	rel, err := githubLatest(aetherOwnerRepo)
+	if err != nil {
+		c.LastError = err.Error()
+		return
+	}
+	a.updateLog(c.ID, "info", fmt.Sprintf("[update:%s] source=%s latest=%s", c.ID, aetherOwnerRepo, rel.TagName))
+	c.Latest = rel.TagName
+	asset := aetherAsset(rel.Assets)
+	if asset == nil {
+		c.UpdateAvail = false
+		c.Notes = fmt.Sprintf("No automatic install for %s/%s — download aether manually.", runtime.GOOS, runtime.GOARCH)
+		return
+	}
+	if coreUpdateNeeded(c.Current, rel.TagName, asset) {
+		c.UpdateAvail = true
+	}
+}
+
+// checkPsiphonServers asks Psiphon's own address when the list was
+// published and compares it with the downloaded list in use. A list that
+// is missing or not Psiphon's is offered an update whatever the time: that
+// is the same rule the update applies, where any signed list may take the
+// place of one that cannot be used.
+func (a *App) checkPsiphonServers(c *UpdatableComponent) {
+	current, published, note := psiphonServersLocal()
+	c.Current = current
+	c.Notes = note
+	latest, err := psiphonServersPublished(psiphonServersSource())
+	if err != nil {
+		c.LastError = err.Error()
+		return
+	}
+	if latest.IsZero() {
+		return
+	}
+	c.Latest = latest.Format("2006-01-02")
+	if published.IsZero() || latest.After(published) {
+		c.UpdateAvail = true
+	}
+}
+
+// psiphonServersSource is the list's address, redirectable in tests.
+func psiphonServersSource() string {
+	return updateBase("psiphon-servers", psiphonServersURL)
+}
+
+// psiphonServersPublished returns the Last-Modified time of the list at
+// url; zero when the server does not name one.
+func psiphonServersPublished(url string) (time.Time, error) {
+	req, err := http.NewRequest("HEAD", url, nil)
+	if err != nil {
+		return time.Time{}, err
+	}
+	req.Header.Set("User-Agent", "NekoGo/"+appVersion)
+	resp, err := updateHTTP.Do(req)
+	if err != nil {
+		return time.Time{}, errors.New(downloadErrorText(err))
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return time.Time{}, fmt.Errorf("psiphon server list: %s", resp.Status)
+	}
+	if lm := resp.Header.Get("Last-Modified"); lm != "" {
+		if t, err := http.ParseTime(lm); err == nil {
+			return t.UTC(), nil
+		}
+	}
+	return time.Time{}, nil
+}
+
 // checkXray resolves the xray row against XTLS/Xray-core's own
 // releases — the repo that publishes xray.exe — the same way the
 // singbox row follows SagerNet and the mihomo row follows MetaCubeX.
@@ -1079,6 +1274,12 @@ func (a *App) CheckUpdates() ([]UpdatableComponent, error) {
 				a.checkXray(c)
 			case "mihomo":
 				a.checkMihomo(c)
+			case "tor":
+				a.checkTorRelease(c)
+			case "psiphon":
+				a.checkPsiphon(c)
+			case "psiphon-servers":
+				a.checkPsiphonServers(c)
 			case "gui":
 				a.checkGUI(c, lookups[forkOwnerRepo])
 			}
@@ -1129,6 +1330,56 @@ func (a *App) downloadFile(id, rawURL string) ([]byte, error) {
 			id, attempt, downloadMaxAttempts, err, delay.Round(time.Millisecond), len(st.data)))
 		time.Sleep(delay)
 	}
+}
+
+// psiphonListDownloadLimit bounds a whole list download, body included.
+// PattN's fetch script uses curl --max-time 180 for the same reason: a
+// body that stalls must not hold the Updates panel forever.
+var psiphonListDownloadLimit = 3 * time.Minute
+
+// downloadPsiphonList fetches the signed server list, asking the server
+// for nothing older than [since] so a list already in use is not sent
+// again. It returns the bytes, the publication time from Last-Modified
+// (zero when the server names none), and whether the server answered 304.
+func (a *App) downloadPsiphonList(id, rawURL string, since time.Time) (data []byte, published time.Time, notModified bool, err error) {
+	ctx, cancel := context.WithTimeout(context.Background(), psiphonListDownloadLimit)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
+	if err != nil {
+		return nil, time.Time{}, false, err
+	}
+	req.Header.Set("User-Agent", "NekoGo/"+appVersion)
+	if !since.IsZero() {
+		req.Header.Set("If-Modified-Since", since.UTC().Format(http.TimeFormat))
+	}
+	resp, err := downloadHTTP.Do(req)
+	if err != nil {
+		return nil, time.Time{}, false, errors.New(downloadErrorText(err))
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusNotModified {
+		return nil, time.Time{}, true, nil
+	}
+	if resp.StatusCode != http.StatusOK {
+		return nil, time.Time{}, false, fmt.Errorf("download %s: %s", redactURLQuery(rawURL), resp.Status)
+	}
+	if lm := resp.Header.Get("Last-Modified"); lm != "" {
+		if t, err := http.ParseTime(lm); err == nil {
+			published = t.UTC()
+		}
+	}
+	timer := time.AfterFunc(downloadIdleTimeout, cancel)
+	defer timer.Stop()
+	body := &idleBody{r: resp.Body, t: timer, d: downloadIdleTimeout}
+	data, err = io.ReadAll(io.LimitReader(body, maxDownloadBytes+1))
+	if err != nil {
+		return nil, published, false, fmt.Errorf("download %s: %w", redactURLQuery(rawURL), err)
+	}
+	if len(data) > maxDownloadBytes {
+		return nil, published, false, fmt.Errorf("download exceeds %d bytes", maxDownloadBytes)
+	}
+	a.updateLog(id, "info", fmt.Sprintf("[update:%s] %s received", id, humanBytes(int64(len(data)))))
+	return data, published, false, nil
 }
 
 // downloadAttempt makes one GET and folds the body into st. complete
@@ -1774,6 +2025,10 @@ func coreImageOwner(path string) string {
 		return "nekobox"
 	case strings.ToLower(coreExeName("xray")):
 		return "xray"
+	case strings.ToLower(aetherExeName):
+		return "psiphon"
+	case strings.ToLower(torExeName):
+		return "tor"
 	}
 	return ""
 }
@@ -2017,6 +2272,177 @@ func (a *App) updateXray() (*UpdatableComponent, error) {
 	return &c, nil
 }
 
+// aetherInstallPath is where aether.exe belongs, mirroring
+// resolveAetherExe: the dedicated AetherPath override (a directory gets
+// aether.exe inside it, a file is updated in place), otherwise the binary
+// already resolved from bin\ / the exe folder, and bin\ next to
+// nekogo.exe as the default destination. resolveAetherExe only accepts an
+// override that EXISTS, so the destination is computed here rather than
+// read back from the resolver: an install into a configured-but-empty
+// folder has to land where the setting points, which is also the only way
+// a machine with no engine yet gets one.
+func (a *App) aetherInstallPath() (string, error) {
+	if a.store != nil {
+		if p := strings.TrimSpace(a.store.GetSettings().AetherPath); p != "" {
+			if info, err := os.Stat(p); err == nil && info.IsDir() {
+				return filepath.Join(p, aetherExeName), nil
+			}
+			return p, nil
+		}
+	}
+	if cur := a.currentCorePath("psiphon"); cur != "" {
+		return cur, nil
+	}
+	return filepath.Join(coreExeDir(), aetherExeName), nil
+}
+
+// aetherBusy reports whether any aether.exe child is running: the engine
+// or either chain leg. Windows cannot replace a mapped image, and
+// pt\lyrebird.exe is a child of a live Tor run, so both have to be down.
+func (a *App) aetherBusy() bool {
+	for _, m := range []*AetherManager{a.aetherMgr, a.psiphonMgr, a.torMgr} {
+		if m != nil && m.Running() {
+			return true
+		}
+	}
+	return false
+}
+
+// updatePsiphon installs the Aether core from the release that
+// publishes aether.exe. The archive's aether.exe goes to the resolved
+// path with the usual backup + smoke verify + rollback, and the pt\
+// transports land beside it: an engine without them starts Tor and then
+// fails to spawn a transport for every bridge line, which reads as a
+// bootstrap stall with nothing on screen naming the missing file.
+func (a *App) updatePsiphon() (*UpdatableComponent, error) {
+	if a.coreBusy() || a.aetherBusy() {
+		return nil, fmt.Errorf("disconnect before updating")
+	}
+	rel, err := githubLatest(aetherOwnerRepo)
+	if err != nil {
+		return nil, err
+	}
+	asset := aetherAsset(rel.Assets)
+	if asset == nil {
+		return nil, fmt.Errorf("no aether build for %s/%s in %s", runtime.GOOS, runtime.GOARCH, rel.TagName)
+	}
+	dest, err := a.aetherInstallPath()
+	if err != nil {
+		return nil, err
+	}
+	if owner := coreImageOwner(dest); owner != "" && owner != "psiphon" {
+		return nil, fmt.Errorf("psiphon update would overwrite %s, which belongs to the %s row; fix aetherPath in settings", filepath.Base(dest), owner)
+	}
+	a.updateLog("psiphon", "info", fmt.Sprintf("[update:psiphon] installing %s from %s", asset.Name, rel.TagName))
+	data, err := a.downloadFile("psiphon", asset.BrowserDownloadURL)
+	if err != nil {
+		a.updateLog("psiphon", "error", "[update:psiphon] ERROR: "+err.Error())
+		return nil, err
+	}
+	// The digest covers the ARCHIVE, so it is checked before anything is
+	// unpacked or written: a tampered zip must never reach the extractor.
+	if err := a.verifyDigest("psiphon", asset.Name, asset.Digest, data); err != nil {
+		a.updateLog("psiphon", "error", "[update:psiphon] ERROR: "+err.Error())
+		return nil, err
+	}
+	exe, err := extractExeFromZip(data, aetherExeName)
+	if err != nil {
+		a.updateLog("psiphon", "error", "[update:psiphon] ERROR: "+err.Error())
+		return nil, err
+	}
+	installed := true
+	if err := a.installExeWithBackup("psiphon", dest, exe, "-v"); err != nil {
+		if !errors.Is(err, errAlreadyUpToDate) {
+			a.updateLog("psiphon", "error", "[update:psiphon] ERROR: "+err.Error())
+			return nil, err
+		}
+		installed = false
+		a.updateLog("psiphon", "info", "[update:psiphon] already up to date (identical binary)")
+	}
+	// The transports beside the engine, written only after it verified. A
+	// release that ships fewer is not a failed install — the row reports
+	// what is missing the next time it is read, which is where a user
+	// looks, and the engine it did get is the one that runs.
+	for _, name := range aetherZipTransports {
+		body, err := extractExeFromZip(data, name)
+		if err != nil {
+			a.updateLog("psiphon", "warn", fmt.Sprintf("[update:psiphon] %s is not in %s — Tor/Psiphon transports need it", name, asset.Name))
+			continue
+		}
+		if err := a.installFile("psiphon", filepath.Join(aetherPtDir(dest), name), body); err != nil &&
+			!errors.Is(err, errAlreadyUpToDate) {
+			a.updateLog("psiphon", "error", "[update:psiphon] ERROR: "+err.Error())
+			return nil, err
+		}
+	}
+	// The version cache is keyed on path, and an in-place replace keeps
+	// the path: drop the stale line so Current refreshes at once.
+	a.invalidateCoreVersion("psiphon")
+	c := UpdatableComponent{ID: "psiphon", Latest: rel.TagName}
+	for _, base := range a.localUpdatables() {
+		if base.ID == "psiphon" {
+			c = base
+			break
+		}
+	}
+	c.Latest = rel.TagName
+	c.UpdateAvail = false
+	if !installed {
+		c.Notes = "Already up to date"
+	}
+	return &c, nil
+}
+
+// updatePsiphonServers downloads the signed server list and puts it in
+// place of the one in use only after Psiphon's signature and the minimum
+// entry count check out. No core has to stop: the next start unpacks the
+// new list beside the identity files. A failed or invalid download leaves
+// the list in use untouched.
+func (a *App) updatePsiphonServers() (*UpdatableComponent, error) {
+	active := psiphonActiveListPath()
+	_, inUse, _ := psiphonServersLocal()
+	source := psiphonServersSource()
+	a.updateLog("psiphon-servers", "info", "[update:psiphon-servers] checking "+redactURLQuery(source))
+
+	data, published, notModified, err := a.downloadPsiphonList("psiphon-servers", source, inUse)
+	if err != nil {
+		a.updateLog("psiphon-servers", "error", "[update:psiphon-servers] ERROR: "+err.Error())
+		return nil, err
+	}
+	if notModified || (!inUse.IsZero() && !published.IsZero() && !published.After(inUse)) {
+		c := psiphonServersRow()
+		c.Notes = "Already up to date"
+		c.LastCheck = time.Now().Format(time.RFC3339)
+		a.updateLog("psiphon-servers", "info", "[update:psiphon-servers] already up to date")
+		return &c, nil
+	}
+	entries, err := psiphonVerifyList(data, psiphonListKey)
+	if err != nil {
+		err = fmt.Errorf("the download is not Psiphon's signed server list (%w); the list in use stays", err)
+		a.updateLog("psiphon-servers", "error", "[update:psiphon-servers] ERROR: "+err.Error())
+		return nil, err
+	}
+	if published.IsZero() {
+		published = time.Now()
+	}
+	if err := a.installFile("psiphon-servers", active, data); err != nil && !errors.Is(err, errAlreadyUpToDate) {
+		a.updateLog("psiphon-servers", "error", "[update:psiphon-servers] ERROR: "+err.Error())
+		return nil, err
+	}
+	// The list in use is as new as its publication time, not as the moment
+	// the bytes were written: the next check compares the same clock.
+	if err := os.Chtimes(active, published, published); err != nil {
+		a.updateLog("psiphon-servers", "warn", "[update:psiphon-servers] cannot record the list's publication time: "+err.Error())
+	}
+	c := psiphonServersRow()
+	c.Latest = published.Format("2006-01-02")
+	c.UpdateAvail = false
+	c.Notes = fmt.Sprintf("Installed %d server entries published %s", entries, published.Format("2006-01-02"))
+	c.LastCheck = time.Now().Format(time.RFC3339)
+	a.updateLog("psiphon-servers", "info", fmt.Sprintf("[update:psiphon-servers] installed %d server entries published %s", entries, published.Format("2006-01-02")))
+	return &c, nil
+}
+
 // currentCorePath returns the resolved exe path a component runs
 // today ("" when none resolves — fresh install to the exe dir).
 func (a *App) currentCorePath(id string) string {
@@ -2038,6 +2464,18 @@ func (a *App) currentCorePath(id string) string {
 	case "mihomo":
 		if a.store != nil {
 			if p, err := resolveMihomo(a.store.GetSettings()); err == nil {
+				return p
+			}
+		}
+	case "tor":
+		if a.store != nil {
+			if p, err := resolveTorExe(a.store.GetSettings()); err == nil {
+				return p
+			}
+		}
+	case "psiphon":
+		if a.aetherMgr != nil && a.store != nil {
+			if p, err := a.aetherMgr.resolveAetherExe(a.store.GetSettings()); err == nil {
 				return p
 			}
 		}
@@ -2065,6 +2503,14 @@ func (a *App) invalidateCoreVersion(id string) {
 		a.mihomoVer.mu.Lock()
 		a.mihomoVer.version = ""
 		a.mihomoVer.mu.Unlock()
+	case "tor":
+		a.torVer.mu.Lock()
+		a.torVer.version = ""
+		a.torVer.mu.Unlock()
+	case "psiphon":
+		a.aetherVer.mu.Lock()
+		a.aetherVer.version = ""
+		a.aetherVer.mu.Unlock()
 	}
 }
 
@@ -2169,6 +2615,12 @@ func (a *App) UpdateComponent(id string) (*UpdatableComponent, error) {
 		return a.updateXray()
 	case "mihomo":
 		return a.updateMihomo()
+	case "tor":
+		return a.updateTorRelease()
+	case "psiphon":
+		return a.updatePsiphon()
+	case "psiphon-servers":
+		return a.updatePsiphonServers()
 	case "gui":
 		return a.updateGUI()
 	default:

@@ -1,3 +1,0 @@
-# One fake SNI (domain) per line.
-# These are used as decoy hostnames during DPI bypass.
-#

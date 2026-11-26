@@ -110,9 +110,9 @@ func TestStatsApiDownJSONShape(t *testing.T) {
 }
 
 // TestXrayPortInUse — HOTFIX Bug 2: when the mixed port is already held
-// (zombie xray from a crashed session), Start must fail fast with the
-// clear "in use" message — naming the port — instead of a bare bind error
-// 5s later. The bogus binary path proves the check runs before resolve.
+// (zombie xray from a crashed session), Start must fail fast naming the
+// port and what to do about it — instead of a bare bind error 5s later.
+// The bogus binary path proves the check runs before resolve.
 func TestXrayPortInUse(t *testing.T) {
 	hold, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -145,7 +145,7 @@ func TestXrayPortInUse(t *testing.T) {
 	if !strings.Contains(msg, "in use") || !strings.Contains(msg, strconv.Itoa(mixed)) {
 		t.Fatalf("Start() err = %q, want port %d in-use hint", msg, mixed)
 	}
-	if !strings.Contains(msg, "still running") {
-		t.Fatalf("Start() err = %q, want zombie hint", msg)
+	if !strings.Contains(msg, "Close whatever owns it") {
+		t.Fatalf("Start() err = %q, want the remedy naming the holder to close", msg)
 	}
 }

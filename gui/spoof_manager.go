@@ -185,9 +185,9 @@ func isCloudflareIP(ip string) bool {
 }
 
 // isDomainAddress reports whether addr is a bare domain name (not an
-// IP literal, not loopback, not empty): the prompt.txt Test-CF shape
-// (www.calmlunch.com) vs the normal shape (an IPv6 literal like
-// [2a06:98c1:3101::6812:202f]). DNS-free, so the import auto-detect
+// IP literal, not loopback, not empty): the Test-CF shape
+// (www.node.example) vs the normal shape (an IPv6 literal like
+// [2001:db8::6812:202f]). DNS-free, so the import auto-detect
 // can use it synchronously.
 func isDomainAddress(addr string) bool {
 	s := strings.ToLower(strings.TrimSpace(addr))

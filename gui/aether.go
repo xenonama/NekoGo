@@ -42,7 +42,7 @@ type aetherSettings struct {
 	Obfuscation string `json:"obfuscation,omitempty"` // auto|off|light|firewall|balanced|gfw|aggressive
 	IPVersion   string `json:"ipVersion,omitempty"`   // v4|v6|both
 	MasqueSNI   string `json:"masqueSni,omitempty"`   // empty = core default
-	Fingerprint string `json:"fingerprint,omitempty"` // chrome|firefox|semi-python|go, empty = chrome
+	Fingerprint string `json:"fingerprint,omitempty"` // chrome|chrome-120|firefox|semi-python|go, empty = chrome
 	DNS         string `json:"dns,omitempty"`         // comma-separated resolvers
 	ExitLoc     string `json:"exitLoc,omitempty"`     // country allow/refuse rule e.g. DE,!NL
 	WiwOuter    string `json:"wiwOuter,omitempty"`    // two-hop protocols: outer endpoint
@@ -189,27 +189,33 @@ func splitCommaSpacer(text string) []string {
 	return out
 }
 
-// aetherFingerprint is one TLS ClientHello fingerprint preset.
+// aetherFingerprint is one TLS ClientHello fingerprint preset. groups
+// is empty for a preset that leaves the core's own key shares alone.
 type aetherFingerprint struct {
 	name    string
 	ciphers string
 	grease  bool
+	groups  string
 }
 
 var aetherFingerprints = []aetherFingerprint{
-	{"chrome", "ALL:!aPSK:!ECDSA+SHA1:!3DES", true},
+	{"chrome", "ALL:!aPSK:!ECDSA+SHA1:!3DES", true, ""},
+	// Chrome 120 offers no post-quantum key share, which is the whole
+	// difference a core of this vintage can express: the groups, in
+	// Chrome's order, with X25519 first.
+	{"chrome-120", "ALL:!aPSK:!ECDSA+SHA1:!3DES", true, "X25519:P-256:P-384"},
 	{"firefox",
 		"ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305:" +
 			"ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-RSA-AES128-SHA:ECDHE-RSA-AES256-SHA:" +
-			"AES128-GCM-SHA256:AES256-GCM-SHA384:AES128-SHA:AES256-SHA", false},
+			"AES128-GCM-SHA256:AES256-GCM-SHA384:AES128-SHA:AES256-SHA", false, ""},
 	{"semi-python",
 		"ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:" +
 			"ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305:ECDHE-ECDSA-AES256-SHA:ECDHE-RSA-AES256-SHA:" +
-			"ECDHE-ECDSA-AES128-SHA256:ECDHE-RSA-AES128-SHA256", false},
+			"ECDHE-ECDSA-AES128-SHA256:ECDHE-RSA-AES128-SHA256", false, ""},
 	{"go",
 		"ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:" +
 			"ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305:ECDHE-ECDSA-AES128-SHA:ECDHE-RSA-AES128-SHA:" +
-			"ECDHE-ECDSA-AES256-SHA:ECDHE-RSA-AES256-SHA", false},
+			"ECDHE-ECDSA-AES256-SHA:ECDHE-RSA-AES256-SHA", false, ""},
 }
 
 // aetherFingerprintDefault maps an unknown name to chrome.
@@ -223,12 +229,15 @@ func aetherFingerprintDefault(name string) string {
 }
 
 // aetherFingerprintArguments returns the core's TLS options for the
-// preset [name]: its TLS 1.2 suites, and GREASE left out where it
-// sends none (AetherFingerprint.arguments).
+// preset [name]: its TLS 1.2 suites, the key shares it names, and
+// GREASE left out where it sends none (AetherFingerprint.arguments).
 func aetherFingerprintArguments(name string) []string {
 	for _, f := range aetherFingerprints {
 		if f.name == name {
 			out := []string{"--tls-ciphers", f.ciphers}
+			if f.groups != "" {
+				out = append(out, "--tls-groups", f.groups)
+			}
 			if !f.grease {
 				out = append(out, "--disable-grease")
 			}

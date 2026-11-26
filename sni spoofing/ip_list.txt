@@ -1,3 +1,0 @@
-# One IP or CIDR per line. Example: 104.16.0.0/24
-# The app uses the first usable IP of each block.
-#

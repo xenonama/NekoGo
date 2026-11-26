@@ -215,6 +215,79 @@ func assertPortState(t *testing.T, addr string, wantOpen bool) {
 	}
 }
 
+func TestUpstreamEphemeralURLTestStartsAndTearsDown(t *testing.T) {
+	for _, cancelProbe := range []bool{false, true} {
+		name := "success"
+		if cancelProbe {
+			name = "cancelled"
+		}
+		t.Run(name, func(t *testing.T) {
+			origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(http.StatusNoContent)
+			}))
+			defer origin.Close()
+			logs := make(chan LogEntry, 256)
+			upstream := NewUpstreamSingBoxManager(logs)
+			cores := NewCoreManager(nil, nil)
+			cores.SetUpstreamSingBoxManager(upstream)
+			settings := DefaultSettings()
+			settings.CoreEngine = "upstream"
+			settings.UpstreamCorePath = installFakeSingBox(t)
+			portFile := filepath.Join(t.TempDir(), "listener.addr")
+			t.Setenv(fakeSingBoxPortFileEnv, portFile)
+			profile := directProfile(CoreSingBox)
+
+			if !cancelProbe {
+				result, err := cores.EphemeralURLTest(profile, settings, origin.URL, 2000, probeOwnerNetwork)
+				if err != nil {
+					t.Fatalf("EphemeralURLTest: %v", err)
+				}
+				if result == nil || result.OutboundTag != clashProxyTag || result.LatencyMs < 0 {
+					t.Fatalf("result = %+v, want a successful upstream proxy probe", result)
+				}
+				data, err := os.ReadFile(portFile)
+				if err != nil {
+					t.Fatalf("read fake listener address: %v", err)
+				}
+				assertPortState(t, string(data), false)
+				return
+			}
+
+			done := make(chan error, 1)
+			go func() {
+				_, err := cores.EphemeralURLTest(profile, settings, origin.URL, 5000, probeOwnerNetwork)
+				done <- err
+			}()
+			var addr string
+			waitFor(t, "upstream probe listener", func() bool {
+				data, err := os.ReadFile(portFile)
+				if err != nil || len(data) == 0 {
+					return false
+				}
+				conn, err := net.DialTimeout("tcp", string(data), 100*time.Millisecond)
+				if err != nil {
+					return false
+				}
+				_ = conn.Close()
+				addr = string(data)
+				return true
+			})
+			if !cores.StopEphemeralTests(probeOwnerNetwork) {
+				t.Fatal("StopEphemeralTests did not stop the upstream probe")
+			}
+			select {
+			case err := <-done:
+				if err == nil {
+					t.Fatal("cancelled upstream probe succeeded")
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatal("cancelled upstream probe did not return")
+			}
+			assertPortState(t, addr, false)
+		})
+	}
+}
+
 func TestEphemeralURLTestTearsDown(t *testing.T) {
 	coreBin, xrayBin := testCoreBins(t)
 	logs := make(chan LogEntry, 512)

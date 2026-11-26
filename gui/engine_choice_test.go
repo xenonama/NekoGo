@@ -11,9 +11,12 @@ package main
 // testdata/spoofmock. No real binaries, drivers or admin rights needed.
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
+	"strings"
 	"testing"
 )
 
@@ -175,5 +178,386 @@ func TestEngineInstallDirIsBinFolder(t *testing.T) {
 	}
 	if got := coreExeDir(); got != want {
 		t.Fatalf("coreExeDir = %q, want %q", got, want)
+	}
+}
+
+func TestCorePreferenceDecisionMatrix(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		engine       string
+		protocol     string
+		storedCore   CoreType
+		wantCore     CoreType
+		wantEngine   string
+		wantFallback bool
+	}{
+		{"nekobox vless", "custom", "vless", CoreXray, CoreSingBox, "custom", false},
+		{"nekobox socks", "custom", "socks", CoreMihomo, CoreSingBox, "custom", false},
+		{"nekobox direct", "custom", "direct", CoreXray, CoreSingBox, "custom", false},
+		{"singbox vless", "upstream", "vless", CoreMihomo, CoreSingBox, "upstream", false},
+		{"singbox http", "upstream", "http", CoreXray, CoreSingBox, "upstream", false},
+		{"xray vless", "xray", "vless", CoreSingBox, CoreXray, "xray", false},
+		{"xray aether", "xray", "aether", CoreMihomo, CoreXray, "xray", false},
+		{"xray socks falls back", "xray", "socks", CoreXray, CoreSingBox, "custom", true},
+		{"xray http falls back", "xray", "http", CoreSingBox, CoreSingBox, "custom", true},
+		{"xray direct falls back", "xray", "direct", CoreMihomo, CoreSingBox, "custom", true},
+		{"mihomo vless", "mihomo", "vless", CoreSingBox, CoreMihomo, "mihomo", false},
+		{"mihomo socks", "mihomo", "socks", CoreXray, CoreMihomo, "mihomo", false},
+		{"mihomo direct falls back", "mihomo", "direct", CoreMihomo, CoreSingBox, "custom", true},
+		{"empty preference", "", "vless", CoreXray, CoreSingBox, "custom", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			p := &Profile{Name: tc.name, Core: tc.storedCore, Protocol: tc.protocol, Address: "example.com", Port: 443}
+			choice, err := resolveProfileCore(p, Settings{CoreEngine: tc.engine})
+			if err != nil {
+				t.Fatalf("resolveProfileCore: %v", err)
+			}
+			if choice.Profile.Core != tc.wantCore || choice.Engine != tc.wantEngine || choice.Fallback != tc.wantFallback {
+				t.Fatalf("choice = core %s, engine %q, fallback %v; want %s, %q, %v",
+					choice.Profile.Core, choice.Engine, choice.Fallback, tc.wantCore, tc.wantEngine, tc.wantFallback)
+			}
+			if p.Core != tc.storedCore {
+				t.Fatal("resolver mutated the stored profile")
+			}
+		})
+	}
+}
+
+func TestCorePreferenceLeavesTunBehaviorUnchanged(t *testing.T) {
+	for _, tc := range []struct {
+		engine     string
+		wantCore   CoreType
+		wantEngine string
+		wantTun    bool
+	}{
+		{"custom", CoreSingBox, "custom", true},
+		{"upstream", CoreSingBox, "upstream", true},
+		{"xray", CoreXray, "xray", false},
+		{"mihomo", CoreMihomo, "mihomo", false},
+	} {
+		t.Run(tc.engine, func(t *testing.T) {
+			p := &Profile{Name: "tun", Core: CoreSingBox, Protocol: "vless", Address: "example.com", Port: 443}
+			settings := Settings{CoreEngine: tc.engine, TunEnabled: true}
+			choice, err := resolveProfileCore(p, settings)
+			if err != nil {
+				t.Fatalf("resolveProfileCore: %v", err)
+			}
+			if choice.Profile.Core != tc.wantCore || choice.Engine != tc.wantEngine || choice.Fallback {
+				t.Fatalf("choice = core %s, engine %q, fallback %v; want %s, %q, false",
+					choice.Profile.Core, choice.Engine, choice.Fallback, tc.wantCore, tc.wantEngine)
+			}
+			if got := tunModeFor(&choice.Profile, settings); got != tc.wantTun {
+				t.Fatalf("tunModeFor = %v, want unchanged %v", got, tc.wantTun)
+			}
+			if settings.CoreEngine != tc.engine || p.Core != CoreSingBox {
+				t.Fatal("resolver mutated the preference or stored profile")
+			}
+		})
+	}
+}
+
+func TestCorePreferenceTunKeepsRawOutboundFormats(t *testing.T) {
+	settings := Settings{CoreEngine: "xray", TunEnabled: true}
+	for _, tc := range []struct {
+		name       string
+		core       CoreType
+		raw        string
+		wantCore   CoreType
+		wantEngine string
+	}{
+		{"sing-box", CoreSingBox, `{"type":"vless"}`, CoreSingBox, "custom"},
+		{"xray", CoreXray, `{"protocol":"vless"}`, CoreXray, "xray"},
+		{"mihomo", CoreMihomo, `{"type":"vless"}`, CoreMihomo, "mihomo"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			p := &Profile{Core: tc.core, Protocol: "vless", RawOutbound: tc.raw}
+			choice, err := resolveProfileCore(p, settings)
+			if err != nil {
+				t.Fatalf("resolveProfileCore: %v", err)
+			}
+			if choice.Profile.Core != tc.wantCore || choice.Engine != tc.wantEngine {
+				t.Fatalf("choice = core %s, engine %q; want %s, %q",
+					choice.Profile.Core, choice.Engine, tc.wantCore, tc.wantEngine)
+			}
+		})
+	}
+}
+
+func TestCorePreferencePreservesSpoofAndRawFormats(t *testing.T) {
+	settings := Settings{CoreEngine: "xray"}
+	spoof := &Profile{Core: CoreSpoof, Protocol: "vless", Address: "example.com", Port: 443}
+	choice, err := resolveProfileCore(spoof, settings)
+	if err != nil || choice.Profile.Core != CoreSpoof || choice.Engine != "xray" {
+		t.Fatalf("enabled spoof choice = %+v, %v; want spoof with xray preference", choice, err)
+	}
+	off := settings
+	disabled := false
+	off.SpoofEnabled = &disabled
+	choice, err = resolveProfileCore(spoof, off)
+	if err != nil || choice.Profile.Core != CoreXray {
+		t.Fatalf("disabled spoof choice = %+v, %v; want the global xray preference", choice, err)
+	}
+
+	for _, tc := range []struct {
+		name       string
+		engine     string
+		core       CoreType
+		raw        string
+		wantCore   CoreType
+		wantEngine string
+		fallback   bool
+	}{
+		{"singbox raw on nekobox", "custom", CoreSingBox, `{"type":"vless"}`, CoreSingBox, "custom", false},
+		{"singbox raw on singbox", "upstream", CoreSingBox, `{"type":"vless"}`, CoreSingBox, "upstream", false},
+		{"singbox raw stays singbox", "xray", CoreSingBox, `{"type":"vless"}`, CoreSingBox, "custom", false},
+		{"nekobox-only raw falls back", "upstream", CoreSingBox, `{"type":"mieru"}`, CoreSingBox, "custom", true},
+		{"xray raw stays xray", "custom", CoreXray, `{"protocol":"vless"}`, CoreXray, "xray", false},
+		{"mihomo raw stays mihomo", "upstream", CoreMihomo, `{"type":"vless"}`, CoreMihomo, "mihomo", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			p := &Profile{Core: tc.core, Protocol: "vless", RawOutbound: tc.raw}
+			choice, err := resolveProfileCore(p, Settings{CoreEngine: tc.engine})
+			if err != nil {
+				t.Fatalf("resolveProfileCore: %v", err)
+			}
+			if choice.Profile.Core != tc.wantCore || choice.Engine != tc.wantEngine || choice.Fallback != tc.fallback {
+				t.Fatalf("choice = core %s, engine %q, fallback %v; want %s, %q, %v",
+					choice.Profile.Core, choice.Engine, choice.Fallback, tc.wantCore, tc.wantEngine, tc.fallback)
+			}
+		})
+	}
+}
+
+func TestCorePreferenceDoesNotFallbackOnStartFailure(t *testing.T) {
+	missing := filepath.Join(t.TempDir(), "missing-core")
+	logCh := make(chan LogEntry, 64)
+	custom := NewSingBoxManager(missing, logCh)
+	xray := NewXrayManager(missing, t.TempDir(), logCh)
+	cores := NewCoreManager(custom, xray)
+	settings := DefaultSettings()
+	settings.CoreEngine = "xray"
+	settings.XrayPath = missing
+	settings.CorePath = missing
+	port, err := freePort()
+	if err != nil {
+		t.Fatal(err)
+	}
+	settings.MixedPort = port
+	api, err := freePort()
+	if err != nil {
+		t.Fatal(err)
+	}
+	settings.XrayAPIAddress = "127.0.0.1:" + strconv.Itoa(api)
+	err = cores.Start(portTestProfile(), settings)
+	if err == nil || !strings.Contains(err.Error(), "xray not found") {
+		t.Fatalf("Start with missing preferred Xray = %v, want the Xray error", err)
+	}
+	if custom.IsRunning() {
+		t.Fatal("a runtime Xray failure silently started the fallback core")
+	}
+}
+
+func TestPreferredCoreRuntimeDispatch(t *testing.T) {
+	for _, tc := range []struct {
+		engine   string
+		wantCore CoreType
+	}{
+		{"xray", CoreXray},
+		{"mihomo", CoreMihomo},
+	} {
+		t.Run(tc.engine, func(t *testing.T) {
+			logCh := make(chan LogEntry, 256)
+			missing := filepath.Join(t.TempDir(), "missing-core")
+			custom := NewSingBoxManager(missing, logCh)
+			xray := NewXrayManager("", t.TempDir(), logCh)
+			mihomo := NewMihomoManager(logCh)
+			cores := NewCoreManager(custom, xray)
+			cores.SetMihomoManager(mihomo)
+			t.Cleanup(func() { _ = cores.Stop() })
+
+			settings := DefaultSettings()
+			settings.CoreEngine = tc.engine
+			settings.CorePath = missing
+			settings.UpstreamCorePath = missing
+			settings.XrayPath = installFakeXray(t)
+			settings.MihomoPath = installFakeMihomo(t)
+			xray.setXrayPath(settings.XrayPath)
+			port, err := freePort()
+			if err != nil {
+				t.Fatal(err)
+			}
+			settings.MixedPort = port
+			api, err := distinctPort(port, port+1)
+			if err != nil {
+				t.Fatal(err)
+			}
+			settings.XrayAPIAddress = "127.0.0.1:" + strconv.Itoa(api)
+			profile := &Profile{
+				ID: "dispatch", Name: "dispatch", Core: CoreSingBox, Protocol: "vless",
+				Address: "example.com", Port: 443, IDOrPassword: "pw",
+			}
+			if err := cores.Start(profile, settings); err != nil {
+				t.Fatalf("Start: %v", err)
+			}
+			core, id, running := cores.Status()
+			if !running || core != tc.wantCore.String() || id != profile.ID {
+				t.Fatalf("Status = (%q, %q, %v), want (%q, %q, true)", core, id, running, tc.wantCore, profile.ID)
+			}
+			if xray.IsRunning() != (tc.engine == "xray") || mihomo.IsRunning() != (tc.engine == "mihomo") || custom.IsRunning() {
+				t.Fatalf("running managers: custom=%v xray=%v mihomo=%v", custom.IsRunning(), xray.IsRunning(), mihomo.IsRunning())
+			}
+			if err := cores.Stop(); err != nil {
+				t.Fatalf("Stop: %v", err)
+			}
+			if xray.IsRunning() || mihomo.IsRunning() || custom.IsRunning() {
+				t.Fatal("a selected manager survived Stop")
+			}
+		})
+	}
+}
+
+func TestCompatibilityFallbackSelectsCustomBeforeStart(t *testing.T) {
+	logCh := make(chan LogEntry, 64)
+	missing := filepath.Join(t.TempDir(), "missing-core")
+	custom := NewSingBoxManager(missing, logCh)
+	xray := NewXrayManager(installFakeXray(t), t.TempDir(), logCh)
+	cores := NewCoreManager(custom, xray)
+	settings := DefaultSettings()
+	settings.CoreEngine = "xray"
+	settings.CorePath = missing
+	port, err := freePort()
+	if err != nil {
+		t.Fatal(err)
+	}
+	settings.MixedPort = port
+	profile := &Profile{Name: "socks", Core: CoreXray, Protocol: "socks", Address: "example.com", Port: 1080}
+	err = cores.Start(profile, settings)
+	if err == nil || !strings.Contains(err.Error(), "core not found") {
+		t.Fatalf("Start = %v, want the custom core's missing-binary error", err)
+	}
+	if xray.IsRunning() || custom.IsRunning() {
+		t.Fatal("compatibility fallback spawned Xray or committed a dead custom core")
+	}
+}
+
+func TestSaveSettingsAcceptsFourCoreEngines(t *testing.T) {
+	app := newGeoTestApp(t)
+	for _, engine := range []string{"custom", "upstream", "xray", "mihomo"} {
+		settings := app.GetSettings()
+		settings.CoreEngine = engine
+		if err := app.SaveSettings(settings); err != nil {
+			t.Errorf("SaveSettings(coreEngine=%q): %v", engine, err)
+		}
+		if got := app.GetSettings().CoreEngine; got != engine {
+			t.Errorf("saved coreEngine = %q, want %q", got, engine)
+		}
+	}
+	bad := app.GetSettings()
+	bad.CoreEngine = "other"
+	if err := app.SaveSettings(bad); err == nil {
+		t.Fatal("SaveSettings accepted an unknown core engine")
+	}
+}
+
+func TestConfigPreviewsFollowPreferredCore(t *testing.T) {
+	for _, tc := range []struct {
+		engine       string
+		protocol     string
+		wantOutbound string
+		wantInbound  string
+		wantMihomo   bool
+	}{
+		{"custom", "vless", `"type": "vless"`, `"type": "mixed"`, false},
+		{"upstream", "vless", `"type": "vless"`, `"type": "mixed"`, false},
+		{"xray", "vless", `"protocol": "vless"`, `"protocol": "http"`, false},
+		{"mihomo", "vless", "", "", true},
+		{"xray", "socks", `"type": "socks"`, `"type": "mixed"`, false},
+	} {
+		t.Run(tc.engine+"/"+tc.protocol, func(t *testing.T) {
+			app := newGeoTestApp(t)
+			if _, err := app.SaveProfile(Profile{
+				Name: "preview", Core: CoreSingBox, Protocol: tc.protocol,
+				Address: "example.com", Port: 443, IDOrPassword: "pw",
+			}); err != nil {
+				t.Fatal(err)
+			}
+			settings := app.GetSettings()
+			settings.CoreEngine = tc.engine
+			if err := app.SaveSettings(settings); err != nil {
+				t.Fatal(err)
+			}
+			raw, err := app.GetRawConfig()
+			if tc.wantMihomo {
+				if err == nil || !strings.Contains(err.Error(), mihomoConfigEditorMessage) {
+					t.Fatalf("GetRawConfig = %v, want the mihomo editor message", err)
+				}
+			} else if err != nil {
+				t.Fatalf("GetRawConfig: %v", err)
+			} else if !strings.Contains(raw, tc.wantOutbound) {
+				t.Fatalf("GetRawConfig missing %s: %s", tc.wantOutbound, raw)
+			}
+			section, err := app.GetCoreConfigSection("inbound")
+			if tc.wantMihomo {
+				if err == nil || !strings.Contains(err.Error(), mihomoConfigEditorMessage) {
+					t.Fatalf("GetCoreConfigSection = %v, want the mihomo editor message", err)
+				}
+			} else if err != nil {
+				t.Fatalf("GetCoreConfigSection: %v", err)
+			} else if !strings.Contains(section, tc.wantInbound) {
+				t.Fatalf("inbound section missing %s: %s", tc.wantInbound, section)
+			}
+		})
+	}
+}
+
+func TestSpoofXrayConfigPreviewUsesXrayTransport(t *testing.T) {
+	settings := DefaultSettings()
+	settings.SpoofXray = true
+	p := &Profile{Core: CoreSpoof, Protocol: "vless", Address: "example.com", Port: 443, IDOrPassword: "pw"}
+	const spoofPort = 18080
+	setSpoofFrontPort(spoofPort)
+	t.Cleanup(func() { clearSpoofFrontPortIf(spoofPort) })
+
+	raw, err := renderActiveConfig(p, settings)
+	if err != nil {
+		t.Fatalf("renderActiveConfig: %v", err)
+	}
+	var cfg struct {
+		Outbounds []struct {
+			Protocol string `json:"protocol"`
+			Settings struct {
+				VNext []struct {
+					Address string `json:"address"`
+					Port    int    `json:"port"`
+				} `json:"vnext"`
+			} `json:"settings"`
+		} `json:"outbounds"`
+	}
+	if err := json.Unmarshal([]byte(raw), &cfg); err != nil {
+		t.Fatalf("preview is not JSON: %v", err)
+	}
+	for _, out := range cfg.Outbounds {
+		if out.Protocol != "vless" {
+			continue
+		}
+		if len(out.Settings.VNext) != 1 || out.Settings.VNext[0].Address != "127.0.0.1" || out.Settings.VNext[0].Port != spoofPort {
+			t.Fatalf("spoof outbound = %+v, want the local spoof front", out.Settings.VNext)
+		}
+		return
+	}
+	t.Fatalf("preview has no Xray VLESS outbound: %s", raw)
+}
+
+func TestCoreEngineSelectorOffersFourChoices(t *testing.T) {
+	src := readGuiFile(t, "frontend/src/components/SettingsPanel.vue")
+	for _, option := range []string{
+		`{ value: 'custom', label: 'NekoBox Core' }`,
+		`{ value: 'upstream', label: 'sing-box' }`,
+		`{ value: 'xray', label: 'Xray' }`,
+		`{ value: 'mihomo', label: 'Mihomo' }`,
+	} {
+		if !strings.Contains(src, option) {
+			t.Errorf("Core Engine selector is missing %s", option)
+		}
 	}
 }

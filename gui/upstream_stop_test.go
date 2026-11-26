@@ -196,12 +196,17 @@ func TestAetherConnectAbortedByStopRollsBackItsLegs(t *testing.T) {
 	cores.SetAetherManager(aether)
 	work := scratchDir(t)
 	prevExe, prevDir, prevPort := aetherExeOverride, aetherWorkDirHook, aetherFreePortHook
+	prevListener := aetherListenerFreeHook
 	sink := newSocksSink(t)
 	aetherExeOverride = bin
 	aetherWorkDirHook = func() string { return work }
 	aetherFreePortHook = func() (int, error) { return sink.port, nil }
+	// The sink stands in for the engine's own listener, so the pre-spawn
+	// check would read the engine as the squatter holding its port.
+	aetherListenerFreeHook = func(int) error { return nil }
 	defer func() {
 		aetherExeOverride, aetherWorkDirHook, aetherFreePortHook = prevExe, prevDir, prevPort
+		aetherListenerFreeHook = prevListener
 		sink.close()
 	}()
 

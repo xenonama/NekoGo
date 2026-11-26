@@ -221,7 +221,7 @@ func TestInjectClashAPIKeepsExistingExperimental(t *testing.T) {
 	}
 }
 
-func TestUpstreamRejectsUnsupportedProfile(t *testing.T) {
+func TestUpstreamFallsBackForUnsupportedProfile(t *testing.T) {
 	store, err := NewConfigStore(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
@@ -240,25 +240,28 @@ func TestUpstreamRejectsUnsupportedProfile(t *testing.T) {
 		t.Fatalf("SaveProfile: %v", err)
 	}
 	started := false
-	app.coreStarter = func(*Profile, Settings) error {
+	startedCore := CoreXray
+	app.coreStarter = func(p *Profile, _ Settings) error {
 		started = true
+		startedCore = p.Core
 		return nil
 	}
 	start := time.Now()
-	err = app.Connect(mieru.ID)
-	if err == nil || !strings.Contains(err.Error(), "upstream sing-box core cannot run") {
-		t.Fatalf("Connect(mieru, upstream) = %v, want the upstream refusal", err)
+	if err := app.Connect(mieru.ID); err != nil {
+		t.Fatalf("Connect(mieru, upstream): %v", err)
 	}
-	if started {
-		t.Fatal("Connect started a core for a profile the upstream backend cannot run")
+	if !started || startedCore != CoreSingBox {
+		t.Fatalf("Connect started=%v core=%s, want the custom sing-box fallback", started, startedCore)
 	}
-	// The refusal is a pre-flight check, not a 15s core decode failure.
+	if got := app.GetSettings().CoreEngine; got != "upstream" {
+		t.Fatalf("compatibility fallback changed the saved preference to %q", got)
+	}
 	if elapsed := time.Since(start); elapsed > 2*time.Second {
-		t.Fatalf("refusal took %v, want an immediate error", elapsed)
+		t.Fatalf("compatibility fallback took %v, want an immediate decision", elapsed)
 	}
 
-	// Raw NekoGo-only outbounds and VLESS encryption are refused too; a
-	// plain VLESS outbound is not.
+	// Raw NekoGo-only outbounds and VLESS encryption need the custom core;
+	// a plain VLESS outbound does not.
 	for _, tc := range []struct {
 		name string
 		p    Profile

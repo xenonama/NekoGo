@@ -23,6 +23,8 @@ func TestValidateProfileForSave(t *testing.T) {
 		{Name: "socks", Core: CoreSingBox, Protocol: "socks", Address: "h", Port: 1080},
 		{Name: "direct", Core: CoreSingBox, Protocol: "direct", Address: "h", Port: 80},
 		{Name: "ss", Core: CoreXray, Protocol: "shadowsocks", Address: "h", Port: 8388},
+		{Name: "socks-on-xray", Core: CoreXray, Protocol: "socks", Address: "h", Port: 1080},
+		{Name: "direct-on-mihomo", Core: CoreMihomo, Protocol: "direct", Address: "h", Port: 80},
 		{Name: "raw-wireguard", Core: CoreSingBox, Protocol: "wireguard", RawOutbound: `{"type":"wireguard"}`},
 		{Name: "raw-only", Core: CoreXray, RawOutbound: `{"protocol":"freedom"}`},
 	}
@@ -37,7 +39,6 @@ func TestValidateProfileForSave(t *testing.T) {
 		{Name: "port-neg", Core: CoreXray, Protocol: "vmess", Address: "h", Port: -1},
 		{Name: "wg-no-raw", Core: CoreSingBox, Protocol: "wireguard", Address: "h", Port: 51820},
 		{Name: "hysteria-no-raw", Core: CoreSingBox, Protocol: "hysteria2", Address: "h", Port: 443},
-		{Name: "socks-on-xray", Core: CoreXray, Protocol: "socks", Address: "h", Port: 1080},
 		{Name: "empty-proto", Core: CoreSingBox, Address: "h", Port: 443},
 	}
 	for _, p := range bad {

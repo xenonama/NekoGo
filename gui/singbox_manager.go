@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math/rand/v2"
 	"net"
 	"os"
 	"os/exec"
@@ -229,6 +230,29 @@ func (m *SingBoxManager) resolveCore() (string, error) {
 // gymnastics or fd-passing; callers treat "address in use" startup
 // failures as retryable errors.
 func freePort() (int, error) {
+	for attempt := 0; attempt < 25; attempt++ {
+		port, err := freePortCandidate()
+		if err != nil {
+			return 0, err
+		}
+		if !connectPortReserved(port) {
+			return port, nil
+		}
+	}
+	return 0, fmt.Errorf("no free loopback port outside the ones this connect already needs")
+}
+
+// freePortHook stands in for the kernel's port assignment in tests, so a
+// picker can be aimed at a number it must refuse.
+var freePortHook func() (int, error)
+
+// freePortCandidate binds 127.0.0.1:0, captures the kernel-assigned port
+// and closes the socket again. The port is free at this instant and may
+// not be by the next: the caller hands it to a child that binds it later.
+func freePortCandidate() (int, error) {
+	if freePortHook != nil {
+		return freePortHook()
+	}
 	l, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		return 0, err
@@ -243,20 +267,45 @@ func freePort() (int, error) {
 // scan sockets), so a TCP-only probe is not enough (PattN PortsProblem
 // probes both). The TOCTOU window after Close remains, as with freePort.
 func freePortTCPAndUDP() (int, error) {
-	var lastErr error
-	for attempt := 0; attempt < 5; attempt++ {
-		port, err := freePort()
-		if err != nil {
-			return 0, err
-		}
-		u, err := net.ListenPacket("udp", fmt.Sprintf("127.0.0.1:%d", port))
-		if err == nil {
-			_ = u.Close()
+	port, err := freePort()
+	if err != nil {
+		return 0, err
+	}
+	u, udpErr := net.ListenPacket("udp", net.JoinHostPort("127.0.0.1", strconv.Itoa(port)))
+	if udpErr == nil {
+		_ = u.Close()
+		return port, nil
+	}
+	// Asking the kernel again is not a retry: it answers a :0 bind with
+	// the next ephemeral number, and Windows reserves contiguous UDP
+	// bands inside that range (WinNAT/Hyper-V), so every attempt lands in
+	// the band the last one was refused in — measured as five refusals
+	// from 64844 to 64878 inside the reserved 64826-65025. Jump instead.
+	for attempt := 0; attempt < 32; attempt++ {
+		port := 49152 + rand.IntN(65536-49152)
+		if !connectPortReserved(port) && portFreeTCPAndUDP(port) {
 			return port, nil
 		}
-		lastErr = err
 	}
-	return 0, fmt.Errorf("no loopback port free for TCP and UDP after 5 attempts: %w", lastErr)
+	return 0, fmt.Errorf("no loopback port free for TCP and UDP: %w", udpErr)
+}
+
+// portFreeTCPAndUDP probe-binds [port] on both protocols and hands it
+// back, the check a listener the app numbers itself needs before a child
+// is told to bind it.
+func portFreeTCPAndUDP(port int) bool {
+	addr := net.JoinHostPort("127.0.0.1", strconv.Itoa(port))
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		return false
+	}
+	_ = ln.Close()
+	pc, err := net.ListenPacket("udp", addr)
+	if err != nil {
+		return false
+	}
+	_ = pc.Close()
+	return true
 }
 
 // startAborted reports whether the given Start epoch was invalidated by
@@ -1028,10 +1077,10 @@ func BuildSingBoxConfig(profile *Profile, settings Settings) (string, error) {
 	if spoofPort, ok := spoofPortForProfile(profile, settings); ok {
 		applySNIFrontSingBox(cfg, spoofPort)
 	}
-	// SNI spoof → Psiphon: Psiphon's outbound, the loopback inbound its
-	// own dials ride, and the inbound-matched route rules.
-	if spoofPsiphonRendering(profile, settings) {
-		renderSpoofPsiphonChain(cfg, route)
+	// SNI spoof → exit chain: the chain's outbound, the loopback inbound
+	// its own dials ride, and the inbound-matched route rules.
+	if spoofChainRendering(profile, settings) {
+		renderSpoofChain(cfg, route)
 	}
 	// Optional upstream DNS (Throne parity): rendered only when the
 	// user set at least one server, so default proxy-mode configs keep

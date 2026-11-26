@@ -5,7 +5,7 @@
 // fails and the stores fall back to mock data.
 import * as App from '../bindings/nekogo/app.js'
 import { ref } from 'vue'
-import type { AetherScanResult, AetherScanStatus, ConnectionList, ConnStatus, CountryRefreshResult, GeoIPStatus, IPTestResult, LastNetworkResults, LinkImportResult, LogEntry, Profile, Settings, SNIPairResult, SNIScanStatus, SNIConfig, SpoofStats, SpoofStatus, SpeedTestResult, Stats, Subscription, TestResult, UpdatableComponent, URLTestResult, WgKeyPair } from './types'
+import type { AetherKeyInfo, AetherKeysSettings, AetherKeysStatus, AetherScanResult, AetherScanStatus, ConnectionList, ConnStatus, CountryRefreshResult, GeoIPStatus, IPTestResult, LastNetworkResults, LinkImportResult, LogEntry, Profile, Settings, SNIPairResult, SNIScanStatus, SNIConfig, SpoofStats, SpoofStatus, SpeedTestResult, Stats, Subscription, TestResult, UpdatableComponent, URLTestResult, WgKeyPair } from './types'
 import { defaultSettings } from './types'
 
 let useBackend = false
@@ -63,6 +63,8 @@ export const backend = {
       App.SaveProfile(p as unknown as Parameters<typeof App.SaveProfile>[0]),
     ) as Promise<Profile>,
   deleteProfile: (id: string) => Promise.resolve(App.DeleteProfile(id)),
+  renameProxyGroup: (oldName: string, newName: string) => Promise.resolve(App.RenameProxyGroup(oldName, newName)),
+  removeProxyGroup: (name: string) => Promise.resolve(App.RemoveProxyGroup(name)),
   // BUG-013: fall back to defaults when the binding ever resolves
   // null/undefined, so the shell never deref-crashes on startup.
   getSettings: async (): Promise<Settings> =>
@@ -71,6 +73,10 @@ export const backend = {
     Promise.resolve(App.SaveSettings(s as unknown as Parameters<typeof App.SaveSettings>[0])),
   connect: (id: string) => Promise.resolve(App.Connect(id)),
   disconnect: () => Promise.resolve(App.Disconnect()),
+  // Stop-then-start in one backend call, so the Reconnect mode the
+  // backend reads can decide what happens to the exit chain in between —
+  // a client-side disconnect would already have reaped it.
+  reconnect: (id: string) => Promise.resolve(App.Reconnect(id)),
   aetherScan: async (p: Profile): Promise<AetherScanResult> => {
     const r = await App.AetherScan(p as unknown as Parameters<typeof App.AetherScan>[0])
     if (!r) throw new Error('scan returned no endpoint')
@@ -99,6 +105,23 @@ export const backend = {
     (await App.AetherSaveScanResultAsConfig(index, name)) as unknown as Profile,
   aetherScanLogs: async (sinceID = 0): Promise<LogEntry[]> =>
     (await App.AetherScanLogs(sinceID)) ?? [],
+  /** The engine line these settings render, for the Aether command box. */
+  aetherCommandPreview: async (p: Profile): Promise<string> =>
+    (await App.AetherCommandPreview(p as unknown as Parameters<typeof App.AetherCommandPreview>[0])) ?? '',
+  /** WARP keys: the identities held, the live renewal, and the run that
+   *  registers new ones. RenewKeys blocks until the keys are in place. */
+  aetherKeysList: async (): Promise<AetherKeyInfo[]> => (await App.AetherKeysList()) ?? [],
+  aetherKeysProgress: async (): Promise<AetherKeysStatus> =>
+    (await App.AetherKeysProgress()) ?? { running: false },
+  aetherKeysPreview: async (s: AetherKeysSettings): Promise<string> =>
+    (await App.AetherKeysPreview(s as unknown as Parameters<typeof App.AetherKeysPreview>[0])) ?? '',
+  saveAetherKeysSettings: (s: AetherKeysSettings) =>
+    Promise.resolve(
+      App.SaveAetherKeysSettings(s as unknown as Parameters<typeof App.SaveAetherKeysSettings>[0]),
+    ),
+  aetherCancelKeys: () => Promise.resolve(App.AetherCancelKeys()),
+  aetherRenewKeys: async (s: AetherKeysSettings): Promise<AetherKeyInfo[]> =>
+    (await App.AetherRenewKeys(s as unknown as Parameters<typeof App.AetherRenewKeys>[0])) ?? [],
   status: async (): Promise<ConnStatus> => {
     const m = await App.Status()
     return {
@@ -140,6 +163,9 @@ export const backend = {
   upstreamSingBoxVersion: () => Promise.resolve(App.UpstreamSingBoxVersion()),
   xrayVersion: () => Promise.resolve(App.XrayVersion()),
   mihomoVersion: () => Promise.resolve(App.MihomoVersion()),
+  /** aether.exe is the engine that carries Tor (arti is linked into it)
+   *  and Psiphon, so this is the "is Tor installed, and which one" query. */
+  aetherVersion: () => Promise.resolve(App.AetherVersion()),
   runtimeInfo: () => Promise.resolve(App.RuntimeInfo()) as Promise<Record<string, string>>,
   openConfigFolder: () => Promise.resolve(App.OpenConfigFolder()),
   detectCountry: async (id: string): Promise<Profile> => {

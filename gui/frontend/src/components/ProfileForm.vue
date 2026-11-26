@@ -5,22 +5,30 @@
       <label>Name</label><input v-model="model.name" />
       <label>Core</label>
       <PickSelect
+        v-if="model.rawOutbound?.trim()"
         :model-value="String(model.core)"
         icon="power"
-        title="Core"
-        aria-label="Core"
+        title="Raw outbound format"
+        aria-label="Raw outbound format"
         quiet
         :options="coreOptions"
         @update:model-value="model.core = Number($event) as Profile['core']"
       />
-      <p v-if="model.core === 2" class="muted">Routes trojan/vless through the built-in sni-spoof core. Requires admin + WinDivert (Windows only).</p>
-      <p v-if="model.core === 3" class="muted">Runs mihomo.exe (Clash Meta) with this profile as its only proxy. Needs mihomo.exe in the bin folder; traffic and the connection table come from its own controller.</p>
+      <span v-else-if="model.core === 2" class="muted">SNI Spoofing</span>
+      <span v-else class="muted">Uses Settings → Connection → Core engine</span>
+      <p v-if="model.rawOutbound?.trim()" class="muted">Selects the engine whose JSON schema this raw outbound uses.</p>
+      <p v-if="model.core === 2 && !model.rawOutbound?.trim()" class="muted">Routes trojan/vless through the built-in sni-spoof core. Requires admin + WinDivert (Windows only).</p>
+      <p v-if="model.core === 3 && model.rawOutbound?.trim()" class="muted">Runs mihomo.exe (Clash Meta) with this profile as its only proxy. Needs mihomo.exe in the bin folder; traffic and the connection table come from its own controller.</p>
       <label>Protocol</label>
       <PickSelect v-model="model.protocol" icon="globe" title="Protocol" aria-label="Protocol" quiet :options="protocolOptions" />
       <p v-if="model.protocol === 'aether'" class="muted">Runs the Aether engine next to sing-box (like PattNG): the profile dials its internal SOCKS listener.</p>
       <AetherFields v-if="model.protocol === 'aether'" :model="model" />
-      <label>Address</label><input v-model="model.address" placeholder="example.com" />
-      <label>Port</label><input v-model.number="model.port" type="number" />
+      <!-- Aether carries its own endpoint rows, behind the gates that
+           decide whether the profile has an endpoint at all. -->
+      <template v-if="model.protocol !== 'aether'">
+        <label>Address</label><input v-model="model.address" placeholder="example.com" />
+        <label>Port</label><input v-model.number="model.port" type="number" />
+      </template>
       <label>ID / Password</label><input v-model="model.idOrPassword" placeholder="uuid or password" />
       <label>Method (ss)</label><input v-model="model.method" placeholder="aes-256-gcm" />
       <label>Network</label>
@@ -62,6 +70,7 @@
 <script setup lang="ts">
 import { reactive, ref, watch } from 'vue'
 import { useProfilesStore } from '../stores/profiles'
+import { aetherPortUnused } from '../aether'
 import type { Profile } from '../types'
 import AetherFields from './AetherFields.vue'
 import Icon from './Icon.vue'
@@ -70,7 +79,6 @@ import PickSelect from './PickSelect.vue'
 const coreOptions = [
   { value: '0', label: 'sing-box (nekobox_core)' },
   { value: '1', label: 'xray' },
-  { value: '2', label: 'SNI Spoofing' },
   { value: '3', label: 'mihomo (Clash Meta)' },
 ]
 const protocolOptions = ['vless', 'vmess', 'trojan', 'shadowsocks', 'socks', 'http', 'wireguard', 'hysteria2', 'tuic', 'aether']
@@ -186,10 +194,12 @@ async function save() {
   // BUG-007: fail fast on the save path like Edit-as-JSON does, instead
   // of persisting port 0/99999 that only dies slowly at Connect. Raw
   // passthrough profiles bypass the check (backend-legal: port unused).
-  // Aether profiles with a hand-written command that names their own
-  // listener also bypass it (the engine port stands, profile port unused).
-  if (!model.rawOutbound && !(model.protocol === 'aether' && model.aether?.command?.trim()
-    && /--(?:bind|socks-listen|listen|listener)\b/.test(model.aether.command))) {
+  // So does an Aether profile whose endpoint row is hidden — two hops, or
+  // a carrier-only run — and one whose hand-written command names its own
+  // listener (the engine port stands, profile port unused).
+  if (!model.rawOutbound && !aetherPortUnused(model.protocol, model.aether)
+    && !(model.protocol === 'aether' && model.aether?.command?.trim()
+      && /--(?:tor-bind|psiphon-bind|socks-listen|bind|listener|listen)\b/.test(model.aether.command))) {
     const port = Number(model.port)
     if (!Number.isInteger(port) || port < 1 || port > 65535) {
       err.value = `Port must be 1..65535 (got ${model.port})`

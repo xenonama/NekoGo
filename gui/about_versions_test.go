@@ -71,7 +71,10 @@ func TestAboutSingBoxRowReadsTheOfficialCore(t *testing.T) {
 		"sing-box core":   "singBox",
 		"NekoBox version": "nekoBox",
 	} {
-		row := regexp.MustCompile(`\{\s*label:\s*'` + regexp.QuoteMeta(label) + `',\s*value:\s*v\.(\w+)\s*\}`)
+		// The value may sit behind bareVersion()'s banner-trimming call, so
+		// only the field it ultimately reads is pinned here; which shape it
+		// is shown in is TestVersionStatRowsShowBareCoreVersions' business.
+		row := regexp.MustCompile(`\{\s*label:\s*'` + regexp.QuoteMeta(label) + `',\s*value:\s*(?:\w+\(\s*)?v\.(\w+)\s*\)?\s*\}`)
 		m := row.FindStringSubmatch(diag)
 		if m == nil {
 			t.Errorf("versionStatRows has no %q row", label)
@@ -103,22 +106,86 @@ func TestVersionStatsDropsTheGoRuntime(t *testing.T) {
 	}
 }
 
-// TestVersionStatRowsGateEngineFactsToAdvancedMode: Simple mode chooses
-// no core, installs no second engine and shows no core path, so the four
-// binary versions and the idle "Engine" read-out described a screen its
-// user cannot reach — they showed anyway, because the card rendered
-// every field the collector returns. Placement inside the `if (advanced)`
-// branch is what gates a row, so that is what gets checked, braces
-// balanced: reordering the list must not quietly move a row into or out
-// of Simple mode.
+// TestVersionStatRowsGateEngineFactsToAdvancedMode: the four core
+// versions are facts a Simple-mode user is asked for ("what version is
+// your core?") and they cost nothing to read, so they show in both modes.
+// What stays advanced-only is the "Engine" row: Simple mode picks no
+// engine and shows no core path, so a sing-box.exe/NekoBox_core.exe
+// read-out describes a screen its user cannot reach. Placement inside the
+// `if (advanced)` branch is what gates a row, so that is what gets
+// checked, braces balanced: reordering the list must not quietly move a
+// row into or out of Simple mode.
 func TestVersionStatRowsGateEngineFactsToAdvancedMode(t *testing.T) {
 	gated, always := versionStatRowPlacement(t, readFrontendSrc(t, "diag.ts"))
 
-	if want := []string{"sing-box core", "NekoBox version", "Xray core", "mihomo core", "Engine"}; !sameLabels(gated, want) {
+	if want := []string{"Engine"}; !sameLabels(gated, want) {
 		t.Errorf("advanced-only rows = %v, want %v", gated, want)
 	}
-	if want := []string{"NekoGo", "OS"}; !sameLabels(always, want) {
+	want := []string{"NekoGo", "sing-box core", "NekoBox version", "Xray core", "mihomo core", "Aether core", "OS"}
+	if !sameLabels(always, want) {
 		t.Errorf("rows Simple mode shows = %v, want %v", always, want)
+	}
+}
+
+// TestVersionStatRowsShowBareCoreVersions: the card asked for "xray
+// v1.2.3 - sing-box v1.11.0", but each core query hands back the first
+// stdout line of `X.exe version` verbatim — "Xray 25.9.11 (v2fly.org)
+// go1.25.0 windows amd64" — so the Simple-mode card printed a build
+// banner where a version belongs. The rows therefore pass their values
+// through bareVersion, and the pattern that does it is run here against
+// the real banner lines: JS and Go share this regex syntax, so the
+// pattern shipped in diag.ts is what gets executed, not a paraphrase of
+// it. A line with no version in it must survive untouched, because the
+// collector's failure value is the literal "unknown" and the card is the
+// only place a user learns the query failed.
+func TestVersionStatRowsShowBareCoreVersions(t *testing.T) {
+	diag := readFrontendSrc(t, "diag.ts")
+
+	fn := regexp.MustCompile(`(?s)export function versionStatRows\(.*?\n\}`).FindString(diag)
+	if fn == "" {
+		t.Fatal("diag.ts no longer exports versionStatRows(...)")
+	}
+	for _, field := range []string{"singBox", "nekoBox", "xray", "mihomo", "aether"} {
+		if !strings.Contains(fn, "bareVersion(v."+field+")") {
+			t.Errorf("the card shows v.%s raw: a core query returns its whole banner line", field)
+		}
+	}
+
+	bare := regexp.MustCompile(`(?s)export function bareVersion\(.*?\n\}`).FindString(diag)
+	if bare == "" {
+		t.Fatal("diag.ts no longer exports bareVersion(...)")
+	}
+	src := regexp.MustCompile(`/(.+)/\.exec\(`).FindStringSubmatch(bare)
+	if src == nil {
+		t.Fatal("bareVersion no longer extracts with a /…/.exec() literal; this test runs that pattern")
+	}
+	re, err := regexp.Compile(src[1])
+	if err != nil {
+		t.Fatalf("bareVersion's pattern %q is not a valid regex: %v", src[1], err)
+	}
+	for _, tc := range []struct{ banner, want string }{
+		{"sing-box version 1.11.0", "v1.11.0"},
+		{"sing-box version 1.0.0-beta.3", "v1.0.0-beta.3"},
+		{"Xray 25.9.11 (v2fly.org) go1.25.0 windows amd64", "v25.9.11"},
+		{"Mihomo Meta v1.19.33 windows amd64 with go1.26.10 f4c0060", "v1.19.33"},
+		{"aether 2.3.0", "v2.3.0"},
+	} {
+		got := re.FindString(tc.banner)
+		if got == "" {
+			t.Errorf("bareVersion(%q) finds no version at all", tc.banner)
+			continue
+		}
+		if v := "v" + strings.TrimPrefix(got, "v"); v != tc.want {
+			t.Errorf("bareVersion(%q) = %s, want %s", tc.banner, v, tc.want)
+		}
+	}
+	if re.FindString("unknown") != "" {
+		t.Error("bareVersion invents a version for a failed query")
+	}
+	// …and the no-match branch returns the input, so "unknown" still reads
+	// "unknown" on the card.
+	if !strings.Contains(bare, ": text") {
+		t.Error("bareVersion does not pass a line with no version through unchanged")
 	}
 }
 
@@ -141,7 +208,7 @@ func TestVersionStatCopyKeepsEveryFact(t *testing.T) {
 	}
 	for _, line := range []string{
 		"NekoBox version ${v.nekoBox}", "sing-box ${v.singBox}",
-		"Xray ${v.xray}", "mihomo ${v.mihomo}", "Core ${v.core}",
+		"Xray ${v.xray}", "mihomo ${v.mihomo}", "aether ${v.aether}", "Core ${v.core}",
 	} {
 		if !strings.Contains(body, line) {
 			t.Errorf("Copy diagnostics dropped %q", line)

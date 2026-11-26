@@ -11,6 +11,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net"
+	"net/http"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -21,6 +22,8 @@ import (
 // fakeSingBoxListeners keeps the fake's listeners reachable so the
 // runtime finalizer cannot close them while the child sleeps.
 var fakeSingBoxListeners []net.Listener
+
+const fakeSingBoxPortFileEnv = "NEKOGO_FAKE_SINGBOX_PORTFILE"
 
 // fakeSingBoxMain is the child-side implementation. args is os.Args.
 func fakeSingBoxMain(args []string) {
@@ -59,6 +62,12 @@ func fakeSingBoxMain(args []string) {
 			os.Exit(3)
 		}
 		fakeSingBoxListeners = append(fakeSingBoxListeners, ln)
+		if path := os.Getenv(fakeSingBoxPortFileEnv); path != "" {
+			_ = os.WriteFile(path, []byte(ln.Addr().String()), 0o600)
+		}
+		go http.Serve(ln, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusOK)
+		}))
 		break
 	}
 	for {
@@ -84,17 +93,5 @@ func installFakeSingBox(t *testing.T) string {
 	if runtime.GOOS != "windows" {
 		name = "sing-box"
 	}
-	exe, err := os.Executable()
-	if err != nil {
-		t.Fatalf("os.Executable: %v", err)
-	}
-	data, err := os.ReadFile(exe)
-	if err != nil {
-		t.Fatalf("read test binary: %v", err)
-	}
-	dest := filepath.Join(t.TempDir(), name)
-	if err := os.WriteFile(dest, data, 0o755); err != nil {
-		t.Fatalf("write fake sing-box: %v", err)
-	}
-	return dest
+	return installFakeNamedCore(t, name)
 }

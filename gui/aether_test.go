@@ -324,6 +324,32 @@ func TestValidateProfileForSaveAether(t *testing.T) {
 	}
 }
 
+// A carrier-only run (--psiphon-only / --tor-only) never dials a WARP
+// endpoint, so the profile's address and port are unused exactly as a
+// two-hop profile's are. Both hide the port row in the editor, so
+// refusing port 0 here left no way to save the profile at all.
+func TestValidateProfileForSaveAetherCarrierOnly(t *testing.T) {
+	for _, cfg := range []aetherSettings{
+		{Protocol: "wg", Psiphon: "only"},
+		{Protocol: "wg", Tor: "only"},
+		{Protocol: "masque", Psiphon: "only"},
+		{Protocol: "gool", Tor: "only"},
+	} {
+		p := Profile{Protocol: "aether", Core: CoreSingBox, Name: "t", Aether: cfg}
+		if err := validateProfileForSave(p); err != nil {
+			t.Fatalf("carrier-only aether %+v port 0 refused: %v", cfg, err)
+		}
+	}
+	// A carrier that only carries the tunnel still dials WARP itself.
+	for _, mode := range []string{"chain", "reverse"} {
+		p := Profile{Protocol: "aether", Core: CoreSingBox, Name: "t",
+			Aether: aetherSettings{Protocol: "wg", Psiphon: mode}}
+		if err := validateProfileForSave(p); err == nil {
+			t.Fatalf("psiphon %s aether port 0 accepted", mode)
+		}
+	}
+}
+
 // TestBuildAetherArguments: argument shapes per profile class.
 func TestBuildAetherArguments(t *testing.T) {
 	// WireGuard one-hop.
@@ -414,8 +440,8 @@ func TestBuildAetherArguments(t *testing.T) {
 	if !strings.Contains(argsjoin, "--bind 127.0.0.1:10820") || !strings.Contains(argsjoin, "--psiphon-bind 127.0.0.1:10819") {
 		t.Fatalf("psiphon chain args: %s", argsjoin)
 	}
-	if strings.Contains(argsjoin, "--psiphon-server-entries") {
-		t.Fatalf("bundled list sentinel emitted: %s", argsjoin)
+	if !hasFlagValue(args, "--psiphon-server-entries", psiphonTestEntriesPath) {
+		t.Fatalf("psiphon chain did not hand over the bundled list: %s", argsjoin)
 	}
 
 	// Psiphon reverse (around the tunnel): its own listener takes no
@@ -580,17 +606,23 @@ func containsArg(args []string, want string) bool {
 	return false
 }
 
-// TestAetherFragmentOffEmitsNoFragment: aether 2.3.0 defaults
-// --fragment to ON, so an off profile must say --no-fragment.
-func TestAetherFragmentOffEmitsNoFragment(t *testing.T) {
+// TestAetherFragmentUnsetKeepsCoreDefault: aether 2.3.0 fragments the
+// ClientHello by default because Iran's firewall resets a whole one
+// whose SNI ends in cloudflareclient.com. A profile that never asked
+// for fragmentation must not turn that off — PattN says --fragment
+// only when the setting is true and nothing at all otherwise
+// (AetherArgs.kt:247). The GUI's default is false, so emitting
+// --no-fragment here disabled the core's own defence on every ordinary
+// profile.
+func TestAetherFragmentUnsetKeepsCoreDefault(t *testing.T) {
 	p := &Profile{Protocol: "aether", Core: CoreSingBox, Name: "t", Address: "203.0.113.9", Port: 2053,
 		Aether: aetherSettings{Protocol: "masque", Transport: "h2", Fragment: false}}
 	args := buildAetherArguments(p, 10819)
-	if !containsArg(args, "--no-fragment") {
-		t.Fatalf("--no-fragment missing: %v", args)
+	if containsArg(args, "--no-fragment") {
+		t.Fatalf("--no-fragment turns off the core's default for a profile that never asked: %v", args)
 	}
 	if containsArg(args, "--fragment") {
-		t.Fatalf("--fragment emitted while off: %v", args)
+		t.Fatalf("--fragment emitted while unset: %v", args)
 	}
 	p.Aether.Fragment = true
 	args = buildAetherArguments(p, 10819)
@@ -618,23 +650,6 @@ func TestAetherRejectsMasqueSni(t *testing.T) {
 	}
 }
 
-// TestAetherPsiphonServerEntriesSentinel: the PattNG "shipped-list"
-// sentinel is never an aether.exe path, bundled list or fresh fetch.
-func TestAetherPsiphonServerEntriesSentinel(t *testing.T) {
-	p := &Profile{Protocol: "aether", Core: CoreSingBox, Name: "t", Address: "203.0.113.7", Port: 443,
-		Aether: aetherSettings{Protocol: "masque", Psiphon: "chain"}}
-	args := buildAetherArguments(p, 10819)
-	if containsArg(args, "--psiphon-server-entries") {
-		t.Fatalf("bundled list sentinel emitted: %v", args)
-	}
-	fresh := false
-	p.Aether.PsiphonBundledList = &fresh
-	args = buildAetherArguments(p, 10819)
-	if containsArg(args, "--psiphon-server-entries") {
-		t.Fatalf("fetch fresh sentinel emitted: %v", args)
-	}
-}
-
 // TestResolveAetherExeHonorsPath: the dedicated setting drives the
 // manager, and a broken explicit path is an error rather than a silent
 // fallback to the exe-adjacent binary.
@@ -654,6 +669,23 @@ func TestResolveAetherExeHonorsPath(t *testing.T) {
 	missing := filepath.Join(t.TempDir(), "missing.exe")
 	if _, err := m.resolveAetherExe(Settings{AetherPath: missing}); err == nil {
 		t.Fatal("resolveAetherExe with missing explicit path = nil, want error")
+	}
+
+	// A path naming the FOLDER that holds the engine resolves to the
+	// binary inside it, the way mihomoPath does: the setting answers
+	// "where is it", and a folder is a legitimate answer. Handing the
+	// folder itself to exec.Command fails with the OS's complaint about
+	// a directory, which names nothing the user configured.
+	dir := t.TempDir()
+	inside := filepath.Join(dir, aetherExeName)
+	if err := os.WriteFile(inside, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := m.resolveAetherExe(Settings{AetherPath: dir}); err != nil || got != inside {
+		t.Fatalf("resolveAetherExe(%q) = %q, %v; want %q", dir, got, err, inside)
+	}
+	if _, err := m.resolveAetherExe(Settings{AetherPath: t.TempDir()}); err == nil {
+		t.Fatal("a folder with no engine in it resolved to something")
 	}
 }
 
@@ -797,6 +829,33 @@ func TestBeginAetherProbeReusesLiveEngine(t *testing.T) {
 	}
 }
 
+// With the tor.exe hop behind the tunnel the published port is the
+// daemon's SOCKS front, not the tunnel's own listener, and the front is
+// what the live config dials. A probe that took the tunnel port measured
+// WARP alone and reported it as the chain's latency.
+func TestBeginAetherProbeUsesThePublishedChainPort(t *testing.T) {
+	p := &Profile{ID: "a1", Protocol: "aether", Aether: aetherSettings{Protocol: "wg", Tor: "chain"}}
+	mgr := NewAetherManager(nil)
+	mgr.mu.Lock()
+	mgr.running = true
+	mgr.port = 24001
+	mgr.mu.Unlock()
+	m := &CoreManager{aetherMgr: mgr, running: true, aetherActive: true, activeID: "a1"}
+	setAetherActivePort(24002)
+	defer clearAetherActivePort()
+	port, restore, err := m.beginAetherProbe(p, DefaultSettings())
+	if err != nil {
+		t.Fatalf("beginAetherProbe: %v", err)
+	}
+	if port != 24002 {
+		t.Fatalf("probe port = %d, want the published chain front 24002, not the tunnel listener", port)
+	}
+	restore()
+	if live, ok := currentAetherActivePort(); !ok || live != 24002 {
+		t.Fatalf("restore dropped the live port: port=%d ok=%v", live, ok)
+	}
+}
+
 // TestBeginAetherProbeRefusesSecondTunnel: testing a different aether
 // profile while a tunnel runs must not open a second one on the same
 // WARP identity (the shared aether work-dir files) — the scan refuses
@@ -844,7 +903,7 @@ func TestAetherProfilePinnedEnginePort(t *testing.T) {
 func TestWaitAetherPsiphonTunnelAborts(t *testing.T) {
 	mgr := NewAetherManager(nil)
 	m := &CoreManager{epoch: 7}
-	err := m.waitAetherPsiphonTunnel(1, time.Second, 7, mgr)
+	err := m.waitChainTunnel(chainDriverPsiphon, 1, time.Second, 7, mgr)
 	if err == nil || !strings.Contains(err.Error(), "exited during connect") {
 		t.Fatalf("dead engine = %v", err)
 	}
@@ -852,7 +911,7 @@ func TestWaitAetherPsiphonTunnelAborts(t *testing.T) {
 	mgr.running = true
 	mgr.mu.Unlock()
 	m.epoch = 8
-	err = m.waitAetherPsiphonTunnel(1, time.Second, 7, mgr)
+	err = m.waitChainTunnel(chainDriverPsiphon, 1, time.Second, 7, mgr)
 	if err == nil || !strings.Contains(err.Error(), "concurrent stop") {
 		t.Fatalf("stale epoch = %v", err)
 	}
@@ -931,5 +990,86 @@ func TestStopTokenSparesNewerSpawn(t *testing.T) {
 	}
 	if mgr.Running() {
 		t.Fatal("the current token did not stop the child")
+	}
+}
+
+// TestAetherChrome120Fingerprint: PattN offers Chrome 120 beside Chrome.
+// What separates them on a core that takes --tls-groups is the key
+// shares: Chrome 120 offers no post-quantum group, so the preset has to
+// name its own groups instead of inheriting the core's default order.
+func TestAetherChrome120Fingerprint(t *testing.T) {
+	if got := aetherFingerprintDefault("chrome-120"); got != "chrome-120" {
+		t.Fatalf("chrome-120 is not a preset: %q", got)
+	}
+	args := strings.Join(aetherFingerprintArguments("chrome-120"), " ")
+	if !strings.Contains(args, "--tls-groups X25519:P-256:P-384") {
+		t.Fatalf("chrome-120 groups: %s", args)
+	}
+	if strings.Contains(args, "--disable-grease") {
+		t.Fatalf("chrome-120 sends GREASE: %s", args)
+	}
+	// Chrome keeps the core's own groups: the post-quantum share PattN
+	// names for it needs a core newer than the one shipped here.
+	if strings.Contains(strings.Join(aetherFingerprintArguments("chrome"), " "), "--tls-groups") {
+		t.Fatal("chrome named groups it does not own")
+	}
+	// The preset survives a share link, which is how PattN hands it over.
+	p := &Profile{Protocol: "aether", Core: CoreSingBox, Name: "t", Address: "203.0.113.9", Port: 443,
+		Aether: aetherSettings{Protocol: "masque", Fingerprint: "chrome-120"}}
+	link, err := buildAetherLink(p)
+	if err != nil {
+		t.Fatalf("build link: %v", err)
+	}
+	back, err := parseAetherLink(link)
+	if err != nil {
+		t.Fatalf("parse %s: %v", link, err)
+	}
+	if back.Aether.Fingerprint != "chrome-120" {
+		t.Fatalf("fingerprint round-trip: %q", back.Aether.Fingerprint)
+	}
+}
+
+// TestAetherCommandPreview: the tab shows the line the settings render,
+// so a user can read what the engine is handed and edit from there. It
+// must be the settings' own line (a hand-written command is what the
+// preview is compared against, not what it shows), and it must read back
+// through the same parser a saved command goes through — a bridge line
+// is one word with spaces in it, and a preview that splits it hands the
+// core a different bridge.
+func TestAetherCommandPreview(t *testing.T) {
+	store, err := NewConfigStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	a := &App{store: store}
+	bridge := "obfs4 203.0.113.5:443 FINGERPRINT cert=abc iat-mode=0"
+	p := Profile{Protocol: "aether", Core: CoreSingBox, Name: "t", Address: "203.0.113.9", Port: 443,
+		Aether: aetherSettings{
+			Protocol: "masque", Transport: "h2", Fragment: true,
+			Tor: "chain", TorBridges: "own", TorBridgeLines: bridge,
+			Command: "--bind 127.0.0.1:1 --protocol wg",
+		}}
+	got := a.AetherCommandPreview(p)
+	if strings.Contains(got, "127.0.0.1:1 ") || strings.Contains(got, "--protocol wg") {
+		t.Fatalf("the preview showed the hand-written command: %s", got)
+	}
+	for _, want := range []string{"--h2", "--fragment", "--tor", "--tor-bind", "--tor-bridge"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("preview missing %q: %s", want, got)
+		}
+	}
+	argv, port, ok := aetherCoreOfCommand(got)
+	if !ok {
+		t.Fatalf("the preview does not read back as a command: %s", got)
+	}
+	if port != aetherDefaultCommandPort {
+		t.Fatalf("preview listen port = %d, want the command default %d", port, aetherDefaultCommandPort)
+	}
+	if !containsStr(argv, bridge) {
+		t.Fatalf("the bridge line did not survive as one word: %q", argv)
+	}
+	// A profile that is not Aether has no engine line to show.
+	if s := a.AetherCommandPreview(Profile{Protocol: "vless"}); s != "" {
+		t.Fatalf("a non-aether profile rendered a command: %s", s)
 	}
 }

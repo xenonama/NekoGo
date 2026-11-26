@@ -154,7 +154,7 @@ func installedXrayVersion(t *testing.T, a *App, path, line string) {
 // TestCheckXrayResolvesTheUpstreamRelease — the xray row follows
 // XTLS/Xray-core. The local banner (25.9.11) is OLDER than the Xray
 // release served here (26.11.9) and NEWER than the NekoGo app tag
-// (1.0.0-beta.3), so the row can only report an update by reading the
+// (1.0.0-beta.5), so the row can only report an update by reading the
 // right repo. The nekobox row keeps following the app repo, which is
 // the point of the shared lookups map.
 func TestCheckXrayResolvesTheUpstreamRelease(t *testing.T) {
@@ -174,7 +174,7 @@ func TestCheckXrayResolvesTheUpstreamRelease(t *testing.T) {
 			// contains the zip's: a substring match takes it.
 			name + ".dgst": []byte("sha256-just-a-text-file"),
 		}, digests: map[string]string{name: "sha256:" + sha256Hex(xrayZip)}},
-		fakeRelease{tag: "1.0.0-beta.3", assets: map[string][]byte{
+		fakeRelease{tag: "1.0.0-beta.5", assets: map[string][]byte{
 			"nekobox_core.exe": []byte("nk"),
 			"xray.exe":         []byte("app-bundled-xray"),
 		}})
@@ -213,7 +213,7 @@ func TestCheckXrayResolvesTheUpstreamRelease(t *testing.T) {
 		t.Fatalf("Current = %q, want the installed banner", xr.Current)
 	}
 	if xr.Latest != "v26.11.9" {
-		t.Fatalf("Latest = %q, want the XTLS tag; %q is the NekoGo app tag", xr.Latest, "1.0.0-beta.3")
+		t.Fatalf("Latest = %q, want the XTLS tag; %q is the NekoGo app tag", xr.Latest, "1.0.0-beta.5")
 	}
 	if !xr.UpdateAvail {
 		t.Fatalf("row = %+v, want UpdateAvail=true (25.9.11 is older than 26.11.9)", *xr)
@@ -222,8 +222,8 @@ func TestCheckXrayResolvesTheUpstreamRelease(t *testing.T) {
 		t.Fatalf("LastError = %q, want empty", xr.LastError)
 	}
 	// The fork-sourced rows must not drift with this change.
-	if nb.Latest != "1.0.0-beta.3" || !nb.UpdateAvail || nb.LastError != "" {
-		t.Fatalf("nekobox row = %+v, want Latest=1.0.0-beta.3 UpdateAvail=true", *nb)
+	if nb.Latest != "1.0.0-beta.5" || !nb.UpdateAvail || nb.LastError != "" {
+		t.Fatalf("nekobox row = %+v, want Latest=1.0.0-beta.5 UpdateAvail=true", *nb)
 	}
 }
 

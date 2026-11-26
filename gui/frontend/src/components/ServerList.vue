@@ -29,6 +29,7 @@ import ServerCard from './ServerCard.vue'
 import { useProfilesStore } from '../stores/profiles'
 import { useConnectionStore } from '../stores/connection'
 import type { ServerRow } from '../data/servers'
+import { profileEndpointLabel } from '../aether'
 
 const props = defineProps<{ search: string; selectedId: string }>()
 defineEmits<{ (e: 'select', id: string): void }>()
@@ -50,7 +51,7 @@ const servers = computed<ServerRow[]>(() => {
     .map((p) => ({
       id: p.id,
       name: p.name,
-      city: `${p.address}:${p.port}`,
+      city: profileEndpointLabel(p),
       countryCode: p.countryCode ?? '',
       latencyMs: profiles.latencies[p.id] ?? -1,
       testedAt: profiles.testedAt[p.id] ?? p.lastTestedAt,

@@ -77,7 +77,7 @@
             :disabled="busy || !target"
             :options="groupOptions"
           />
-          <button class="nb-act" :disabled="busy || !target" @click="moveToGroup">
+          <button class="nb-act" :disabled="!canMove" @click="moveToGroup">
             <Icon name="folder" :size="14" />Move
           </button>
         </span>
@@ -108,13 +108,13 @@
       <div
         v-if="groupPrompt"
         class="nb-modal-overlay"
-        @click.self="groupPrompt = false"
-        @keydown.esc.prevent="groupPrompt = false"
+        @click.self="cancelNewGroup"
+        @keydown.esc.prevent="cancelNewGroup"
       >
         <div class="nb-modal" role="dialog" aria-modal="true" aria-label="New group">
           <div class="nb-modal-head">
             <span class="nb-section-title">New group</span>
-            <button class="nb-icon-btn" title="Close" @click="groupPrompt = false">
+            <button class="nb-icon-btn" title="Close" @click="cancelNewGroup">
               <Icon name="x" :size="18" />
             </button>
           </div>
@@ -126,16 +126,12 @@
             <input
               ref="groupInput"
               v-model="newGroupName"
-              list="nb-adv-group-names"
               placeholder="e.g. US nodes"
               @keydown.enter.prevent="submitNewGroup"
             />
           </label>
-          <datalist id="nb-adv-group-names">
-            <option v-for="g in groupNames" :key="g" :value="g" />
-          </datalist>
           <div class="nb-modal-foot">
-            <button class="nb-act nb-act--ghost" @click="groupPrompt = false">
+            <button class="nb-act nb-act--ghost" @click="cancelNewGroup">
               <Icon name="x" :size="14" />Cancel
             </button>
             <button class="nb-act nb-act--primary" :disabled="!newGroupName.trim()" @click="submitNewGroup">
@@ -183,7 +179,10 @@ const target = computed(() => profiles.profiles.find((p) => p.id === targetId.va
 const probeBlocked = computed(() => busy.value || connection.busy || connection.connectBusy)
 
 const groupNames = computed(() =>
-  [...new Set(profiles.profiles.map((p) => p.group).filter((g): g is string => !!g))].sort(),
+  [...new Set([
+    ...profiles.profiles.map((p) => p.group).filter((g): g is string => !!g),
+    ...(settings.settings.proxyGroups ?? []),
+  ])].sort(),
 )
 
 const targetOptions = computed(() =>
@@ -195,12 +194,31 @@ const groupOptions = computed(() => [
   { value: '__new__', label: 'New group…' },
 ])
 
+/** Picking the group the profile already sits in is a no-op, so Move stays
+ *  disabled until the choice actually changes something. */
+const canMove = computed(() => {
+  if (busy.value || !target.value) return false
+  const g = moveGroup.value
+  return g === '__new__' || g !== (target.value.group ?? '')
+})
+
 // Keep the selector on a live profile when the list changes.
 watch(() => profiles.profiles.length, () => {
   if (!profiles.profiles.some((p) => p.id === targetId.value)) {
     targetId.value = profiles.profiles[0]?.id || ''
   }
 })
+
+// The move picker must show the group the chosen profile is actually in;
+// otherwise it keeps a stale choice from a previous profile (or from the
+// last move) and the next Move silently re-files to the wrong group.
+watch(
+  () => [target.value?.id, target.value?.group] as const,
+  () => {
+    moveGroup.value = target.value?.group ?? ''
+  },
+  { immediate: true },
+)
 
 /** Temporarily switch the active profile to id, run fn (a network
  *  tool against the now-active core), then restore the previous
@@ -324,17 +342,37 @@ async function submitNewGroup() {
 
 async function applyMove(g: string) {
   if (!target.value) return
+  const name = g.trim()
+  const isNewGroup = !!name && !groupNames.value.includes(name)
   busy.value = true
   msg.value = ''
   try {
-    await profiles.save({ ...target.value, group: g || undefined })
-    msg.value = g ? `Moved to ${g}.` : 'Removed from group.'
-    moveGroup.value = ''
+    const saved = await profiles.save({ ...target.value, group: name || undefined })
+    // A name created here must survive the profile moving out later, so
+    // mirror it into Settings just like Proxies' group editor does.
+    if (isNewGroup) {
+      const prev = settings.settings.proxyGroups ?? []
+      settings.settings.proxyGroups = [...prev, name]
+      try {
+        await settings.save()
+      } catch {
+        settings.settings.proxyGroups = prev
+      }
+    }
+    msg.value = name ? `Moved to ${name}.` : 'Removed from group.'
+    moveGroup.value = saved.group ?? ''
   } catch (e) {
     msg.value = String(e)
   } finally {
     busy.value = false
   }
+}
+
+/** Cancel the "New group…" prompt without leaving that pseudo-choice in
+ *  the picker, which would make the next Move reopen the prompt. */
+function cancelNewGroup() {
+  groupPrompt.value = false
+  moveGroup.value = target.value?.group ?? ''
 }
 
 function openJson() {

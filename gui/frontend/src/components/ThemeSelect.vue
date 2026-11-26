@@ -20,6 +20,7 @@
         <span class="nb-select-check"><Icon v-if="theme === opt.value" name="check" :size="14" /></span>
       </button>
     </div>
+    <span v-if="error" class="nb-json-error nb-select-error" role="alert">{{ error }}</span>
   </div>
 </template>
 
@@ -33,6 +34,7 @@ const theme = computed(() => settings.settings.theme)
 const isDark = computed(() => theme.value === 'dark')
 const open = ref(false)
 const busy = ref(false)
+const error = ref('')
 const root = ref<HTMLElement | null>(null)
 // BUG-028: the toggle button ref — choosing an option (or ESC) unmounts
 // the v-if menu while focus is inside it, so focus is returned here
@@ -49,8 +51,11 @@ async function choose(v: 'light' | 'dark') {
   toggleRef.value?.focus()
   if (v === theme.value) return
   busy.value = true
+  error.value = ''
   try {
     await settings.setTheme(v)
+  } catch (e) {
+    error.value = String(e)
   } finally {
     busy.value = false
   }

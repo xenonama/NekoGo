@@ -166,6 +166,9 @@ func tunConnectTestApp(t *testing.T, core CoreType) (*App, string, *bool) {
 	s := DefaultSettings()
 	s.TunEnabled = true
 	s.SystemProxy = false
+	if core.IsXray() {
+		s.CoreEngine = "xray"
+	}
 	if err := store.SaveSettings(s); err != nil {
 		t.Fatal(err)
 	}

@@ -10,6 +10,15 @@
         neutral="all"
         :options="levelOptions"
       />
+      <PickSelect
+        v-model="consoleLogLimit"
+        icon="list"
+        title="Console line limit — No limit shows all buffered lines"
+        aria-label="Console line limit"
+        quiet
+        :disabled="savingLimit"
+        :options="consoleLimitOptions"
+      />
       <div class="lv-field">
         <Icon name="search" :size="14" />
         <input v-model="query" placeholder="Search logs…" aria-label="Search logs" />
@@ -41,10 +50,11 @@
       </button>
       <span class="muted lv-count">{{ visible.length }} / {{ logs.length }} lines</span>
       <span v-if="reError" class="nb-json-error" :title="reError">Bad regex</span>
+      <span v-if="limitError" class="nb-json-error" :title="limitError">Limit not saved</span>
       <span v-if="copied" class="muted">Copied</span>
     </div>
     <div ref="box" class="logbox lv-box" @scroll="onScroll">
-      <div v-for="l in visible" :key="keyOf(l)">
+      <div v-for="l in visible" :key="l.id">
         <span class="lv-time">[{{ hhmmss(l.time) }}]</span>
         <span class="lv-src" :class="lvlClass(l.level)">[{{ l.source }}]</span>
         <span class="lv-msg">{{ l.message }}</span>
@@ -56,12 +66,27 @@
 <script setup lang="ts">
 import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
 import { useConnectionStore } from '../stores/connection'
-import type { LogEntry } from '../types'
+import { useSettingsStore } from '../stores/settings'
 import Icon from './Icon.vue'
 import PickSelect from './PickSelect.vue'
 
 const connection = useConnectionStore()
+const settings = useSettingsStore()
 const logs = computed(() => connection.logs)
+const consoleLogLimit = computed({
+  get: () => String(settings.settings.consoleLogLimit ?? 300),
+  set: (value: string) => { void changeConsoleLogLimit(Number(value)) },
+})
+const consoleLimitOptions = [
+  { value: '100', label: '100 lines' },
+  { value: '300', label: '300 lines' },
+  { value: '500', label: '500 lines' },
+  { value: '1000', label: '1,000 lines' },
+  { value: '2000', label: '2,000 lines' },
+  { value: '0', label: 'No limit' },
+]
+const savingLimit = ref(false)
+const limitError = ref('')
 
 const levelFilter = ref('all')
 const levelOptions = [
@@ -83,9 +108,6 @@ const reError = computed(() =>
   incBad.value || excBad.value ? 'One of the regex filters is invalid and is being ignored.' : '',
 )
 const copied = ref(false)
-// Keys of lines the user dismissed via Clear (local view only; the backend
-// buffer is untouched, so brand-new lines keep appearing).
-const cleared = ref(new Set<string>())
 const box = ref<HTMLElement | null>(null)
 // Stick to the bottom on new lines unless the user scrolled up.
 let stick = true
@@ -93,14 +115,6 @@ let stick = true
 function normLevel(level: string): string {
   const l = (level || '').toLowerCase()
   return l === 'warning' ? 'warn' : l
-}
-
-// Identity of a log line for the Clear set. The backend assigns a monotonic
-// id, so use it: the previous key embedded the array index, and once the
-// 300-line window slid every index changed — dismissed lines came back on
-// the next poll.
-function keyOf(l: LogEntry): string {
-  return String(l.id)
 }
 
 function tryRegex(src: string): RegExp | null {
@@ -118,7 +132,7 @@ const visible = computed(() => {
   const inc = tryRegex(includeRe.value)
   const exc = tryRegex(excludeRe.value)
   return logs.value.filter((l) => {
-    if (cleared.value.has(keyOf(l))) return false
+    if (l.id <= connection.logsClearedThrough) return false
     if (levelFilter.value !== 'all' && normLevel(l.level) !== levelFilter.value) return false
     if (q && !`${l.message} ${l.source}`.toLowerCase().includes(q)) return false
     const hay = `${l.message} ${l.source}`
@@ -155,15 +169,21 @@ function onScroll() {
 }
 
 function clearView() {
-  // Drop ids that already left the buffer so the set cannot grow without
-  // bound over a long session of repeated Clears.
-  const live = new Set(logs.value.map((l) => keyOf(l)))
-  const next = new Set<string>()
-  cleared.value.forEach((k) => {
-    if (live.has(k)) next.add(k)
-  })
-  visible.value.forEach((l) => next.add(keyOf(l)))
-  cleared.value = next
+  connection.clearLogs()
+}
+
+async function changeConsoleLogLimit(limit: number) {
+  if (savingLimit.value || limit === (settings.settings.consoleLogLimit ?? 300)) return
+  savingLimit.value = true
+  limitError.value = ''
+  try {
+    await settings.setConsoleLogLimit(limit)
+    await connection.refreshLogs(true)
+  } catch (e) {
+    limitError.value = String(e)
+  } finally {
+    savingLimit.value = false
+  }
 }
 
 async function copyVisible() {

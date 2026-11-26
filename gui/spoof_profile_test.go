@@ -58,21 +58,21 @@ func TestSpoofEligibilityIssue(t *testing.T) {
 }
 
 // TestIsDomainAddress pins the import auto-tag split: bare domains
-// (prompt.txt Test-CF) auto-tag, while IP literals (prompt.txt
-// normal), loopback, and empties never do.
+// (Test-CF) auto-tag, while IP literals (the normal
+// fixture), loopback, and empties never do.
 func TestIsDomainAddress(t *testing.T) {
 	for addr, want := range map[string]bool{
-		"www.calmlunch.com":           true,
-		"nat3.xxai.dpdns.org":         true,
-		"example.com.":                true,
-		"2a06:98c1:3101::6812:202f":   false,
-		"[2a06:98c1:3101::6812:202f]": false,
-		"104.18.9.83":                 false,
-		"127.0.0.1":                   false,
-		"localhost":                   false,
-		"":                            false,
-		"  ":                          false,
-		"nodot":                       false,
+		"www.node.example":      true,
+		"cdn.node.example":      true,
+		"example.com.":          true,
+		"2001:db8::6812:202f":   false,
+		"[2001:db8::6812:202f]": false,
+		"104.18.9.83":           false,
+		"127.0.0.1":             false,
+		"localhost":             false,
+		"":                      false,
+		"  ":                    false,
+		"nodot":                 false,
 	} {
 		if got := isDomainAddress(addr); got != want {
 			t.Errorf("isDomainAddress(%q) = %v, want %v", addr, got, want)
@@ -88,11 +88,11 @@ func TestSpoofUseProfile(t *testing.T) {
 	loop := Profile{
 		ID: "appxa", Name: "APPXA", Core: CoreSingBox, Protocol: "trojan",
 		Address: "127.0.0.1", Port: 40443, IDOrPassword: "pw",
-		TLS: true, Network: "ws", ServerName: "www.calmlunch.com", Path: "/assignment",
+		TLS: true, Network: "ws", ServerName: "www.node.example", Path: "/assignment",
 	}
 	spoofed := Profile{
 		ID: "test-cf", Name: "Test-CF", Core: CoreSpoof, Protocol: "trojan",
-		Address: "www.calmlunch.com", Port: 443, IDOrPassword: "pw",
+		Address: "www.node.example", Port: 443, IDOrPassword: "pw",
 		TLS: true, Network: "ws",
 	}
 	reality := Profile{
@@ -160,7 +160,7 @@ func TestShouldRescueLoopbackProfile(t *testing.T) {
 		return Profile{
 			ID: "appxa", Name: "APPXA", Core: CoreSingBox, Protocol: "trojan",
 			Address: "127.0.0.1", Port: 40443, IDOrPassword: "pw",
-			TLS: true, Network: "ws", ServerName: "www.calmlunch.com", Path: "/assignment",
+			TLS: true, Network: "ws", ServerName: "www.node.example", Path: "/assignment",
 		}
 	}
 	// Reserve a port, release it: guaranteed dead.
@@ -208,7 +208,7 @@ func TestShouldRescueLoopbackProfile(t *testing.T) {
 		t.Fatal("explicit xray core: want no rescue")
 	}
 	direct := base()
-	direct.Address = "www.calmlunch.com"
+	direct.Address = "www.node.example"
 	if shouldRescueLoopbackProfile(&direct, DefaultSettings()) {
 		t.Fatal("non-loopback address: want no rescue")
 	}
@@ -227,8 +227,8 @@ func TestShouldRescueDirectSpoofProfile(t *testing.T) {
 	base := func() Profile {
 		return Profile{
 			ID: "test-cf", Name: "Test-CF", Core: CoreSingBox, Protocol: "trojan",
-			Address: "www.calmlunch.com", Port: 443, IDOrPassword: "pw",
-			TLS: true, Network: "ws", ServerName: "www.calmlunch.com", Path: "/assignment",
+			Address: "www.node.example", Port: 443, IDOrPassword: "pw",
+			TLS: true, Network: "ws", ServerName: "www.node.example", Path: "/assignment",
 		}
 	}
 	if p := base(); !shouldRescueDirectSpoofProfile(&p, DefaultSettings()) {
@@ -256,7 +256,7 @@ func TestShouldRescueDirectSpoofProfile(t *testing.T) {
 		t.Fatal("IP literal: want no rescue (never auto-tag)")
 	}
 	v6 := base()
-	v6.Address = "2a06:98c1:3101::6812:202f"
+	v6.Address = "2001:db8::6812:202f"
 	if shouldRescueDirectSpoofProfile(&v6, DefaultSettings()) {
 		t.Fatal("IPv6 literal (normal config): want no rescue")
 	}
@@ -299,7 +299,7 @@ func TestConnectRescuesDeadLoopbackProfile(t *testing.T) {
 	saved, err := store.SaveProfile(Profile{
 		Name: "APPXA", Core: CoreSingBox, Protocol: "trojan",
 		Address: "127.0.0.1", Port: deadPort, IDOrPassword: "pw",
-		TLS: true, Network: "ws", ServerName: "www.calmlunch.com",
+		TLS: true, Network: "ws", ServerName: "www.node.example",
 	})
 	if err != nil {
 		t.Fatalf("SaveProfile: %v", err)
@@ -348,6 +348,7 @@ func TestConnectKeepsAnExplicitXrayCore(t *testing.T) {
 	}
 	s := DefaultSettings()
 	s.SystemProxy = false
+	s.CoreEngine = "xray"
 	if err := store.SaveSettings(s); err != nil {
 		t.Fatalf("SaveSettings: %v", err)
 	}
@@ -361,7 +362,7 @@ func TestConnectKeepsAnExplicitXrayCore(t *testing.T) {
 	saved, err := store.SaveProfile(Profile{
 		Name: "APPXA-xray", Core: CoreXray, Protocol: "trojan",
 		Address: "127.0.0.1", Port: deadPort, IDOrPassword: "pw",
-		TLS: true, Network: "ws", ServerName: "www.calmlunch.com",
+		TLS: true, Network: "ws", ServerName: "www.node.example",
 	})
 	if err != nil {
 		t.Fatalf("SaveProfile: %v", err)

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -43,6 +44,141 @@ func TestMigrateFromOldAppDataDir(t *testing.T) {
 	}
 	if migrated {
 		t.Fatal("must prefer the new config silently when both exist")
+	}
+}
+
+func TestSetActiveProfileIDIfUnchanged(t *testing.T) {
+	store, err := NewConfigStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SetActiveProfileID("old"); err != nil {
+		t.Fatal(err)
+	}
+	changed, err := store.SetActiveProfileIDIfUnchanged("connected", "old")
+	if err != nil || !changed {
+		t.Fatalf("matching selection write = %v, %v; want true, nil", changed, err)
+	}
+	changed, err = store.SetActiveProfileIDIfUnchanged("stale", "old")
+	if err != nil || changed {
+		t.Fatalf("stale selection write = %v, %v; want false, nil", changed, err)
+	}
+	if got := store.GetSettings().ActiveProfileID; got != "connected" {
+		t.Fatalf("stale write changed active profile to %q", got)
+	}
+}
+
+func TestLegacyMigrationOnlyRewritesFilesystemSettings(t *testing.T) {
+	oldRoot := t.TempDir()
+	newRoot := t.TempDir()
+	legacy := `{
+  "profiles": [{"id":"p","name":"node/SNI-NekoBox/name","idOrPassword":"user/SNI-NekoBox/password"}],
+  "settings": {
+    "corePath":"C:\\Users\\x\\AppData\\Roaming\\SNI-NekoBox\\nekobox_core.exe",
+    "subscriptions":[{"url":"https://example.test/SNI-NekoBox/token","name":"SNI-NekoBox/feed"}],
+    "testUrl":"https://example.test/SNI-NekoBox/probe"
+  }
+}`
+	if err := os.WriteFile(filepath.Join(oldRoot, "config.json"), []byte(legacy), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := migrateFromOldAppDataDir(newRoot, oldRoot); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := os.ReadFile(filepath.Join(newRoot, "config.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got struct {
+		Profiles []Profile `json:"profiles"`
+		Settings struct {
+			CorePath      string         `json:"corePath"`
+			Subscriptions []Subscription `json:"subscriptions"`
+			TestURL       string         `json:"testUrl"`
+		} `json:"settings"`
+	}
+	if err := json.Unmarshal(raw, &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.Settings.CorePath != `C:\Users\x\AppData\Roaming\NekoGo\nekobox_core.exe` {
+		t.Fatalf("corePath = %q, want the renamed app-data path", got.Settings.CorePath)
+	}
+	if len(got.Profiles) != 1 || got.Profiles[0].Name != "node/SNI-NekoBox/name" || got.Profiles[0].IDOrPassword != "user/SNI-NekoBox/password" {
+		t.Fatalf("migration changed profile text: %+v", got.Profiles)
+	}
+	if len(got.Settings.Subscriptions) != 1 || got.Settings.Subscriptions[0].URL != "https://example.test/SNI-NekoBox/token" || got.Settings.Subscriptions[0].Name != "SNI-NekoBox/feed" {
+		t.Fatalf("migration changed subscription identity: %+v", got.Settings.Subscriptions)
+	}
+	if got.Settings.TestURL != "https://example.test/SNI-NekoBox/probe" {
+		t.Fatalf("migration changed test URL to %q", got.Settings.TestURL)
+	}
+}
+
+func TestSaveProfileRollsBackMemoryOnPersistenceFailure(t *testing.T) {
+	store, err := NewConfigStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	original := Profile{ID: "keep", Name: "original", Protocol: "vless", Address: "node.example", Port: 443}
+	if _, err := store.SaveProfile(original); err != nil {
+		t.Fatal(err)
+	}
+	before := store.ListProfiles()
+	store.path = t.TempDir()
+
+	if _, err := store.SaveProfile(Profile{ID: "rejected", Name: "new"}); err == nil {
+		t.Fatal("insert with broken persistence succeeded")
+	}
+	if got := store.ListProfiles(); !reflect.DeepEqual(got, before) {
+		t.Fatalf("failed insert left an in-memory profile: got %+v, want %+v", got, before)
+	}
+	replacement := original
+	replacement.Name = "rejected replacement"
+	if _, err := store.SaveProfile(replacement); err == nil {
+		t.Fatal("replacement with broken persistence succeeded")
+	}
+	if got := store.ListProfiles(); !reflect.DeepEqual(got, before) {
+		t.Fatalf("failed replacement changed the in-memory profile: got %+v, want %+v", got, before)
+	}
+}
+
+func TestSettingsWritesRollBackMemoryOnPersistenceFailure(t *testing.T) {
+	store, err := NewConfigStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	initial := store.GetSettings()
+	initial.ActiveProfileID = "old"
+	initial.Theme = "light"
+	if err := store.SaveSettings(initial); err != nil {
+		t.Fatal(err)
+	}
+	before := store.GetSettings()
+	store.path = t.TempDir()
+
+	rejected := before
+	rejected.ActiveProfileID = "rejected-settings"
+	rejected.Theme = "dark"
+	if err := store.SaveSettings(rejected); err == nil {
+		t.Fatal("SaveSettings with broken persistence succeeded")
+	}
+	if got := store.GetSettings(); !reflect.DeepEqual(got, before) {
+		t.Errorf("failed settings write changed memory: got %+v, want %+v", got, before)
+	}
+
+	if err := store.SetActiveProfileID("rejected-selection"); err == nil {
+		t.Fatal("SetActiveProfileID with broken persistence succeeded")
+	}
+	if got := store.GetSettings().ActiveProfileID; got != "old" {
+		t.Errorf("failed selection write left active profile %q, want old", got)
+	}
+
+	changed, err := store.SetActiveProfileIDIfUnchanged("rejected-connect", "old")
+	if err == nil || !changed {
+		t.Fatalf("matching selection write with broken persistence = %v, %v; want true, error", changed, err)
+	}
+	if got := store.GetSettings().ActiveProfileID; got != "old" {
+		t.Errorf("failed connect selection write left active profile %q, want old", got)
 	}
 }
 
@@ -150,7 +286,7 @@ func TestSpoofAutoDetectRevert(t *testing.T) {
 	// spoofAutoDetectReverted marker.
 	legacy := `{
   "profiles": [
-    {"id": "d1", "name": "direct", "core": 0, "protocol": "trojan", "address": "www.calmlunch.com", "port": 443, "tls": true, "network": "ws"},
+    {"id": "d1", "name": "direct", "core": 0, "protocol": "trojan", "address": "www.node.example", "port": 443, "tls": true, "network": "ws"},
     {"id": "i1", "name": "iplit", "core": 0, "protocol": "trojan", "address": "104.18.9.83", "port": 443, "tls": true, "network": "ws"},
     {"id": "c1", "name": "chain", "core": 0, "protocol": "trojan", "address": "127.0.0.1", "port": 40443, "tls": true, "network": "ws"},
     {"id": "v1", "name": "vmess", "core": 0, "protocol": "vmess", "address": "cf.example", "port": 443, "tls": true, "network": "ws"}
@@ -319,6 +455,97 @@ func TestSaveSettingsKeepsBackendOwnedFields(t *testing.T) {
 	}
 	if n := len(reloaded.GetSettings().Subscriptions); n != 1 {
 		t.Fatalf("persisted Subscriptions = %d, want 1", n)
+	}
+}
+
+// The SNI lists are shared: the tab curates them (add, remove, check) and
+// the scanner stamps LastOK/LastMs/LastAt/LastTLS/LastIP onto the live
+// store, even when the run is cancelled. SaveSettings used to take the
+// lists wholesale from the frontend's startup snapshot, so any later
+// settings save — a theme toggle — erased the stamps of a scan the tab had
+// not reloaded yet.
+func TestSaveSettingsKeepsSNIScanStamps(t *testing.T) {
+	store, err := NewConfigStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	seed := store.GetSettings()
+	seed.SNIIPs = []SNIIP{{IP: "192.0.2.10"}}
+	seed.SNISNIs = []SNISNI{{Host: "example.com"}}
+	if err := store.SaveSettings(seed); err != nil {
+		t.Fatal(err)
+	}
+	snapshot := store.GetSettings()
+
+	if err := store.UpdateSNI(func(s *Settings) {
+		s.SNIIPs[0].LastOK = true
+		s.SNIIPs[0].LastMs = 42
+		s.SNIIPs[0].LastAt = "2026-11-17T00:00:00Z"
+		s.SNIIPs[0].LastTLS = "TLS 1.3"
+		s.SNISNIs[0].LastOK = true
+		s.SNISNIs[0].LastIP = "192.0.2.20"
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	no := false
+	snapshot.SNIIPs[0].Selected = &no
+	snapshot.Theme = "dark"
+	if err := store.SaveSettings(snapshot); err != nil {
+		t.Fatal(err)
+	}
+	got := store.GetSettings()
+	if got.Theme != "dark" {
+		t.Fatalf("Theme = %q, want the saved dark", got.Theme)
+	}
+	if len(got.SNIIPs) != 1 || got.SNIIPs[0].IsSelected() {
+		t.Fatalf("SNIIPs = %+v, want the one entry the user unchecked", got.SNIIPs)
+	}
+	ip := got.SNIIPs[0]
+	if !ip.LastOK || ip.LastMs != 42 || ip.LastAt != "2026-11-17T00:00:00Z" || ip.LastTLS != "TLS 1.3" {
+		t.Fatalf("SNIIPs[0] = %+v, want the scan stamps the backend wrote", ip)
+	}
+	if len(got.SNISNIs) != 1 || !got.SNISNIs[0].LastOK || got.SNISNIs[0].LastIP != "192.0.2.20" {
+		t.Fatalf("SNISNIs = %+v, want the scan stamps the backend wrote", got.SNISNIs)
+	}
+	reloaded, err := NewConfigStore(store.Dir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r := reloaded.GetSettings().SNIIPs; len(r) != 1 || !r[0].LastOK {
+		t.Fatalf("persisted SNIIPs = %+v, want the stamp on disk", r)
+	}
+}
+
+// The merge keeps the tab's entry set: a removed entry stays removed and a
+// newly added one starts unscanned, so carrying the stamps over cannot
+// resurrect a list the user edited.
+func TestSaveSettingsSNIMergeKeepsTheTabEntrySet(t *testing.T) {
+	store, err := NewConfigStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	seed := store.GetSettings()
+	seed.SNIIPs = []SNIIP{{IP: "192.0.2.10", LastOK: true, LastMs: 42}, {IP: "192.0.2.11"}}
+	seed.SNISNIs = []SNISNI{{Host: "example.com", LastOK: true}}
+	if err := store.SaveSettings(seed); err != nil {
+		t.Fatal(err)
+	}
+	snapshot := store.GetSettings()
+	snapshot.SNIIPs = []SNIIP{{IP: "192.0.2.11"}, {IP: "192.0.2.12"}}
+	snapshot.SNISNIs = nil
+	if err := store.SaveSettings(snapshot); err != nil {
+		t.Fatal(err)
+	}
+	got := store.GetSettings()
+	if len(got.SNIIPs) != 2 || got.SNIIPs[0].IP != "192.0.2.11" || got.SNIIPs[1].IP != "192.0.2.12" {
+		t.Fatalf("SNIIPs = %+v, want the tab's two entries in order", got.SNIIPs)
+	}
+	if got.SNIIPs[0].LastOK || got.SNIIPs[1].LastOK || got.SNIIPs[1].LastMs != 0 {
+		t.Fatalf("SNIIPs = %+v, want a removed entry gone and a new one unscanned", got.SNIIPs)
+	}
+	if len(got.SNISNIs) != 0 {
+		t.Fatalf("SNISNIs = %+v, want the list the tab emptied", got.SNISNIs)
 	}
 }
 

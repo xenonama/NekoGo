@@ -47,12 +47,15 @@ type orphanProc struct {
 // serving traffic with no supervisor to end it. sni-spoof.exe is the
 // WinDivert SNI engine: an orphan keeps intercepting and faking TLS for
 // the WHOLE machine after the GUI is gone, and pt\lyrebird.exe is the Tor
-// transport the Aether engine spawns.
+// transport the Aether engine spawns. tor.exe is the standalone Tor
+// daemon the chain's Tor hop runs on when it is installed: it opens a
+// SOCKS listener and, unlike aether's arti, keeps running with no
+// supervisor once the GUI is gone.
 var orphanImageNames = []string{
 	"xray.exe", "nekobox_core.exe", "sing-box.exe",
 	"mihomo.exe", "mihomo-windows-amd64.exe",
 	"aether.exe", "psiphon-tunnel-core.exe",
-	"sni-spoof.exe", "lyrebird.exe",
+	"sni-spoof.exe", "lyrebird.exe", "tor.exe",
 }
 
 // orphanProcFilter renders the image-name list as a WQL/CIM filter

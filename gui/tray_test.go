@@ -5,6 +5,7 @@ import (
 	"image/png"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -30,6 +31,116 @@ func TestTrayIconEmbedded(t *testing.T) {
 		t.Fatalf("appIconPNG too small for a tray icon: %dx%d", b.Dx(), b.Dy())
 	}
 	t.Logf("tray icon: %d bytes, %dx%d", len(appIconPNG), b.Dx(), b.Dy())
+}
+
+func TestTrayMenuItemsHaveWindows10Icons(t *testing.T) {
+	app := application.New(application.Options{Name: "NekoGo-test"})
+	tray := SetupTray(app, TrayCallbacks{}, nil)
+	check := func(label string) {
+		t.Helper()
+		item := tray.menu.FindByLabel(label)
+		if item == nil {
+			t.Fatalf("tray menu has no %q item", label)
+		}
+		bitmap := reflect.ValueOf(item).Elem().FieldByName("bitmap").Bytes()
+		img, err := png.Decode(bytes.NewReader(bitmap))
+		if err != nil {
+			t.Fatalf("%q has no valid menu PNG: %v", label, err)
+		}
+		if b := img.Bounds(); b.Dx() != 16 || b.Dy() != 16 {
+			t.Fatalf("%q menu icon is %dx%d, want 16x16", label, b.Dx(), b.Dy())
+		}
+	}
+	for _, label := range []string{"Show NekoGo", "Connect selected", "Reconnect", "Disconnect", "Profiles", "Quit NekoGo"} {
+		check(label)
+	}
+	tray.SetConnectionState(false, true, "", "", false, false)
+	check("Cancel connection")
+}
+
+func TestTrayCancelIsNotSkippedWhileConnectBusy(t *testing.T) {
+	app := newTrayTestApp(t, true)
+	app.connMu.Lock()
+	app.connBusy = true
+	before := app.connEpoch
+	app.connMu.Unlock()
+	runTrayDisconnect(app)
+	app.connMu.Lock()
+	after := app.connEpoch
+	app.connMu.Unlock()
+	if after != before+1 {
+		t.Fatalf("tray Cancel left the Connect epoch at %d, want %d", after, before+1)
+	}
+	for _, entry := range app.RecentLogs(20) {
+		if strings.Contains(entry.Message, "disconnect skipped") {
+			t.Fatalf("tray Cancel was ignored: %s", entry.Message)
+		}
+	}
+}
+
+func TestTrayCancelIsPublishedDuringConnectStartup(t *testing.T) {
+	app, profile := testProxyApp(t, DefaultSettings(), CoreSingBox)
+	defer func() { _ = app.Disconnect() }()
+	entered := make(chan struct{})
+	gate := make(chan struct{})
+	var releaseOnce sync.Once
+	release := func() { releaseOnce.Do(func() { close(gate) }) }
+	defer release()
+	app.coreStarter = func(*Profile, Settings) error {
+		close(entered)
+		<-gate
+		return nil
+	}
+	disconnected := make(chan struct{})
+	tray := SetupTray(application.New(application.Options{Name: "NekoGo-test"}), TrayCallbacks{
+		OnDisconnect: func() {
+			runTrayDisconnect(app)
+			close(disconnected)
+		},
+	}, app.logCh)
+	app.attachTray(tray)
+	connectErr := make(chan error, 1)
+	go func() { connectErr <- app.Connect(profile.ID) }()
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Connect did not reach the core starter")
+	}
+
+	tray.mu.RLock()
+	busy := tray.state.busy
+	label := tray.disconnectItem.Label()
+	tray.mu.RUnlock()
+	if !busy {
+		t.Fatal("tray did not publish busy=true while Connect was starting")
+	}
+	if label != "Cancel connection" {
+		t.Fatalf("tray action = %q, want Cancel connection", label)
+	}
+	if !tray.invoke(trayDisconnect, "") {
+		t.Fatal("tray rejected Cancel connection during startup")
+	}
+	select {
+	case <-disconnected:
+	case <-time.After(2 * time.Second):
+		t.Fatal("tray Cancel did not reach App.Disconnect")
+	}
+	release()
+	select {
+	case err := <-connectErr:
+		if err == nil || err.Error() != "connect aborted (concurrent stop)" {
+			t.Fatalf("Connect after tray Cancel = %v, want shared cancellation error", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Connect did not settle after tray Cancel")
+	}
+	tray.mu.RLock()
+	busy = tray.state.busy
+	label = tray.disconnectItem.Label()
+	tray.mu.RUnlock()
+	if busy || label != "Disconnect" {
+		t.Fatalf("settled tray state: busy=%v action=%q, want stopped Disconnect", busy, label)
+	}
 }
 
 // TestTrayIconConvertsToHICON runs the exact Windows conversion the tray
@@ -82,13 +193,15 @@ func TestSetupTrayLogs(t *testing.T) {
 	tray := SetupTray(app, TrayCallbacks{}, ch)
 	tray.SetStatus(false, "", "")
 	tray.SetStatus(true, "p", "xray")
-	deadline := time.Now().Add(2 * time.Second)
 	var got []string
-	for time.Now().Before(deadline) && len(got) < 7 {
-		select {
-		case e := <-ch:
-			got = append(got, e.Message)
-		case <-time.After(100 * time.Millisecond):
+	for len(ch) > 0 {
+		e := <-ch
+		got = append(got, e.Message)
+		if e.Source != "tray" || e.Level != "info" {
+			t.Errorf("unexpected tray diagnostic: %+v", e)
+		}
+		if _, err := time.Parse(time.RFC3339, e.Time); err != nil {
+			t.Errorf("invalid log timestamp: %v", err)
 		}
 	}
 	joined := strings.Join(got, "\n")
@@ -96,7 +209,8 @@ func TestSetupTrayLogs(t *testing.T) {
 		"[tray] creating system tray",
 		"[tray] set label ok",
 		"[tray] set icon (",
-		"[tray] set menu (5 items)",
+		"[tray] set menu (10 items)",
+		"[tray] profiles menu rebuilt (0 rows, 0 hidden)",
 		"[tray] system tray created",
 	} {
 		if !strings.Contains(joined, want) {
@@ -105,6 +219,13 @@ func TestSetupTrayLogs(t *testing.T) {
 	}
 	if strings.Contains(joined, "ERROR") {
 		t.Errorf("unexpected tray error lines:\n%s", joined)
+	}
+	// Initial render and running transition log; unchanged stopped state skips.
+	if n := strings.Count(joined, "[tray] set label ok"); n != 2 {
+		t.Errorf("got %d label updates, want 2; logs:\n%s", n, joined)
+	}
+	if tray.statusItem.Label() != "Status: Connected — p (xray)" {
+		t.Errorf("SetStatus did not update menu status: %q", tray.statusItem.Label())
 	}
 }
 
@@ -144,8 +265,38 @@ func TestTrayServersMenu(t *testing.T) {
 	}
 
 	tray.RefreshServers(nil, "")
-	if got := tray.servers.FindByLabel("No servers"); got == nil {
+	if got := tray.servers.FindByLabel("No profiles"); got == nil {
 		t.Fatalf("empty store: want the disabled placeholder row")
+	}
+}
+
+// Regression: the selected profile must remain visible even past the cap.
+// Uses only the original SetupTray/RefreshServers APIs, without app.Run.
+func TestTrayServersRetainsSelectedBeyondCap(t *testing.T) {
+	app := application.New(application.Options{Name: "NekoGo-test"})
+	tray := SetupTray(app, TrayCallbacks{}, nil)
+	entries := make([]TrayServer, trayServerCap+5)
+	for i := range entries {
+		id := "profile-" + string(rune('A'+i))
+		entries[i] = TrayServer{ID: id, Name: id}
+	}
+	selected := entries[len(entries)-1]
+	tray.RefreshServers(entries, selected.ID)
+	row := tray.servers.FindByLabel(selected.Name)
+	if row == nil {
+		t.Fatalf("selected profile %q past cap %d is missing", selected.ID, trayServerCap)
+	}
+	if !row.IsRadio() || !row.Checked() {
+		t.Fatal("selected profile must be a checked radio row")
+	}
+	radios := 0
+	for i := 0; tray.servers.ItemAt(i) != nil; i++ {
+		if tray.servers.ItemAt(i).IsRadio() {
+			radios++
+		}
+	}
+	if radios != trayServerCap {
+		t.Fatalf("got %d profile rows, want cap %d including selection", radios, trayServerCap)
 	}
 }
 

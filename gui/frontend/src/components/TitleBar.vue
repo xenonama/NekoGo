@@ -14,7 +14,7 @@
      working from the custom bar. -->
 <template>
   <header class="nb-titlebar" @dblclick="toggleMaximise">
-    <img class="nb-titlebar-icon" :src="appIcon" alt="" />
+    <img class="nb-titlebar-icon" :src="appIcon" alt="" draggable="false" />
     <span class="nb-titlebar-title">NekoGo</span>
     <div class="nb-titlebar-controls" @dblclick.stop>
       <button class="nb-tb-btn" type="button" title="Minimise" aria-label="Minimise" @click="minimise">

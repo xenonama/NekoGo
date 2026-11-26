@@ -15,7 +15,7 @@ export interface AetherSettings {
   ipVersion?: string
   /** MASQUE SNI override (empty = core default). */
   masqueSni?: string
-  /** chrome | firefox | semi-python | go (empty = chrome). */
+  /** chrome | chrome-120 | firefox | semi-python | go (empty = chrome). */
   fingerprint?: string
   /** Comma-separated DNS resolvers. */
   dns?: string
@@ -94,6 +94,47 @@ export interface AetherScanStatus {
   lastError?: string
   lastErrorAt?: string
   startedAt?: string
+}
+
+/** WARP-key renewal knobs (mirrors gui/aether_keys.go aetherKeysSettings).
+ *  Their own settings: no profile's Aether fields reach them. */
+export interface AetherKeysSettings {
+  /** all | wg | masque | gool | mim — what --register takes on 2.3.0. */
+  kind?: string
+  /** --enroll-address: name or IP, alone or with :port. Blank = the
+   *  core's own api.cloudflareclient.com. */
+  enrollAddress?: string
+  fragment?: boolean
+  fragmentSize?: string
+  fragmentDelay?: string
+  ech?: boolean
+  echDns?: string
+  echDomain?: string
+  fingerprint?: string
+  /** '' = direct, tor | psiphon = the API calls ride that carrier. */
+  carrier?: string
+  /** Hand-written registration line; runs as written when set. */
+  command?: string
+}
+
+/** One WARP key file and the identity it holds. The private key,
+ *  certificate and access token beside these are never handed over. */
+export interface AetherKeyInfo {
+  file: string
+  label: string
+  present: boolean
+  deviceId?: string
+  ipv4?: string
+  ipv6?: string
+}
+
+export interface AetherKeysStatus {
+  running: boolean
+  kind?: string
+  startedAt?: string
+  lastError?: string
+  lastErrorAt?: string
+  lastOkAt?: string
 }
 
 export interface Profile {
@@ -255,18 +296,17 @@ export interface Settings {
   /** mihomo.exe (Clash Meta) override; never shared with corePath or
    *  xrayPath. Omitted by Go while empty. */
   mihomoPath?: string
-  /** Core backend: 'custom' (nekobox_core with Thrift RPC, default) or
-   *  'upstream' (official sing-box.exe CLI, Clash API stats; no
-   *  Mieru/Juicity/TrustTunnel/VLESS-encryption). The choice covers every
-   *  sing-box transport: plain profiles, the SNI spoof transport and the
-   *  Aether transport. Xray and mihomo profiles never run a sing-box
-   *  binary, so the choice is inert for them. Omitted by Go when a legacy
-   *  config file predates the setting — GetSettings reports 'custom' then. */
+  /** Preferred core: 'custom' (nekobox_core, default), 'upstream'
+   *  (official sing-box), 'xray', or 'mihomo'. Unsupported protocols fall
+   *  back to custom; raw outbound formats and SNI spoof keep their special
+   *  routing. Omitted by Go for legacy configs — GetSettings reports 'custom'. */
   coreEngine?: string
   /** aether.exe override (empty = bin\ next to the app; omitted by Go when empty). */
   aetherPath?: string
   language: string
   logLevel: string
+  /** Newest buffered lines shown in the Console; 0 = no display limit. */
+  consoleLogLimit?: number | null
   startMinimized: boolean
   closeToTray: boolean
   autoConnect: boolean
@@ -336,6 +376,13 @@ export interface Settings {
    *  core's own chain mode (mirrors gui Settings; omitted by Go when
    *  false). Separate from spoofPsiphon: this rides the Aether tunnel. */
   aetherPsiphon?: boolean
+  /** Chain Tor on top of the SNI-spoofed tunnel (mirrors gui Settings;
+   *  omitted by Go when false). A leg runs one exit chain, so a saved
+   *  config never holds both drivers for the same leg. */
+  spoofTor?: boolean
+  /** Chain Tor through the aether core's own chain mode, on the Aether
+   *  leg. Same one-driver rule as spoofTor. */
+  aetherTor?: boolean
   /** Chain-level Psiphon options (mirrors gui Settings; Advanced-only).
    *  They drive the two chain legs above — never a profile's own Aether
    *  Psiphon fields. Empty means aether's own default. */
@@ -348,6 +395,21 @@ export interface Settings {
   chainPsiphonCdnIps?: string
   chainPsiphonCdnSni?: string
   chainPsiphonCdnSets?: string
+  /** Chain-level Tor options (mirrors gui Settings; Advanced-only), on
+   *  the same rule as the Psiphon ones: the chain legs, not a profile's. */
+  /** Bridge use: auto | first | never | own. */
+  chainTorBridges?: string
+  /** Directory relay pool: auto | only | off. */
+  chainTorRelays?: string
+  /** Bridge lines for own, one per line; # comments and blanks are
+   *  dropped before aether sees them. */
+  chainTorBridgeLines?: string
+  /** What the Reconnect button does with the exit chain: off (no
+   *  button), restart (every leg cold-starts — what the button has
+   *  always done and the fallback for a keyless config), sticky (the
+   *  SNI-spoof chain's Psiphon/Tor child is handed to the next connect).
+   *  Read by the backend when the button is pressed; see gui/reconnect.go. */
+  reconnectMode?: string
   /** Loopback-profile endpoint/SNI override (mirrors gui Settings). */
   sniSelectedIp?: string
   /** Loopback-profile decoy SNI override. */
@@ -360,6 +422,8 @@ export interface Settings {
   sniSnis?: SNISNI[]
   /** Persisted Aether scan results (mirrors gui Settings). */
   aetherScanResults?: AetherScanResult[]
+  /** WARP-key renewal knobs of the Aether tab (mirrors gui Settings). */
+  aetherKeys?: AetherKeysSettings
 }
 
 /** Phase F backup document (mirrors gui BackupBlob). */
@@ -395,6 +459,7 @@ export const defaultSettings: Settings = {
   aetherPath: '',
   language: 'en',
   logLevel: 'info',
+  consoleLogLimit: 300,
   startMinimized: false,
   closeToTray: true,
   autoConnect: false,
@@ -420,11 +485,17 @@ export const defaultSettings: Settings = {
   spoofXray: false,
   spoofEnabled: true,
   aetherPsiphon: false,
+  spoofTor: false,
+  aetherTor: false,
   chainPsiphonRegion: '',
   chainPsiphonMode: 'auto',
   chainPsiphonCdnIps: '',
   chainPsiphonCdnSni: '',
   chainPsiphonCdnSets: '',
+  chainTorBridges: 'auto',
+  chainTorRelays: 'auto',
+  chainTorBridgeLines: '',
+  reconnectMode: 'restart',
 }
 
 export interface LogEntry {
@@ -600,9 +671,11 @@ export interface SpoofStatus {
   startedAt: string
   uptime: number
   lastError: string
-  /** The live connect runs the SNI spoof → Psiphon chain; chainPort is
-   *  Psiphon's local SOCKS listener (0 when no chain). */
+  /** The live connect runs the SNI spoof → exit-chain leg; chainDriver
+   *  names it ('psiphon' | 'tor', '' when no chain) and chainPort is
+   *  that chain's local SOCKS listener (0 when no chain). */
   chain?: boolean
+  chainDriver?: string
   chainPort?: number
 }
 

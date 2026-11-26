@@ -137,7 +137,7 @@ func TestSpoofPlanARecognizesPlan(t *testing.T) {
 // the key at all, so the engine keeps dialing the curated pool.
 func TestBuildSpoofConfigJSONPlanSwitch(t *testing.T) {
 	p := spoofTestProfile()
-	p.Address = "www.calmlunch.com"
+	p.Address = "www.node.example"
 	p.Port = 8443
 
 	for _, tc := range []struct {
@@ -187,7 +187,7 @@ func TestResolvePlanATargetFromDoH(t *testing.T) {
 	s.SNISelectedSNI = "example.com"
 	// A non-Cloudflare answer must be used as-is: Plan B's range check
 	// would have rejected it, Plan A's whole point is not to care.
-	ip, sni, port, err := resolvePlanATarget(&Profile{Name: "p", Address: "www.calmlunch.com", Port: 8443}, s)
+	ip, sni, port, err := resolvePlanATarget(&Profile{Name: "p", Address: "www.node.example", Port: 8443}, s)
 	if err != nil {
 		t.Fatalf("resolvePlanATarget: %v", err)
 	}
@@ -201,7 +201,7 @@ func TestResolvePlanATargetFromDoH(t *testing.T) {
 	s.SNIIPs = []SNIIP{{IP: "172.67.1.2", Source: "test"}}
 	s.SNISNIs = []SNISNI{{Host: "other.example", Source: "test"}}
 	s.SNISelectedSNI = "other.example"
-	ip2, sni2, _, err := resolveSNITarget(&Profile{Name: "p", Address: "www.calmlunch.com", Port: 443}, s)
+	ip2, sni2, _, err := resolveSNITarget(&Profile{Name: "p", Address: "www.node.example", Port: 443}, s)
 	if err != nil {
 		t.Fatalf("resolveSNITarget(plan A): %v", err)
 	}
@@ -239,7 +239,7 @@ func TestResolvePlanAErrors(t *testing.T) {
 	// A pin that has no A record must fail with the DoH cause, not hang.
 	s.SNISNIs = []SNISNI{{Host: "dead.example", Source: "test"}}
 	s.SNISelectedSNI = "dead.example"
-	if _, _, _, err := resolvePlanATarget(&Profile{Name: "p", Address: "www.calmlunch.com", Port: 443}, s); err == nil {
+	if _, _, _, err := resolvePlanATarget(&Profile{Name: "p", Address: "www.node.example", Port: 443}, s); err == nil {
 		t.Fatal("plan A with an unresolvable SNI succeeded, want error")
 	} else if !strings.Contains(err.Error(), "no A record") || !strings.Contains(err.Error(), "plan A:") {
 		t.Fatalf("error %q lost the DoH cause", err)

@@ -513,7 +513,7 @@ func failingConnectApp(t *testing.T, coreStillRunning bool) (*App, Profile) {
 	t.Helper()
 	t.Cleanup(isolateSysproxy(t))
 	app := runningProxyApp(t, 2080, CoreSingBox)
-	prof, err := app.store.SaveProfile(Profile{Name: "p", Core: CoreSingBox, Address: "203.0.113.7", Port: 443})
+	prof, err := app.store.SaveProfile(Profile{Name: "p", Core: CoreSingBox, Protocol: "vless", Address: "203.0.113.7", Port: 443})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -585,7 +585,7 @@ func TestFailedConnectLeavesAForeignProxyAlone(t *testing.T) {
 		t.Fatal(err)
 	}
 	app := runningProxyApp(t, 2080, CoreSingBox)
-	prof, err := app.store.SaveProfile(Profile{Name: "p", Core: CoreSingBox, Address: "203.0.113.7", Port: 443})
+	prof, err := app.store.SaveProfile(Profile{Name: "p", Core: CoreSingBox, Protocol: "vless", Address: "203.0.113.7", Port: 443})
 	if err != nil {
 		t.Fatal(err)
 	}

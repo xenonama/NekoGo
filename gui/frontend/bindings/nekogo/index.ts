@@ -8,6 +8,8 @@ export {
 
 export {
     AetherConfig,
+    AetherKeyInfo,
+    AetherKeysStatus,
     AetherScanResult,
     AetherScanStatus,
     Connection,

@@ -61,7 +61,7 @@ func TestStartReturnsStopError(t *testing.T) {
 	// running with a nil xray manager: stopLocked fails, Start must
 	// propagate the stop error instead of silently continuing.
 	m := &CoreManager{activeCore: CoreXray, running: true, activeID: "old"}
-	err := m.Start(&Profile{Name: "p", Core: CoreSingBox}, DefaultSettings())
+	err := m.Start(&Profile{Name: "p", Core: CoreSingBox, Protocol: "vless"}, DefaultSettings())
 	if err == nil {
 		t.Fatal("expected stop error from Start")
 	}

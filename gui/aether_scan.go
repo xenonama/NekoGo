@@ -256,9 +256,22 @@ func (a *App) aetherScanBegin(timeout time.Duration) (context.Context, context.C
 	if a.aetherScanCancel != nil {
 		return nil, nil, fmt.Errorf("an Aether scan is already running")
 	}
+	// A renewal rewrites the identities a scan would use. The lock order
+	// is scan then keys; AetherRenewKeys checks the scan slot before it
+	// takes the keys slot, so the two cannot deadlock.
+	if a.aetherKeysRunning() {
+		return nil, nil, fmt.Errorf("a WARP key run is going; wait for it to finish before scanning")
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	a.aetherScanCancel = cancel
 	return ctx, cancel, nil
+}
+
+// aetherScanRunning reports whether a scan holds the one slot.
+func (a *App) aetherScanRunning() bool {
+	a.aetherScanMu.Lock()
+	defer a.aetherScanMu.Unlock()
+	return a.aetherScanCancel != nil
 }
 
 func (a *App) aetherScanEnd(cancel context.CancelFunc) {

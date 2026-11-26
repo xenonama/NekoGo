@@ -72,16 +72,22 @@ button,
   height: 100%;
 }
 /* Caption buttons drop the global button chrome: square, borderless and
-   flush with the bar, per the Windows caption convention. */
+   flush with the bar, per the Windows caption convention. min-height has
+   to be reset as well as height — the global rule asks every button for a
+   36px touch target, min-height beats height:100%, and the bar is 34px, so
+   the buttons hung 2px past its bottom edge and their hover colour painted
+   over the page. */
 .nb-tb-btn {
-  width: 46px; height: 100%;
+  width: 46px; height: 100%; min-height: 0;
   padding: 0; border: none; border-radius: 0;
   background: transparent; color: var(--fg);
   display: flex; align-items: center; justify-content: center;
   transition: background 0.12s ease, color 0.12s ease;
 }
 .nb-tb-btn:hover { background: var(--hover); }
-.nb-tb-btn:active { background: var(--btn-hover); }
+/* The press already darkens the block; global button:active also dips it
+   1px and dims it, which no caption button does on Windows. */
+.nb-tb-btn:active { background: var(--btn-hover); transform: none; filter: none; }
 .nb-tb-btn:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
 /* Close keeps the system red in both themes: it is the one caption
    button whose hover is a warning, not a highlight. */
@@ -112,6 +118,8 @@ button,
 }
 .nb-nav-item:hover { background: var(--hover); color: var(--fg); }
 .nb-nav-item.active { background: var(--accent-soft); color: var(--accent); font-weight: 600; }
+.nb-aether-logo { object-fit: contain; flex-shrink: 0; filter: brightness(0); }
+:root.dark .nb-aether-logo { filter: none; }
 /* Bottom-left Advanced Mode switch: pinned under the nav, mirrors
    the labeled master switch in the Advanced shell footer. */
 .nb-side-foot {
@@ -161,7 +169,8 @@ button,
 }
 
 /* ---------- Center panel ---------- */
-.nb-center { flex: 1; min-width: 0; overflow-y: auto; padding: 20px 22px; display: flex; flex-direction: column; gap: 16px; }
+.nb-center { flex: 1; min-width: 0; min-height: 0; overflow-x: hidden; overflow-y: auto; padding: 20px 22px; display: flex; flex-direction: column; gap: 16px; }
+.nb-center > * { flex: 0 0 auto; min-width: 0; }
 .nb-card { background: var(--card); border: 1px solid var(--border); border-radius: var(--radius); box-shadow: var(--shadow); padding: 18px 20px; }
 .nb-section-head { display: flex; align-items: center; justify-content: space-between; margin: 2px 2px 10px; }
 .nb-section-title { font-weight: 700; font-size: 15px; }
@@ -249,6 +258,22 @@ button,
 .nb-connect-btn.is-on .nb-connect-ico { background: rgba(239, 68, 68, 0.12); }
 .nb-connect-btn.is-on:hover .nb-connect-ico { background: rgba(255, 255, 255, 0.2); }
 .nb-connect-btn:disabled { box-shadow: none; }
+/* While a connect is in flight the hero button IS the cancel. Amber, not
+   the disconnect red: it stops a handshake rather than tearing down a
+   working tunnel. Declared after .is-on so a cancel pressed during a
+   reconnect's own connect leg reads as the cancel it is. */
+.nb-connect-btn.is-cancel {
+  background: var(--warn-soft); border-color: var(--warn); color: var(--warn);
+  box-shadow: none;
+}
+.nb-connect-btn.is-cancel:hover:not(:disabled) {
+  background: var(--warn); border-color: var(--warn); color: #fff;
+  box-shadow: none;
+}
+.nb-connect-btn.is-cancel .nb-connect-ico { background: rgba(245, 158, 11, 0.14); }
+.nb-connect-btn.is-cancel:hover:not(:disabled) .nb-connect-ico { background: rgba(255, 255, 255, 0.2); }
+/* The secondary action of a running tunnel, under the hero. */
+.nb-conn-reconnect { width: 100%; justify-content: center; margin-top: 6px; }
 .nb-speed { font-weight: 600; font-size: 13px; white-space: nowrap; }
 .nb-speed.down { color: var(--down); }
 .nb-speed.up { color: var(--up); }
@@ -528,6 +553,11 @@ button,
 .nb-select-opt:hover { background: var(--hover); }
 .nb-select-opt.active { color: var(--accent); font-weight: 600; }
 .nb-select-check { margin-left: auto; display: flex; min-width: 14px; }
+.nb-select-error {
+  position: absolute; top: calc(100% + 6px); left: 0; right: 0; z-index: 31;
+  padding: 8px 10px; border: 1px solid var(--border); border-radius: 8px;
+  background: var(--card); box-shadow: var(--shadow-lg); overflow-wrap: anywhere;
+}
 
 /* Custom edit context menu */
 .nb-ctxmenu {
@@ -822,7 +852,7 @@ input.nb-field:not([type="checkbox"]):not([type="radio"]):focus {
 .nb-kv .k { color: var(--muted); width: 130px; flex: 0 0 130px; }
 
 /* ---------- Settings tab (hero + pill tabs + grouped rows) ---------- */
-.stg { display: flex; flex-direction: column; }
+.stg { display: flex; flex-direction: column; min-width: 0; }
 .stg-hero {
   position: relative;
   display: flex; align-items: center; gap: 16px;
@@ -846,7 +876,7 @@ input.nb-field:not([type="checkbox"]):not([type="radio"]):focus {
   position: absolute; right: 24px; top: 50%; transform: translateY(-50%);
   width: 110px; height: 110px; border-radius: 16px; object-fit: cover;
 }
-.stg-tabs { display: flex; gap: 8px; margin-bottom: 16px; flex-wrap: wrap; }
+.stg-tabs { display: flex; gap: 8px; margin-bottom: 16px; flex-wrap: wrap; flex: 0 0 auto; min-width: 0; }
 .stg-tab {
   border-radius: 999px; height: 40px; min-height: 40px; padding: 8px 18px;
   background: transparent; border-color: transparent; color: var(--muted);
@@ -862,6 +892,7 @@ input.nb-field:not([type="checkbox"]):not([type="radio"]):focus {
 .stg-card {
   background: var(--card); border: 1px solid var(--border);
   border-radius: 16px; box-shadow: var(--shadow); padding: 20px;
+  min-width: 0;
 }
 /* Phase F reset card: red accent border (token only, no literals). */
 .stg-card-danger { border-color: var(--danger); }
@@ -895,7 +926,10 @@ input.nb-field:not([type="checkbox"]):not([type="radio"]):focus {
 .stg-meta { display: flex; flex-direction: column; min-width: 0; }
 .stg-title { font-size: 14px; font-weight: 500; color: var(--fg); }
 .stg-sub { font-size: 12px; color: var(--muted); }
-.stg-ctl { display: flex; justify-content: flex-end; align-items: center; }
+.stg-ctl { display: flex; justify-content: flex-end; align-items: center; min-width: 0; max-width: 100%; }
+.stg-ctl > .nb-pick,
+.stg-ctl > .nb-pick > .nb-pick-btn,
+.stg-ctl > input { min-width: 0; max-width: 100%; }
 .stg-toggle {
   width: 44px; height: 24px; min-height: 24px; padding: 0;
   border-radius: 999px; border: none; background: var(--tgl-off);
@@ -917,10 +951,18 @@ input.nb-field:not([type="checkbox"]):not([type="radio"]):focus {
 }
 .stg .nb-icon-btn:hover:not(:disabled) { background: var(--hover); color: var(--accent); }
 
+/* Routing guidance stays in the page flow; only its wide table scrolls. */
+.routing-rules { min-width: 0; overflow: hidden; }
+.routing-rules p, .routing-rules li { overflow-wrap: anywhere; }
+.routing-rules code { white-space: normal; overflow-wrap: anywhere; }
+.routing-rules-scroll { max-width: 100%; overflow-x: auto; }
+
 /* ---------- Console tab (Traffic + Logs) ---------- */
-.console-tabs { display: flex; gap: 8px; margin-bottom: 16px; flex-wrap: wrap; }
-.console-fill { display: flex; flex-direction: column; flex: 1 1 auto; min-height: 0; }
-.console-fill > .panel { display: flex; flex-direction: column; flex: 1 1 auto; min-height: 0; overflow: hidden; }
+.console-tabs { display: flex; gap: 8px; margin-bottom: 16px; flex-wrap: wrap; flex: 0 0 auto; min-width: 0; }
+.console-fill { display: flex; flex-direction: column; flex: 0 0 auto; min-width: 0; }
+.console-fill > .panel { display: flex; flex-direction: column; flex: 0 0 auto; min-width: 0; min-height: 0; overflow: hidden; }
+.console-fill > .panel.lv { height: clamp(360px, 60vh, 560px); }
+.console-fill > .net-stack { flex: 0 0 auto; min-width: 0; }
 .console-fill .ts-cards, .console-fill .ts-rate { flex: 0 0 auto; }
 .console-tab {
   display: inline-flex; align-items: center; gap: 8px;
@@ -1117,6 +1159,23 @@ input.nb-field:not([type="checkbox"]):not([type="radio"]):focus {
 .stg-card .toolbar--tail { padding: 12px 0 0; }
 /* Two controls sharing one row's control track (selector + action). */
 .stg-ctl--pair { gap: 8px; }
+/* A multi-line value below its row: the 140px control track holds no
+   address list, so the block spans the card instead. */
+.stg-area-wrap {
+  display: flex; flex-direction: column; gap: 6px;
+  padding: 12px 0 4px; border-top: 1px solid var(--row-sep);
+}
+.stg-area {
+  width: 100%; min-height: 84px; resize: vertical;
+  border-radius: 10px; border: 1px solid var(--border);
+  background: var(--card); padding: 8px 12px;
+  font-family: Consolas, "Cascadia Mono", monospace;
+  font-size: 12px; line-height: 1.45; outline: none;
+}
+.stg-area:focus {
+  outline: none; border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-soft);
+}
 
 /* ---------- Proxies tab polish (sticky header/footer, overflow menu) ---------- */
 .nb-px-sep-v { width: 1px; align-self: stretch; background: var(--border); margin: 2px 0; }
@@ -1145,8 +1204,53 @@ input.nb-field:not([type="checkbox"]):not([type="radio"]):focus {
   background: var(--accent-soft); border-radius: 9999px; padding: 1px 9px;
 }
 /* Empty user-created group: remove action pushed to the header's right. */
-.nb-px-group-x { margin-left: auto; width: 24px; height: 24px; min-height: 24px; color: var(--muted); }
-.nb-px-group-x:hover:not(:disabled) { color: var(--danger); }
+.nb-px-group-actions { margin-left: auto; display: flex; gap: 4px; }
+.nb-px-group-actions .nb-icon-btn { width: 24px; height: 24px; min-height: 24px; color: var(--muted); }
+.nb-px-group-actions .nb-icon-btn:hover:not(:disabled) { color: var(--accent); }
+/* Drag-to-group: the whole group section is the drop target, so dropping
+   on its header or its rows both work. */
+.nb-px-section { border-radius: 8px; transition: background 120ms ease, outline-color 120ms ease; }
+.nb-px-section.is-drop-target {
+  background: var(--accent-soft);
+  outline: 1px dashed var(--accent);
+  outline-offset: -1px;
+}
+.nb-px-section.is-drop-target .nb-px-group { background: transparent; }
+.nb-px-row.dragging { opacity: 0.45; }
+/* Floating pill, not a toolbar child: the hint must not reflow the toolbar
+   (and shift every row) mid-drag, which would move the drop target out from
+   under the pointer. */
+.nb-px-drag-hint {
+  position: fixed; left: 50%; bottom: 68px; transform: translateX(-50%);
+  z-index: 60; pointer-events: none;
+  color: var(--accent); font-size: 12px; font-weight: 600; white-space: nowrap;
+  background: var(--card); border: 1px solid var(--accent);
+  border-radius: 9999px; padding: 6px 14px;
+  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.28);
+}
+/* Explicit target list in the Move to group dialog. */
+.nb-group-pick {
+  display: flex; flex-direction: column; gap: 2px;
+  max-height: 260px; overflow-y: auto;
+  border: 1px solid var(--border); border-radius: 10px;
+  padding: 4px; margin-top: 4px;
+  background: var(--input);
+}
+.nb-group-opt {
+  display: flex; align-items: center; gap: 9px;
+  width: 100%; padding: 8px 10px; border: none; border-radius: 7px;
+  background: transparent; color: var(--fg); text-align: left;
+  font-weight: 500; cursor: pointer;
+}
+.nb-group-opt:hover { background: var(--hover); }
+.nb-group-opt.active { background: var(--accent-soft); color: var(--accent); }
+.nb-group-opt-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.nb-group-opt-count {
+  color: var(--muted); font-size: 11px; font-variant-numeric: tabular-nums;
+  background: var(--card); border-radius: 9999px; padding: 0 8px;
+}
+.nb-group-opt.active .nb-group-opt-count { color: var(--accent); }
+.nb-group-opt--new { color: var(--accent); }
 .nb-active-pill {
   font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.05em;
   color: var(--accent2); border: 1px solid var(--accent2);

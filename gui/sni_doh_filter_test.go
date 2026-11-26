@@ -74,7 +74,7 @@ func TestPlanARejectsAPoisonedSNIAnswer(t *testing.T) {
 	s.SNIConfig.Plan = "A"
 	s.SNISNIs = []SNISNI{{Host: "decoy.example", Source: "test"}}
 	s.SNISelectedSNI = "decoy.example"
-	ip, _, _, err := resolvePlanATarget(&Profile{Name: "p", Address: "www.calmlunch.com", Port: 443}, s)
+	ip, _, _, err := resolvePlanATarget(&Profile{Name: "p", Address: "www.node.example", Port: 443}, s)
 	if err == nil {
 		t.Fatalf("plan A handed the engine the answer %q, want a rejection", ip)
 	}
