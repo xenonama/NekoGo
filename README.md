@@ -1246,6 +1246,7 @@ replacing `source\`.
 
 ## Credits
 
+- [patterniha](https://github.com/patterniha) — patterns and reference behaviour this fork drew on.
 - [qr243vbi/nekobox](https://github.com/qr243vbi/nekobox)
 - [Thrift](https://thrift.apache.org/)
 - [enfein/mieru](https://github.com/enfein/mieru)
