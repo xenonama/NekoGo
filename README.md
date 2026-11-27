@@ -109,6 +109,48 @@ replacing `source\`.
 
 ### 1.0.0-beta.4
 
+- The Simple/Advanced switch now uses the same on/off control as Settings.
+  Dark mode is the default for new and missing theme values; an explicitly
+  saved light theme is still respected.
+
+- Settings → Updates shows downloaded and total bytes while an asset is being
+  fetched, with a progress bar and live polling. A discovered update leaves a
+  badge and reminder beside its row in `updates.json` until that component is
+  actually installed; downloading the NekoGo installer alone does not dismiss
+  the reminder, and a failed update check keeps the last known release notice.
+  Checks and downloads are serialized so an older completion cannot overwrite
+  newer per-component state.
+
+- Every explicit SNI bypass method now combines its decoy behaviour with a
+  split of the real ClientHello, rather than relying on the decoy alone.
+  `auto` keeps its previous compatibility strategy. New engine defaults are
+  `hello_split`, `legacy`, `block` and `ipv4` across the GUI, backend and
+  standalone engine.
+
+- SNI Spoofing Plan A accepts a manually entered IPv4 address. Manual mode
+  sends that endpoint through `CONNECT_OVERRIDE` and omits `RESOLVE_SNI`, so
+  NekoGo does not perform its automatic SNI DoH lookup; Plan B keeps its IP
+  pool and scans use the configured manual endpoint.
+
+- SNI Spoofing Stats has a Clear button. It sends a reset command to the Rust
+  engine and clears the cached snapshot, resetting counters, transferred-byte
+  totals, rankings and hot-path statistics rather than only hiding the panel.
+  Reset generations reject queued pre-reset snapshots, and delayed output from
+  a stopped child cannot mutate a restarted engine's statistics or error state.
+  Engine-option saves are serialized so a rapid plan/method edit cannot restore
+  an older value.
+
+- Durable configuration is now compact `config.json`; latency, country,
+  connection and scan history move to a compact, versioned `state.json`
+  sidecar. Runtime writes use a 500 ms trailing debounce with a two-second
+  maximum delay, flush on shutdown, and retry failed writes automatically for
+  up to four bounded backoffs. A failed legacy migration blocks the durable
+  rewrite until the runtime snapshot is safe, and config backups are replaced
+  atomically. Direct imports and subscription refreshes save new profiles in
+  batches, so a 5,000-line import no longer rewrites the whole profile file
+  once per node; subscription repointing updates only live matches under one
+  lock.
+
 - Settings → Connection → Core engine now offers NekoBox Core, sing-box,
   Xray and Mihomo. The selection is a preference: a normal profile whose
   protocol the selected engine cannot render uses NekoBox Core for that
@@ -1246,7 +1288,20 @@ replacing `source\`.
 
 ## Credits
 
-- [patterniha](https://github.com/patterniha) — patterns and reference behaviour this fork drew on.
+### patterniha
+- **[PattN](https://github.com/patterniha/PattN) / [PattNG](https://github.com/patterniha/PattNG)**:
+  the reference for NekoGo's Aether integration. The engine lifecycle,
+  profile fields and their order, WARP keys card, endpoint scan and
+  TUN options are modeled on PattN's design.
+- **[SNI-Spoofing](https://github.com/patterniha/SNI-Spoofing)**:
+  the original idea behind the SNI-spoofing engine, which NekoGo
+  rewrote in Rust.
+
+### Engines
+- [CluvexStudio/Aether](https://github.com/CluvexStudio/Aether)
+- [MetaCubeX/mihomo](https://github.com/MetaCubeX/mihomo)
+
+### Other projects and libraries
 - [qr243vbi/nekobox](https://github.com/qr243vbi/nekobox)
 - [Thrift](https://thrift.apache.org/)
 - [enfein/mieru](https://github.com/enfein/mieru)

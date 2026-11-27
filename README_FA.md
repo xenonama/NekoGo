@@ -1129,7 +1129,18 @@ BUILD OK چاپ می‌کرد و موتور SNI بدون درایورش ارسا
 
 ## اعتبارها
 
-- [patterniha](https://github.com/patterniha) — الگوها و رفتار مرجعی که این فورک از آن‌ها الهام گرفت.
+### patterniha
+- **[PattN](https://github.com/patterniha/PattN) / [PattNG](https://github.com/patterniha/PattNG)**:
+  مرجع یکپارچه‌سازی Aether در NekoGo. چرخه‌ی عمر موتور، فیلدهای پروفایل و ترتیب آن‌ها،
+  کارت کلیدهای WARP، اسکن endpoint و گزینه‌های TUN بر اساس طراحی PattN ساخته شده‌اند.
+- **[SNI-Spoofing](https://github.com/patterniha/SNI-Spoofing)**:
+  ایده‌ی اصلی موتور SNI-spoofing، که NekoGo آن را به Rust بازنویسی کرد.
+
+### موتورها
+- [CluvexStudio/Aether](https://github.com/CluvexStudio/Aether)
+- [MetaCubeX/mihomo](https://github.com/MetaCubeX/mihomo)
+
+### سایر پروژه‌ها و کتابخانه‌ها
 - [qr243vbi/nekobox](https://github.com/qr243vbi/nekobox)
 - [Thrift](https://thrift.apache.org/)
 - [enfein/mieru](https://github.com/enfein/mieru)
