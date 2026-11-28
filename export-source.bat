@@ -219,7 +219,7 @@ REM  *.txt covers the whole class: chat/prompt/go_files scratch notes and,
 REM  critically, spoof_config.txt - a dump of live proxy links with real
 REM  passwords. None of it is build input for a Rust or Go sibling, so the
 REM  extension is skipped rather than the files being named one by one.
-robocopy "%ROOT%\%~1" "%SRC%\%~1" /E /XD target dist build bin obj source node_modules .vite .cache .vs .vscode .idea .git /XF *.exe *.dll *.sys *.pdb *.syso *.zip *.map *.log *.tmp *.txt config.json >nul
+robocopy "%ROOT%\%~1" "%SRC%\%~1" /E /XD target dist build bin obj source node_modules .vite .cache .vs .vscode .idea .git /XF *.exe *.dll *.sys *.pdb *.syso *.zip *.map *.log *.tmp *.txt config.json config.json.bak config.json.corrupt state.json updates.json >nul
 if errorlevel 8 (
     echo   [warn] %~1 copy had errors ^(robocopy !errorlevel!^)
 ) else (

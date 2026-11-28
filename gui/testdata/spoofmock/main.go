@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"sync/atomic"
 	"time"
 )
 
@@ -32,24 +33,30 @@ func main() {
 	// The stop channel, mirroring cli/src/main.rs: a Go parent on Windows
 	// cannot deliver any signal to its child except TerminateProcess, so
 	// SpoofManager.Stop writes "stop" here and the engine exits by itself.
+	var total atomic.Int64
+	var generation atomic.Uint64
 	go func() {
 		sc := bufio.NewScanner(os.Stdin)
 		for sc.Scan() {
-			if strings.TrimSpace(sc.Text()) == "stop" {
+			switch strings.TrimSpace(sc.Text()) {
+			case "stop":
 				fmt.Println(stopMarker)
 				os.Exit(0)
+			case "reset-stats":
+				generation.Add(1)
+				total.Store(0)
+				fmt.Println("[INFO] mock stats counters reset")
 			}
 		}
 	}()
 	tick := time.NewTicker(100 * time.Millisecond)
 	defer tick.Stop()
-	n := 0
 	for range tick.C {
-		n++
+		n := total.Add(1)
 		// methods mirrors core/src/stats.rs Ranked exactly: one row that has
 		// been timed (latency_ms a number) and one that has not (null), both
 		// carrying the score auto ranks on.
-		fmt.Printf("[STATS] {\"type\":\"stats\",\"active\":%d,\"total\":%d,\"success\":%d,\"failed\":0,\"uptime\":%.1f,\"success_rate\":1.0,\"best_endpoint\":\"\",\"best_method\":\"split_seq\",\"methods\":[{\"key\":\"split_seq\",\"ok\":%d,\"fail\":0,\"rate\":1.0,\"latency_ms\":42.5,\"score\":0.912},{\"key\":\"hello_split\",\"ok\":%d,\"fail\":0,\"rate\":1.0,\"latency_ms\":null,\"score\":0.8}],\"up_bytes\":0,\"down_bytes\":0}\n",
-			n%3, n, n, float64(n)/10.0, n, n)
+		fmt.Printf("[STATS] {\"type\":\"stats\",\"generation\":%d,\"active\":%d,\"total\":%d,\"success\":%d,\"failed\":0,\"uptime\":%.1f,\"success_rate\":1.0,\"best_endpoint\":\"\",\"best_method\":\"split_seq\",\"methods\":[{\"key\":\"split_seq\",\"ok\":%d,\"fail\":0,\"rate\":1.0,\"latency_ms\":42.5,\"score\":0.912},{\"key\":\"hello_split\",\"ok\":%d,\"fail\":0,\"rate\":1.0,\"latency_ms\":null,\"score\":0.8}],\"up_bytes\":0,\"down_bytes\":0}\n",
+			generation.Load(), n%3, n, n, float64(n)/10.0, n, n)
 	}
 }

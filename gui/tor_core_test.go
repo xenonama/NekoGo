@@ -10,14 +10,9 @@ import (
 
 // tor_core_test.go — Tor is its own engine, with its own binary.
 //
-// NekoGo has run Tor inside aether.exe (arti is linked into it) and
-// named the Updates row "Tor / Psiphon engine (aether)" — one row, two
-// protocols, one binary. The standalone Tor the Tor Project publishes is
-// a different program with its own file name, its own version number and
-// its own bridges, and the app could neither find it, run it nor install
-// it. These tests are the first half of separating them: the binary
-// resolves, says which version it is, and gets a row of its own while
-// Psiphon keeps the aether one.
+// NekoGo can run Tor inside aether.exe (arti is linked into it) or use
+// the standalone Tor binary. They remain separate runtime engines with
+// their own paths and versions; only Aether belongs in the Updates panel.
 
 // writeTorExe lays out a fake Tor install: [layout] picks where tor.exe
 // sits — flat beside the engines, in a tor\ subfolder, or inside a Tor
@@ -47,9 +42,8 @@ func writeTorExe(t *testing.T, dir, layout string) string {
 // binary it resolves to ("" clears the override so the settings and bin\
 // paths are walked instead) and the answer its version query gives.
 // Non-tor binaries are delegated to whatever query was installed before,
-// because aether and tor.exe are now reported by two rows of one panel
-// and a test that pins both must not have the second stub silence the
-// first.
+// because runtime diagnostics still report both engines and a test that
+// pins both must not have the second stub silence the first.
 func stubTorResolver(t *testing.T, exe, version string) {
 	t.Helper()
 	prevExe, prevDir, prevQuery := torExeOverride, torExeDirOverride, exeVersionQuery
@@ -193,31 +187,30 @@ func TestTorPathSurvivesASave(t *testing.T) {
 	}
 }
 
-// TestTorRowIsTheStandaloneBinaryAndPsiphonKeepsAether: the two protocols
-// get two rows. Before this, the row named "tor" answered with aether's
-// version, so a machine with real Tor installed looked exactly like one
-// with nothing, and Psiphon had no row to report its own engine from.
-func TestTorRowIsTheStandaloneBinaryAndPsiphonKeepsAether(t *testing.T) {
+// TestTorStaysOutOfUpdatesAndPsiphonKeepsAether: removing Tor from the
+// updater must not remove its runtime resolver, version diagnostics or
+// the Aether updater row.
+func TestTorStaysOutOfUpdatesAndPsiphonKeepsAether(t *testing.T) {
 	a := newUpdaterTestApp(t)
 	stubAetherResolver(t, "aether 2.3.0")
-	aetherDir := fakeAetherBin(t, false) // engine without pt\: Psiphon's problem to report
+	aetherDir := fakeAetherBin(t, false)
 	setAetherPath(t, a, filepath.Join(aetherDir, "aether.exe"))
-
-	// No Tor installed anywhere: the row says so instead of borrowing
-	// aether's answer.
+	setTorPath(t, a, filepath.Join(t.TempDir(), "absent", "tor.exe"))
 	stubTorResolver(t, "", "")
-	torRow := updatableRow(t, a, "tor")
-	if strings.Contains(strings.ToLower(torRow.Name), "aether") {
-		t.Errorf("the Tor row is named %q; Tor is not aether", torRow.Name)
+
+	rows, err := a.ListUpdatables()
+	if err != nil {
+		t.Fatal(err)
 	}
-	if torRow.Current != "" {
-		t.Errorf("Tor Current = %q with no tor.exe on disk", torRow.Current)
+	for _, row := range rows {
+		if row.ID == "tor" {
+			t.Fatal("Tor still has an Updates row")
+		}
 	}
-	if !strings.Contains(torRow.Notes, "Not installed") {
-		t.Errorf("Tor Notes = %q, want it to say Not installed", torRow.Notes)
+	if got := a.TorVersion(); got != "" {
+		t.Errorf("TorVersion = %q with no tor.exe on disk", got)
 	}
 
-	// The aether engine moves to its own row and keeps its version.
 	psRow := updatableRow(t, a, "psiphon")
 	if psRow.Current != "aether 2.3.0" {
 		t.Errorf("Psiphon Current = %q, want the aether engine's line", psRow.Current)
@@ -226,16 +219,13 @@ func TestTorRowIsTheStandaloneBinaryAndPsiphonKeepsAether(t *testing.T) {
 		t.Errorf("the aether row is named %q", psRow.Name)
 	}
 
-	// Tor installed: its own version, and nothing to fix.
 	dir := t.TempDir()
-	writeTorExe(t, dir, "flat")
-	stubTorResolver(t, filepath.Join(dir, "tor.exe"), "tor 0.4.8.16")
-	torRow = updatableRow(t, a, "tor")
-	if torRow.Current != "tor 0.4.8.16" {
-		t.Errorf("Tor Current = %q, want the binary's own version line", torRow.Current)
+	torPath := writeTorExe(t, dir, "flat")
+	setTorPath(t, a, torPath)
+	stubTorResolver(t, torPath, "tor 0.4.8.16")
+	if got := a.TorVersion(); got != "tor 0.4.8.16" {
+		t.Errorf("TorVersion = %q, want the standalone binary's line", got)
 	}
-
-	// The two rows never report the same binary.
 	if a.currentCorePath("tor") == a.currentCorePath("psiphon") {
 		t.Errorf("tor and psiphon resolve to the same file %q", a.currentCorePath("tor"))
 	}

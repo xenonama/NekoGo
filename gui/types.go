@@ -128,6 +128,10 @@ type Profile struct {
 	// replaced. Never persisted or exposed (json:"-").
 	AetherEnginePort int `json:"-"`
 
+	// SpoofEnginePort pins a throwaway probe's spoof listener without
+	// publishing it to the live connection. Never persisted or exposed.
+	SpoofEnginePort int `json:"-"`
+
 	// Last measured latency in ms (0 = never tested).
 	LastLatency int `json:"lastLatency,omitempty"`
 	// When LastLatency was measured (nil = never tested). Pointer so
@@ -530,8 +534,10 @@ type SNIConfig struct {
 	// "" or "B" = Plan B, the curated IP list is the endpoint pool
 	// (the historical behaviour); "A" = Plan A, the engine resolves
 	// each fake SNI itself (DoH) and dials that, so the IP list
-	// becomes a read-out of what Plan A derived.
-	Plan string `json:"plan,omitempty"`
+	// becomes a read-out of what Plan A derived. ManualIP disables
+	// that resolution and dials one user-supplied IPv4 instead.
+	Plan     string `json:"plan,omitempty"`
+	ManualIP string `json:"manualIp,omitempty"`
 }
 
 // SNIIP is one Cloudflare endpoint candidate in the SNI tab list.
@@ -610,7 +616,7 @@ const defaultConsoleLogLimit = 300
 
 func DefaultSettings() Settings {
 	return Settings{
-		Theme:          "light",
+		Theme:          "dark",
 		MixedPort:      2080,
 		TunEnabled:     false,
 		TunStack:       tunStackDefault,
@@ -633,7 +639,7 @@ func DefaultSettings() Settings {
 		WindowStyle:      "rounded",
 		SidebarLabels:    true,
 		AdvancedMode:     false,
-		SNIConfig:        SNIConfig{Method: "auto"},
+		SNIConfig:        SNIConfig{Method: "hello_split", Fingerprint: "legacy", QUICMode: "block", IPMode: "ipv4"},
 		// The SNI Spoofing tab is curated-list driven: fresh installs
 		// start with the TLS-verified Cloudflare IPs + decoy SNIs
 		// (sni_defaults.go) and a working pin, so Start works before

@@ -1230,7 +1230,10 @@ mod auto_state_tests {
         );
         assert_eq!(
             BypassMethod::Fragmented.into_strategy(),
-            Strategy::plain(BypassMethod::Fragmented)
+            Strategy {
+                decoy: BypassMethod::Fragmented,
+                split_real: true,
+            }
         );
         // `auto` never reaches the wire as a decoy shape.
         assert!(

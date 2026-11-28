@@ -3,7 +3,8 @@
 //! CLI surface (exact, no other flags):
 //!   sni-spoof.exe version        -> version on stdout, exit 0
 //!   sni-spoof.exe run -c <file>  -> load config, start engine, stdout logs, run until stopped
-//!                                 (a `stop` line on stdin, or an OS signal)
+//!                                 (a `stop` line on stdin, or an OS signal;
+//!                                  `reset-stats` clears counters without stopping)
 //!   sni-spoof.exe probe --host=<sni> [--ip=<ipv4>] [--port=443]
 //!                                 [--vector=whole,split,split_paced,lead5] [--reps=5]
 //!                                 [--profile=legacy|chrome|firefox] [--delay=20] [--timeout=3000]
@@ -149,31 +150,51 @@ fn usage_stderr() {
 /// `run()` and the stats thread. Plain static: one run per process.
 static STOP: AtomicBool = AtomicBool::new(false);
 
-/// The one word the host may write on our stdin to ask for a clean exit.
-/// Case- and whitespace-insensitive; anything else is ignored, because a
-/// stray byte must not tear down a working tunnel.
+/// Recognize the host's clean-exit command. Case- and whitespace-insensitive;
+/// unrelated lines must not tear down a working tunnel.
 fn is_stop_request(line: &str) -> bool {
     line.trim().eq_ignore_ascii_case("stop")
 }
 
-/// Read the stop request off stdin on its own thread.
+/// Recognize the host's stats-clear command with the same matching rules.
+fn is_reset_stats_request(line: &str) -> bool {
+    line.trim().eq_ignore_ascii_case("reset-stats")
+}
+
+/// Apply one stdin command. Returns true when the listener should exit.
+fn handle_stdin_line<W: std::io::Write>(line: &str, stats: &Stats, output: &mut W) -> bool {
+    if is_stop_request(line) {
+        STOP.store(true, Ordering::Relaxed);
+        true
+    } else if is_reset_stats_request(line) {
+        stats.reset();
+        let _ = writeln!(output, "[INFO] stats counters reset");
+        let _ = output.flush();
+        false
+    } else {
+        false
+    }
+}
+
+/// Read host commands off stdin on its own thread.
 ///
 /// This exists because NekoGo cannot signal us: Go's `os.Process.signal` on
 /// Windows answers EWINDOWS for every signal except Kill, so the console
 /// handler below only ever fires for a human at a terminal, and a parent
 /// `proc.Kill()` was the only stop the engine ever saw — with
 /// `EngineHandle::shutdown` and the "[WARN] engine stopped" line never
-/// running. EOF and read errors are ignored on purpose: an unclaimed stdin
-/// must never look like a shutdown order.
-fn spawn_stop_listener() {
+/// running. `reset-stats` clears the same shared counters without stopping.
+/// EOF and read errors are ignored on purpose: an unclaimed stdin must never
+/// look like a shutdown order.
+fn spawn_stop_listener(stats: Arc<Stats>) {
     let _ = std::thread::Builder::new()
         .name("stop-listener".into())
-        .spawn(|| {
+        .spawn(move || {
             for line in std::io::stdin().lines() {
                 match line {
                     Ok(l) => {
-                        if is_stop_request(&l) {
-                            STOP.store(true, Ordering::Relaxed);
+                        let mut output = std::io::stdout().lock();
+                        if handle_stdin_line(&l, &stats, &mut output) {
                             return;
                         }
                     }
@@ -323,7 +344,7 @@ fn run(config_path: &str) {
     out_line("[INFO]", "engine RUNNING");
     // Armed only after the engine is live, so a stdin that is already at EOF
     // when the process is exec'd can never cut a startup short.
-    spawn_stop_listener();
+    spawn_stop_listener(Arc::clone(&stats));
 
     // Stats line for the host (no RPC): `[STATS] {...}` every 5s.
     // Sleeps in 100ms slices so shutdown stays snappy (<100ms late).
@@ -372,7 +393,9 @@ fn run(config_path: &str) {
 
 #[cfg(test)]
 mod tests {
-    use super::is_stop_request;
+    use super::{handle_stdin_line, is_reset_stats_request, is_stop_request};
+    use sni_core::stats::Stats;
+    use std::sync::Arc;
 
     #[test]
     fn stop_request_accepts_the_hosts_word_only() {
@@ -386,5 +409,70 @@ mod tests {
         for no in ["", "\n", "stats", "stopp", "stop it", "unstop"] {
             assert!(!is_stop_request(no), "{no:?} must not be a stop request");
         }
+    }
+
+    #[test]
+    fn reset_stats_request_accepts_the_hosts_command_only() {
+        for ok in [
+            "reset-stats",
+            "reset-stats\n",
+            "reset-stats\r\n",
+            "  RESET-STATS  ",
+            "Reset-Stats",
+        ] {
+            assert!(is_reset_stats_request(ok), "{ok:?} must reset stats");
+        }
+        for no in [
+            "",
+            "\n",
+            "reset",
+            "stats",
+            "reset-stats-now",
+            "reset stats",
+            "please reset-stats",
+            "stop",
+        ] {
+            assert!(!is_reset_stats_request(no), "{no:?} must not reset stats");
+        }
+    }
+
+    #[test]
+    fn reset_stats_command_resets_shared_counters_and_logs() {
+        let stats = Arc::new(Stats::new());
+        stats.increment_active();
+        stats.increment_total();
+        stats.increment_success();
+        stats.increment_failed();
+        stats.add_traffic(123, 456);
+        stats.record_result("203.0.113.1:443", "example.com", true, "whole");
+
+        let listener_stats = Arc::clone(&stats);
+        let mut output = Vec::new();
+        assert!(!handle_stdin_line(
+            "unrelated\n",
+            &listener_stats,
+            &mut output
+        ));
+        assert!(output.is_empty());
+        assert_eq!(stats.snapshot().total, 1);
+
+        assert!(!handle_stdin_line(
+            " \tReSeT-StAtS \r\n",
+            &listener_stats,
+            &mut output
+        ));
+        let snapshot = stats.snapshot();
+        assert_eq!(snapshot.active, 0);
+        assert_eq!(snapshot.total, 0);
+        assert_eq!(snapshot.success, 0);
+        assert_eq!(snapshot.failed, 0);
+        assert_eq!(snapshot.success_rate, 0.0);
+        assert_eq!(snapshot.up_bytes, 0);
+        assert_eq!(snapshot.down_bytes, 0);
+        assert!(snapshot.methods.is_empty());
+        assert_eq!(
+            String::from_utf8(output).unwrap(),
+            "[INFO] stats counters reset\n"
+        );
     }
 }

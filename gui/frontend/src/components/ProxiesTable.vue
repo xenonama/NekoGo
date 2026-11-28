@@ -401,6 +401,16 @@ const busy = ref(false)
 const pendingConnect = ref(false)
 const connecting = computed(() => pendingConnect.value || connection.busy || connection.connectBusy)
 const msg = ref('')
+let msgTimer: number | undefined
+watch(msg, (value) => {
+  if (msgTimer !== undefined) window.clearTimeout(msgTimer)
+  msgTimer = undefined
+  if (!value) return
+  msgTimer = window.setTimeout(() => { msg.value = '' }, 3000)
+})
+onUnmounted(() => {
+  if (msgTimer !== undefined) window.clearTimeout(msgTimer)
+})
 // Throne-style Test All sweep state: bounded-concurrency workers with
 // live N/M progress + Cancel (see testAll/cancelTestAll).
 const testAllCancelled = ref(false)

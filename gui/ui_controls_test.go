@@ -10,6 +10,60 @@ import (
 	"testing"
 )
 
+func TestSNIPanelExposesManualPlanAAndStatsClear(t *testing.T) {
+	panel := withoutComments(readFrontendSrc(t, filepath.Join("components", "SNIPanel.vue")))
+	for _, want := range []string{
+		`v-model="draft.manualIp"`,
+		`@click="clearStats"`,
+		`backend.spoofClearStats()`,
+		`method: 'hello_split'`,
+		`String(cfg.manualIp ?? '')`,
+	} {
+		if !strings.Contains(panel, want) {
+			t.Errorf("SNI panel does not contain %q", want)
+		}
+	}
+}
+
+func TestSNIConfigSavesShareOneQueue(t *testing.T) {
+	panel := withoutComments(readFrontendSrc(t, filepath.Join("components", "SNIPanel.vue")))
+	for _, want := range []string{"let configSaveQueue: Promise<void>", "function queueConfigSave", "configSaveQueue = pending.then"} {
+		if !strings.Contains(panel, want) {
+			t.Errorf("SNI panel has no serialized config queue: missing %q", want)
+		}
+	}
+	for _, fn := range []string{"persistKnob", "applyPlan"} {
+		if !strings.Contains(fnBody(t, panel, fn), "queueConfigSave(") {
+			t.Errorf("SNI %s bypasses the config save queue", fn)
+		}
+	}
+	persist := fnBody(t, panel, "persistKnob")
+	if strings.Contains(persist, "plan: savedPlan.value") {
+		t.Error("a queued knob save captures the old plan and can undo a newer plan save")
+	}
+	if !strings.Contains(persist, "queueConfigSave({ [k]: wire }") {
+		t.Error("a knob save must merge only its own field onto the latest queued config")
+	}
+	if n := strings.Count(panel, "backend.spoofSetConfig("); n != 1 {
+		t.Errorf("SNI panel has %d direct spoofSetConfig calls, want one inside the queue", n)
+	}
+}
+
+func TestProxiesStatusMessagesAutoDismiss(t *testing.T) {
+	panel := withoutComments(readFrontendSrc(t, filepath.Join("components", "ProxiesTable.vue")))
+	for _, want := range []string{
+		"let msgTimer: number | undefined",
+		"watch(msg, (value) => {",
+		"window.clearTimeout(msgTimer)",
+		"msgTimer = window.setTimeout(() => { msg.value = '' }, 3000)",
+		"onUnmounted(() => {\n  if (msgTimer !== undefined) window.clearTimeout(msgTimer)\n})",
+	} {
+		if !strings.Contains(panel, want) {
+			t.Errorf("Proxies status message lifecycle is missing %q", want)
+		}
+	}
+}
+
 func TestAppLogosCannotBeDragged(t *testing.T) {
 	imgTag := regexp.MustCompile(`(?s)<img\b[^>]*>`)
 	found := 0
@@ -342,6 +396,31 @@ func TestSettingsActionsRollbackRejectedPersistence(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestModeSwitchUsesSettingsToggleStyle(t *testing.T) {
+	sidebar := readFrontendSrc(t, filepath.Join("components", "Sidebar.vue"))
+	if !strings.Contains(sidebar, `class="stg-toggle"`) || !strings.Contains(sidebar, `<span class="knob" />`) {
+		t.Error("Simple/Advanced switch does not reuse the Settings toggle and knob")
+	}
+	css := withoutComments(readFrontendSrc(t, filepath.Join("styles", "theme.css")))
+	track := cssRuleBody(t, css, ".stg-toggle")
+	for _, want := range []string{"display: inline-block", "box-sizing: border-box", "flex: 0 0 44px"} {
+		if !strings.Contains(track, want) {
+			t.Errorf("Settings toggle track does not declare %q; an inline sidebar span cannot size its track", want)
+		}
+	}
+	on := cssRuleBody(t, css, ".stg-toggle.on .knob")
+	if !strings.Contains(on, "left: calc(100% - 21px)") {
+		t.Error("enabled toggle knob is not anchored three pixels inside the track's right edge")
+	}
+}
+
+func TestFrontendDefaultThemeIsDark(t *testing.T) {
+	types := readFrontendSrc(t, filepath.Join("types", "index.ts"))
+	if !strings.Contains(types, "theme: 'dark'") {
+		t.Error("frontend defaults do not select dark mode")
 	}
 }
 

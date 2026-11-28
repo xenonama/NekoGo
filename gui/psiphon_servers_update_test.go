@@ -220,6 +220,55 @@ func TestPsiphonServersCheckOffersOnlyANewerList(t *testing.T) {
 	}
 }
 
+func TestPsiphonServersCheckFailureKeepsUpdateActionable(t *testing.T) {
+	_, key, _ := psiphonUpdateEnv(t)
+	saveUpdateBaseURL(t)
+
+	inUse := time.Date(2026, 9, 1, 12, 0, 0, 0, time.UTC)
+	oldPacked, _ := psiphonTestList(t, key, psiphonEntriesText(55))
+	writePsiphonActiveList(t, oldPacked, inUse)
+	newPacked, _ := psiphonTestList(t, key, psiphonEntriesText(70))
+	published := inUse.Add(24 * time.Hour)
+	src := newPsiphonListSource(t, newPacked, published)
+	src.setStatus(http.StatusServiceUnavailable)
+	updateBaseURL["psiphon-servers"] = src.srv.URL
+	a := newUpdaterTestApp(t)
+
+	rows, err := a.CheckUpdates([]string{"psiphon-servers"})
+	if err != nil {
+		t.Fatalf("CheckUpdates: %v", err)
+	}
+	for _, row := range rows {
+		if row.ID != "psiphon-servers" {
+			continue
+		}
+		if !row.CheckUnavailable || !row.UpdateAvail || row.LastError != "" {
+			t.Fatalf("check failure blocked the row: %+v", row)
+		}
+		if !strings.Contains(row.Notes, "still try Update") {
+			t.Fatalf("Notes = %q, want the non-blocking remedy", row.Notes)
+		}
+	}
+
+	src.setStatus(0)
+	row, err := a.UpdateComponent("psiphon-servers")
+	if err != nil {
+		t.Fatalf("UpdateComponent after failed check: %v", err)
+	}
+	if row.UpdateAvail || row.CheckUnavailable {
+		t.Fatalf("successful install left indeterminate state: %+v", row)
+	}
+	rows, err = a.ListUpdatables()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, row := range rows {
+		if row.ID == "psiphon-servers" && (row.CheckUnavailable || row.UpdateAvail || row.LastError != "") {
+			t.Fatalf("persisted row still blocks or reminds: %+v", row)
+		}
+	}
+}
+
 // The update asks for nothing older than the list in use, checks what
 // arrives, and records the publication time it came with.
 func TestPsiphonServersUpdateInstallsANewerSignedList(t *testing.T) {

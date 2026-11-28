@@ -11,28 +11,47 @@ REM    - gui\build\bin\nekobox_core.exe      (sing-box engine)
 REM    - gui\build\bin\sing-box.exe          (official CLI, optional)
 REM    - gui\build\bin\mihomo.exe            (Clash Meta core, optional)
 REM    - gui\build\bin\xray.exe              (Xray-core)
-REM    - dist\NekoGo-Portable-*.zip          (portable)
-REM    - dist\NekoGo-Setup-*.exe             (installer, needs NSIS)
+REM    - dist\NekoGo-Portable-*.zip          (portable - optional, chosen in the build menu)
+REM    - dist\NekoGo-Setup-*.exe             (installer - optional, needs NSIS)
 REM  A missing xray.exe / sing-box.exe / mihomo.exe / aether.exe is downloaded
 REM  from its official GitHub release (SHA256-checked when the release
 REM  publishes one) instead of failing / being skipped.
 REM ============================================================
 
+REM  Packaging is chosen before anything is built: a menu (Up/Down, Space,
+REM  Enter) asks whether to make the portable ZIP and the installer. To skip
+REM  the menu in scripts:
+REM    build.bat --yes             ZIP + installer, no menu
+REM    build.bat --zip             ZIP only
+REM    build.bat --installer       installer only
+REM    build.bat --all             ZIP + installer
+REM    build.bat --none            binaries only, nothing packaged
+REM    build.bat --no-zip          drop the ZIP from the default
+REM    build.bat --no-installer    drop the installer from the default
+REM    build.bat --dry-run         list the downloads, build nothing
+REM    build.bat --help            this list
+REM  The menu is also skipped when the CI variable is set or stdin is piped.
+
 REM ---------- Resolve root ----------
 REM Before the version read: VERSION lives next to this script, and a
 REM cwd-relative "if exist VERSION" silently falls back to the hardcoded
 REM tag when build.bat is invoked from anywhere else (wrong artifact names).
+REM %~f0 is the batch file only in the main flow: inside "call :label" %0 is
+REM the label, so the menu helper reads this copy instead.
+set "SELF=%~f0"
 set "ROOT=%~dp0"
 if "%ROOT:~-1%"=="\" set "ROOT=%ROOT:~0,-1%"
 
 REM ---------- Version ----------
-if exist "%ROOT%\VERSION" (
-    set /p APP_VERSION=<"%ROOT%\VERSION"
-) else (
-    set "APP_VERSION=5.11.28.3-fork.1"
+if not exist "%ROOT%\VERSION" (
+    echo [ERR] VERSION is missing - cannot build a correctly versioned release.
+    exit /b 1
 )
-REM An empty/trailing-newline-only VERSION leaves APP_VERSION undefined.
-if not defined APP_VERSION set "APP_VERSION=5.11.28.3-fork.1"
+set /p APP_VERSION=<"%ROOT%\VERSION"
+if not defined APP_VERSION (
+    echo [ERR] VERSION is empty - cannot build a correctly versioned release.
+    exit /b 1
+)
 REM NSIS VIProductVersion needs 4 plain numbers (1.0.0.0), not a tag.
 set "APP_VERSION_VI=1.0.0.0"
 for /f "tokens=1,2,3 delims=.-" %%a in ("%APP_VERSION%") do set "APP_VERSION_VI=%%a.%%b.%%c.0"
@@ -55,6 +74,54 @@ set "CORE_EXE=%ROOT%\gui\build\bin\nekobox_core.exe"
 set "XRAY_EXE=%ROOT%\gui\build\bin\xray.exe"
 set "XRAY_SRC=%ROOT%\xray"
 
+REM ---------- Command line ----------
+REM Defaults reproduce the old behaviour (package everything); any selection
+REM flag or --yes turns the menu off.
+set "WANT_ZIP=1"
+set "WANT_SETUP=1"
+set "ASK=1"
+set "DRY_RUN="
+set "SEL_EXPLICIT="
+
+:args_loop
+if "%~1"=="" goto :args_done
+set "ARG_OK="
+if /i "%~1"=="--dry-run"      ( set "DRY_RUN=1" & set "ARG_OK=1" )
+if /i "%~1"=="--yes"          ( set "ASK=" & set "ARG_OK=1" )
+if /i "%~1"=="-y"             ( set "ASK=" & set "ARG_OK=1" )
+if /i "%~1"=="--no-prompt"    ( set "ASK=" & set "ARG_OK=1" )
+if /i "%~1"=="--all"          ( set "WANT_ZIP=1" & set "WANT_SETUP=1" & set "ASK=" & set "ARG_OK=1" )
+if /i "%~1"=="--none"         ( set "WANT_ZIP=" & set "WANT_SETUP=" & set "ASK=" & set "ARG_OK=1" )
+if /i "%~1"=="--no-zip"       ( set "WANT_ZIP=" & set "ASK=" & set "ARG_OK=1" )
+if /i "%~1"=="--no-installer" ( set "WANT_SETUP=" & set "ASK=" & set "ARG_OK=1" )
+REM --zip / --installer name exactly what to build: the first one drops the
+REM other default, a second one adds back.
+if /i "%~1"=="--zip" (
+    if not defined SEL_EXPLICIT ( set "WANT_ZIP=" & set "WANT_SETUP=" & set "SEL_EXPLICIT=1" )
+    set "WANT_ZIP=1"
+    set "ASK="
+    set "ARG_OK=1"
+)
+if /i "%~1"=="--installer" (
+    if not defined SEL_EXPLICIT ( set "WANT_ZIP=" & set "WANT_SETUP=" & set "SEL_EXPLICIT=1" )
+    set "WANT_SETUP=1"
+    set "ASK="
+    set "ARG_OK=1"
+)
+if /i "%~1"=="--help" ( call :usage & exit /b 0 )
+if /i "%~1"=="-h"     ( call :usage & exit /b 0 )
+if /i "%~1"=="/?"     ( call :usage & exit /b 0 )
+if not defined ARG_OK (
+    echo   [ERR] unknown option: %~1
+    call :usage
+    exit /b 1
+)
+shift
+goto :args_loop
+:args_done
+REM Unattended runs (CI) never wait on a menu.
+if defined CI set "ASK="
+
 REM ---------- PATH ----------
 set "PATH=%USERPROFILE%\.cargo\bin;D:\mingw64\bin;%USERPROFILE%\go\bin;%PATH%"
 if exist "C:\mingw64\bin"          set "PATH=C:\mingw64\bin;%PATH%"
@@ -63,6 +130,11 @@ if exist "C:\Program Files\Go\bin" set "PATH=C:\Program Files\Go\bin;%PATH%"
 if exist "C:\Program Files (x86)\NSIS" set "PATH=C:\Program Files (x86)\NSIS;%PATH%"
 if exist "C:\Program Files\NSIS"       set "PATH=C:\Program Files\NSIS;%PATH%"
 if exist "%LOCALAPPDATA%\Programs\NSIS" set "PATH=%LOCALAPPDATA%\Programs\NSIS;%PATH%"
+
+REM ---------- NSIS probe ----------
+REM Needed before anything runs: the menu greys the installer out without it.
+set "NSIS_AVAILABLE="
+where makensis >nul 2>nul && set "NSIS_AVAILABLE=1"
 
 echo.
 echo ============================================================
@@ -74,7 +146,7 @@ echo.
 REM ---------- optional: --dry-run ----------
 REM Prints the release assets the build WOULD download when a binary
 REM is missing, then exits without touching anything.
-if /i "%~1"=="--dry-run" (
+if defined DRY_RUN (
     echo [dry-run] latest engine release assets this build would fetch:
     call :show_release XTLS/Xray-core "Xray-windows-64.zip"
     call :show_release SagerNet/sing-box "^sing-box-[0-9.]+-windows-amd64\.zip$"
@@ -83,6 +155,37 @@ if /i "%~1"=="--dry-run" (
     echo.
     exit /b 0
 )
+
+REM ---------- Build options ----------
+REM Asked before anything is compiled or downloaded.
+if defined ASK (
+    call :build_menu
+    if errorlevel 1 (
+        echo.
+        echo   Cancelled - nothing was built.
+        echo.
+        pause
+        exit /b 2
+    )
+)
+
+REM makensis is the installer's one hard requirement. Without it the
+REM installer is dropped here, loudly, instead of failing at STEP 8.
+set "SETUP_SKIP=not selected"
+if not defined NSIS_AVAILABLE (
+    set "SETUP_SKIP=makensis not found - install NSIS: https://nsis.sourceforge.io/Download"
+    if defined WANT_SETUP (
+        echo   [warn] installer requested but makensis was not found - setup.exe will not be built
+        set "WANT_SETUP="
+    )
+)
+set "SHOW_ZIP=no"
+if defined WANT_ZIP set "SHOW_ZIP=yes"
+set "SHOW_SETUP=no"
+if defined WANT_SETUP set "SHOW_SETUP=yes"
+echo   Packaging:  portable ZIP = !SHOW_ZIP!,  installer = !SHOW_SETUP!
+if not defined WANT_ZIP if not defined WANT_SETUP echo   Nothing to package - only gui\build\bin will be produced.
+echo.
 
 REM ---------- Toolchain check ----------
 echo [setup] checking toolchain...
@@ -94,14 +197,9 @@ where wails3 >nul 2>nul || (echo   [ERR] wails3 not found ^(go install github.co
 echo   [ok] wails3
 where gcc    >nul 2>nul || (echo   [warn] gcc not found - cgo builds may fail)
 
-set "NSIS_AVAILABLE="
-where makensis >nul 2>nul && set "NSIS_AVAILABLE=1"
-if defined NSIS_AVAILABLE (
-    echo   [ok] makensis
-) else (
-    echo   [skip] makensis not found - setup.exe will not be built
-    echo          Install NSIS: https://nsis.sourceforge.io/Download
-)
+REM NSIS was probed before the build menu; a missing makensis was already
+REM reported there, so only confirm it when the installer is selected.
+if defined WANT_SETUP echo   [ok] makensis
 
 REM ============================================================
 REM  STEP 1 - NekoBox core (sing-box engine, Go, no CMake)
@@ -346,9 +444,23 @@ REM ============================================================
 REM  STEP 7 - Copy runtime files + stage portable ZIP
 REM ============================================================
 echo.
-echo [7/9] Portable ZIP...
+if not defined WANT_ZIP if not defined WANT_SETUP (
+    echo [7/9] Portable ZIP...
+    echo   [skip] nothing to package - ZIP and installer were not selected
+    goto :step8
+)
+if defined WANT_ZIP (
+    echo [7/9] Portable ZIP...
+) else (
+    echo [7/9] Staging files for the installer...
+)
 
 if not exist "%DIST%" mkdir "%DIST%" >nul 2>nul
+copy /Y "%EXE%" "%DIST%\nekogo.exe" >nul 2>nul
+if errorlevel 1 (echo   [ERR] cannot publish dist\nekogo.exe ^(file is open or locked^). & goto :fail)
+call :same "%EXE%" "%DIST%\nekogo.exe"
+if errorlevel 1 goto :fail
+echo   [ok] nekogo.exe ^(portable self-update asset^)
 REM Stage into dist\portable when it can be wiped - and it is not always
 REM wipeable. A LOADED driver image stays open in the kernel even after the
 REM app that installed it has exited, and the windivert service here points
@@ -413,11 +525,9 @@ if exist "%BUILDBIN%\pt\" (
     robocopy "%BUILDBIN%\pt" "%PORTABLE_BIN%\pt" /E /NFL /NDL /NJH /NJS /NC /NS >nul 2>nul
     if errorlevel 8 (echo   [ERR] pt\ copy into the portable stage failed ^(robocopy !errorlevel!^) & goto :fail)
 )
-REM The standalone Tor the Tor row installs: tor.exe plus its own
-REM pluggable_transports\ and the NEKOGO-BUNDLE.txt the row compares
-REM against. Staged by hand or by the updater in build\bin\tor\ - either
-REM way it must survive into the zip, or a fresh copy loses the binary the
-REM user just downloaded.
+REM The standalone Tor runtime: tor.exe plus its own pluggable_transports\
+REM and NEKOGO-BUNDLE.txt. Tor has no updater row; preserve any files the
+REM user staged in build\bin\tor\ so packaging does not discard the runtime.
 if exist "%BUILDBIN%\tor\" (
     robocopy "%BUILDBIN%\tor" "%PORTABLE_BIN%\tor" /E /NFL /NDL /NJH /NJS /NC /NS >nul 2>nul
     if errorlevel 8 (echo   [ERR] tor\ copy into the portable stage failed ^(robocopy !errorlevel!^) & goto :fail)
@@ -509,6 +619,12 @@ REM README
 ) > "%PORTABLE_STAGE%\README.txt"
 
 set "ZIP_NAME=NekoGo-Portable-v%APP_VERSION%.zip"
+REM The installer is built from the staged folder, not from the ZIP, so
+REM everything above is needed either way; only the archive is optional.
+if not defined WANT_ZIP (
+    echo   [skip] portable ZIP not selected - files are staged for the installer only
+    goto :step8
+)
 if exist "%DIST%\%ZIP_NAME%" del "%DIST%\%ZIP_NAME%" >nul 2>nul
 
 set "ZIP_BUILT="
@@ -532,6 +648,7 @@ if errorlevel 1 (
 REM ============================================================
 REM  STEP 8 - Installer (setup.exe)
 REM ============================================================
+:step8
 echo.
 echo [8/9] Installer...
 set "SETUP_NAME=NekoGo-Setup-v%APP_VERSION%.exe"
@@ -539,9 +656,8 @@ set "SETUP_FINAL=%DIST%\%SETUP_NAME%"
 set "SETUP_TMP=%DIST%\NekoGo-Setup-v%APP_VERSION%-new.exe"
 set "NSIS_LOG=%DIST%\installer-build.log"
 
-if not defined NSIS_AVAILABLE (
-    echo   [skip] makensis not found - setup.exe was NOT rebuilt
-    echo          Install NSIS ^(https://nsis.sourceforge.io/Download^) and rebuild
+if not defined WANT_SETUP (
+    echo   [skip] installer: !SETUP_SKIP!
     goto :done
 )
 
@@ -603,7 +719,7 @@ echo ---------- build\bin ----------
 dir /b "%BUILDBIN%"
 echo.
 echo ---------- dist ----------
-dir /b "%DIST%"
+if exist "%DIST%" (dir /b "%DIST%") else (echo   no dist folder - nothing was packaged)
 echo.
 
 echo ============================================================
@@ -612,17 +728,23 @@ echo.
 echo   Dev run:    %EXE%
 if defined ZIP_BUILT (
     echo   Portable:   %DIST%\%ZIP_NAME%
-) else (
+) else if defined WANT_ZIP (
     echo   Portable:   NOT BUILT - see [7/9] above
+) else (
+    echo   Portable:   skipped - not selected
 )
 if defined SETUP_BUILT (
     echo   Installer:  %SETUP_FINAL%
-) else (
+) else if defined WANT_SETUP (
     echo   Installer:  NOT BUILT - see [8/9] above
+) else (
+    echo   Installer:  skipped - !SETUP_SKIP!
 )
 echo ============================================================
 echo.
 
+REM Nothing was packaged: there is no dist folder worth opening.
+if not defined ZIP_BUILT if not defined SETUP_BUILT goto :end
 choice /C YN /M "Open dist folder now"
 if errorlevel 2 goto :end
 explorer "%DIST%"
@@ -775,3 +897,193 @@ echo.
 pause
 exit /b 1
 
+REM ---------- helper: usage ----------
+:usage
+echo.
+echo   build.bat [options]
+echo.
+echo   With no options a menu opens first and asks what to package.
+echo.
+echo     --yes, -y        no menu: build the ZIP and the installer
+echo     --zip            build the portable ZIP only
+echo     --installer      build the installer only
+echo     --all            build both
+echo     --none           build the binaries only, package nothing
+echo     --no-zip         default minus the portable ZIP
+echo     --no-installer   default minus the installer
+echo     --dry-run        list the engine downloads and exit
+echo     --help, -h, /?   this text
+echo.
+echo   --zip and --installer can be combined. The menu is skipped when CI is
+echo   set in the environment.
+echo.
+exit /b 0
+
+REM ---------- helper: build menu (TUI) ----------
+REM Runs the PowerShell menu stored at the end of this file and copies its
+REM answer into WANT_ZIP / WANT_SETUP. Returns errorlevel 1 when the user
+REM cancelled, 0 otherwise. PowerShell exit codes: 100 + mask (1 = ZIP,
+REM 2 = installer), 190 = cancelled, 191 = no interactive console (keep the
+REM defaults), anything else = menu could not run (plain Y/N prompts).
+:build_menu
+set "NG_SELF=%SELF%"
+set "NG_VER=%APP_VERSION%"
+set "NG_ZIP=0"
+if defined WANT_ZIP set "NG_ZIP=1"
+set "NG_SETUP=0"
+if defined WANT_SETUP set "NG_SETUP=1"
+set "NG_NSIS=0"
+if defined NSIS_AVAILABLE set "NG_NSIS=1"
+powershell -NoProfile -ExecutionPolicy Bypass -Command "$t = [IO.File]::ReadAllText($env:NG_SELF); $m = [regex]::Match($t, '(?s)\n#MENU-BEGIN\r?\n(.*?)\n#MENU-END'); if (-not $m.Success) { exit 1 }; & ([scriptblock]::Create($m.Groups[1].Value))"
+set "MENU_RC=!errorlevel!"
+if "!MENU_RC!"=="190" exit /b 1
+if "!MENU_RC!"=="191" exit /b 0
+if !MENU_RC! GEQ 100 if !MENU_RC! LEQ 103 (
+    set /a "MENU_MASK=MENU_RC-100"
+    set "WANT_ZIP="
+    set "WANT_SETUP="
+    set /a "MENU_Z=MENU_MASK & 1"
+    set /a "MENU_S=(MENU_MASK >> 1) & 1"
+    if !MENU_Z!==1 set "WANT_ZIP=1"
+    if !MENU_S!==1 set "WANT_SETUP=1"
+    exit /b 0
+)
+echo   [warn] menu unavailable - PowerShell returned !MENU_RC! - using plain prompts
+call :ask_yn "Build the portable ZIP" WANT_ZIP
+if defined NSIS_AVAILABLE call :ask_yn "Build the installer - setup.exe" WANT_SETUP
+exit /b 0
+
+REM ---------- helper: Y/N prompt ----------
+REM call :ask_yn "question" VARNAME   (sets VARNAME=1 on Y, empties it on N)
+:ask_yn
+choice /C YN /M %1
+if errorlevel 2 (
+    set "%~2="
+) else (
+    set "%~2=1"
+)
+exit /b 0
+
+REM ============================================================
+REM  Build menu source (PowerShell). Never executed by cmd: the code above
+REM  always ends in exit /b before reaching this point. :build_menu copies
+REM  the lines between the BEGIN and END marker out of this file and runs
+REM  them. Keep this block ASCII, and never start a line with a colon,
+REM  because cmd scans every line start for labels.
+REM ============================================================
+#MENU-BEGIN
+# In : env NG_ZIP, NG_SETUP (1 = preselected), NG_NSIS (1 = makensis found), NG_VER
+# Out: exit code 100 + mask (1 = ZIP, 2 = installer), 190 = cancelled,
+#      191 = no interactive console, 192 = menu could not run
+$ErrorActionPreference = 'Stop'
+$code = 192
+$cursorWas = $true
+$ctrlCWas = $false
+try {
+    if ([Console]::IsInputRedirected -or [Console]::IsOutputRedirected) {
+        $code = 191
+    } elseif ([Console]::WindowHeight -lt 16) {
+        $code = 192
+    } else {
+        $w = [Math]::Min(64, [Console]::WindowWidth - 1)
+        $ver = $env:NG_VER
+        $nsisOk = ($env:NG_NSIS -eq '1')
+        $items = @(
+            @{ On = ($env:NG_ZIP -eq '1'); Ok = $true; Name = 'Portable ZIP'; Path = ('dist\NekoGo-Portable-v' + $ver + '.zip') },
+            @{ On = (($env:NG_SETUP -eq '1') -and $nsisOk); Ok = $nsisOk; Name = 'Installer (setup.exe)'; Path = ('dist\NekoGo-Setup-v' + $ver + '.exe') }
+        )
+
+        function Pad([string]$s) {
+            if ($s.Length -gt $w) { $s = $s.Substring(0, $w) }
+            return $s.PadRight($w)
+        }
+        function Row([string]$s, $fg) {
+            if ($fg) { Write-Host (Pad $s) -ForegroundColor $fg } else { Write-Host (Pad $s) }
+        }
+        function Toggle([int]$i) {
+            if ($items[$i].Ok) { $items[$i].On = -not $items[$i].On }
+        }
+        function Draw {
+            $bar = '+' + ('-' * ($w - 2)) + '+'
+            Row $bar 'DarkCyan'
+            Row ('  NekoGo build   v' + $ver) 'White'
+            Row $bar 'DarkCyan'
+            Row '  Pick what to package once the binaries are built:' $null
+            Row '' $null
+            for ($i = 0; $i -lt $items.Count; $i++) {
+                $it = $items[$i]
+                $ptr = if ($i -eq $sel) { '>' } else { ' ' }
+                if ($it.Ok) {
+                    $mark = if ($it.On) { '[x]' } else { '[ ]' }
+                    $fg = if ($i -eq $sel) { 'Cyan' } else { 'Gray' }
+                    Row ('  ' + $ptr + ' ' + $mark + ' ' + $it.Name) $fg
+                    Row ('        ' + $it.Path) 'DarkGray'
+                } else {
+                    Row ('  ' + $ptr + ' [-] ' + $it.Name) 'DarkGray'
+                    Row '        unavailable: makensis (NSIS) was not found' 'DarkGray'
+                }
+            }
+            Row '' $null
+            $n = @($items | Where-Object { $_.On }).Count
+            if ($n -eq 0) { Row '  Nothing selected: only gui\build\bin will be produced.' 'Yellow' } else { Row '' $null }
+            Row '  Up/Down move   Space toggle   A all   N none' 'Gray'
+            Row '  Enter start the build   Esc cancel' 'Gray'
+            Row $bar 'DarkCyan'
+        }
+
+        $ctrlCWas = [Console]::TreatControlCAsInput
+        [Console]::TreatControlCAsInput = $true
+        try { $cursorWas = [Console]::CursorVisible; [Console]::CursorVisible = $false } catch { }
+
+        $height = 14
+        $sel = 0
+        Draw
+        $top = [Math]::Max(0, [Console]::CursorTop - $height)
+        $result = ''
+        while ($result -eq '') {
+            $k = [Console]::ReadKey($true)
+            $name = $k.Key.ToString()
+            $ctrl = ((([int]$k.Modifiers) -band 4) -ne 0)
+            if ($ctrl -and $name -eq 'C') {
+                $result = 'cancel'
+            } else {
+                switch ($name) {
+                    'UpArrow'   { $sel = ($sel + $items.Count - 1) % $items.Count }
+                    'DownArrow' { $sel = ($sel + 1) % $items.Count }
+                    'Spacebar'  { Toggle $sel }
+                    'D1'        { $sel = 0; Toggle 0 }
+                    'NumPad1'   { $sel = 0; Toggle 0 }
+                    'Z'         { $sel = 0; Toggle 0 }
+                    'D2'        { $sel = 1; Toggle 1 }
+                    'NumPad2'   { $sel = 1; Toggle 1 }
+                    'I'         { $sel = 1; Toggle 1 }
+                    'A'         { foreach ($it in $items) { if ($it.Ok) { $it.On = $true } } }
+                    'N'         { foreach ($it in $items) { $it.On = $false } }
+                    'Enter'     { $result = 'go' }
+                    'Escape'    { $result = 'cancel' }
+                    'Q'         { $result = 'cancel' }
+                }
+            }
+            if ($result -eq 'go') { $sel = -1 }
+            if ($result -ne 'cancel') {
+                [Console]::SetCursorPosition(0, $top)
+                Draw
+            }
+        }
+        if ($result -eq 'go') {
+            $mask = 0
+            if ($items[0].On) { $mask += 1 }
+            if ($items[1].On) { $mask += 2 }
+            $code = 100 + $mask
+        } else {
+            $code = 190
+        }
+    }
+} catch {
+    $code = 192
+} finally {
+    try { [Console]::CursorVisible = $cursorWas } catch { }
+    try { [Console]::TreatControlCAsInput = $ctrlCWas } catch { }
+}
+exit $code
+#MENU-END

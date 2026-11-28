@@ -311,12 +311,15 @@ func TestConfigStoreRoundtrip(t *testing.T) {
 	if len(c2.ListProfiles()) != 1 {
 		t.Fatal("profile not persisted")
 	}
-	// Latency fields must round-trip through config.json.
+	// Latency fields must round-trip through the runtime sidecar.
 	persisted, _ := c2.GetProfile("p1")
 	persisted.LastLatency = 87
 	stamp := time.Date(2026, 9, 28, 12, 0, 0, 0, time.UTC)
 	persisted.LastTestedAt = &stamp
 	if _, err := c2.SaveProfile(persisted); err != nil {
+		t.Fatal(err)
+	}
+	if err := c2.Flush(); err != nil {
 		t.Fatal(err)
 	}
 	c3, err := NewConfigStore(dir)

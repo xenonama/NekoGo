@@ -931,6 +931,7 @@ input.nb-field:not([type="checkbox"]):not([type="radio"]):focus {
 .stg-ctl > .nb-pick > .nb-pick-btn,
 .stg-ctl > input { min-width: 0; max-width: 100%; }
 .stg-toggle {
+  display: inline-block; box-sizing: border-box; flex: 0 0 44px;
   width: 44px; height: 24px; min-height: 24px; padding: 0;
   border-radius: 999px; border: none; background: var(--tgl-off);
   position: relative;
@@ -942,7 +943,7 @@ input.nb-field:not([type="checkbox"]):not([type="radio"]):focus {
   transition: left 0.15s ease;
 }
 .stg-toggle.on { background: var(--tab-active); }
-.stg-toggle.on .knob { left: 23px; }
+.stg-toggle.on .knob { left: calc(100% - 21px); }
 /* Icon buttons inside the Settings tab (none currently rendered;
    kept consistent so future ones match the 10px control scale). */
 .stg .nb-icon-btn {
@@ -1096,9 +1097,15 @@ input.nb-field:not([type="checkbox"]):not([type="radio"]):focus {
 /* ---------- Updates panel (manual component updates) ---------- */
 .upd { display: flex; flex-direction: column; }
 .upd-top { display: flex; gap: 12px; align-items: center; margin-bottom: 12px; flex-wrap: wrap; }
-.upd-card { margin-bottom: 12px; }
+.upd-proxy {
+  display: flex; align-items: center; justify-content: space-between;
+  gap: 16px; margin-bottom: 8px; padding: 12px 14px;
+}
+.upd-proxy-copy { display: flex; flex-direction: column; gap: 3px; min-width: 0; }
+.upd-selection-hint { font-size: 12px; margin: 0 0 12px; }
+.upd-card { margin-bottom: 12px; min-width: 0; }
 .upd-card:last-child { margin-bottom: 0; }
-.upd-head { display: flex; gap: 12px; align-items: center; }
+.upd-head { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
 .upd-name { font-size: 15px; font-weight: 600; color: var(--fg); }
 .upd-pill {
   font-size: 12px; color: var(--muted); background: var(--accent-soft);
@@ -1106,10 +1113,22 @@ input.nb-field:not([type="checkbox"]):not([type="radio"]):focus {
   overflow: hidden; text-overflow: ellipsis; max-width: 280px;
 }
 .upd-sub { font-size: 13px; color: var(--muted); margin-top: 6px; }
+.upd-found {
+  margin-left: auto; padding: 2px 9px; border-radius: 9999px;
+  background: var(--accent-soft); color: var(--accent2);
+  font-size: 12px; font-weight: 600; white-space: nowrap;
+}
+.upd-reminder { display: flex; align-items: center; gap: 6px; color: var(--accent2); }
+.upd-check-control { display: inline-flex; align-items: center; gap: 8px; font-size: 12px; }
+.upd-check-toggle { flex: 0 0 44px; vertical-align: middle; cursor: pointer; }
+.upd-proxy .stg-toggle:disabled,
+.upd-check-toggle:disabled { opacity: 0.55; cursor: default; }
+.upd-progress-copy { display: flex; justify-content: space-between; gap: 12px; color: var(--fg); }
+.upd-progress { width: 100%; height: 7px; margin-top: 6px; accent-color: var(--accent); }
 .upd-avail { color: var(--accent2); font-weight: 600; }
 .upd-ok { color: var(--accent2); font-weight: 600; }
 .upd-err { color: var(--danger); }
-.upd-actions { display: flex; gap: 8px; align-items: center; margin-top: 10px; }
+.upd-actions { display: flex; gap: 8px; align-items: center; margin-top: 10px; flex-wrap: wrap; }
 
 /* ---------- Phase H: distributed advanced tools ---------- */
 .nb-traffic-chart, .nb-inspector { margin-top: 12px; }
@@ -1346,22 +1365,9 @@ input.nb-field:not([type="checkbox"]):not([type="radio"]):focus {
    Height comes from .nb-root, which also holds the title bar. */
 .nb-simple { display: flex; flex-direction: column; flex: 1; min-height: 0; overflow: hidden; }
 .nb-simple > .nb-shell { height: auto; flex: 1; min-height: 0; }
-/* Shared mode switch: token track, token knob. */
-.adv-switch:focus-visible {
+.nb-side-advrow:focus-visible {
   outline: 2px solid var(--accent); outline-offset: -2px;
 }
-.adv-switch {
-  width: 32px; height: 18px; min-height: 18px; padding: 2px;
-  border: none; border-radius: 9999px; background: var(--tgl-off);
-  display: inline-flex; align-items: center; cursor: pointer;
-}
-.adv-switch::after {
-  content: ""; width: 14px; height: 14px; border-radius: 9999px;
-  background: var(--card); border: 1px solid var(--border);
-  transition: transform 120ms ease-out;
-}
-.adv-switch.on { background: var(--accent); }
-.adv-switch.on::after { transform: translateX(14px); border-color: transparent; }
 /* Technical values render monospace with aligned numerals. */
 .nb-mono { font-family: ui-monospace, Consolas, monospace; font-size: 12px; font-variant-numeric: tabular-nums; }
 
@@ -1374,9 +1380,6 @@ input.nb-field:not([type="checkbox"]):not([type="radio"]):focus {
   transition: background 120ms ease-out, border-color 120ms ease-out;
 }
 .nb-side-advrow:hover { border-color: var(--border); }
-.nb-side-advrow .adv-switch {
-  box-shadow: inset 0 0 0 1px var(--border);
-}
 .nb-card, .stg-card {
   transition: box-shadow 150ms ease-out, border-color 150ms ease-out;
 }
@@ -1469,6 +1472,9 @@ input.nb-field:not([type="checkbox"]):not([type="radio"]):focus {
   font-size: 13px; font-weight: 600; cursor: pointer;
 }
 .sni-chain-row input { margin: 0; }
+.sni-manual-grid { margin-top: 14px; align-items: center; }
+.sni-manual-error { grid-column: 2; font-size: 12px; }
+.sni-stats-toolbar { margin: 8px 0 14px; }
 .sni-stat-grid {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));

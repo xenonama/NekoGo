@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
 	"net/url"
 	"os/exec"
 	"runtime"
@@ -16,14 +17,9 @@ import (
 	"github.com/wailsapp/wails/v3/pkg/application"
 )
 
-// appVersion is overridden at link time:
-// go build -ldflags="-X main.appVersion=1.2.3"
-// Keep the default in step with the VERSION file so a plain `go build`
-// (wails3 task, `go run`) still reports a real version to the updater.
-// TestAppVersionMatchesVERSIONFile fails the build when the two drift: a
-// "-dev" suffix here made the UI claim a prerelease no release ever had,
-// and the updater order it against the published tag as a different build.
-var appVersion = "1.0.0-beta.4"
+// appVersion is overridden at link time by build.bat. Unstamped development
+// builds resolve the repository's VERSION file through appVersionValue.
+var appVersion string
 
 // App is the Wails bound service. Every public method is callable from the
 // Vue frontend.
@@ -34,11 +30,24 @@ var appVersion = "1.0.0-beta.4"
 // Go runtime wiring (it takes a non-serializable *application.App and is
 // Go-only in practice). The next audit should not flag them as dead.
 type App struct {
-	mu      sync.Mutex
-	store   *ConfigStore
-	cores   *CoreManager
-	singbox *SingBoxManager
-	xray    *XrayManager
+	mu    sync.Mutex
+	store *ConfigStore
+	// updaterMu guards the last check, byte progress and durable notices.
+	// The small updates.json cache is independent of the large config file.
+	updaterOpMu         sync.Mutex
+	updaterMu           sync.Mutex
+	updaterLoaded       bool
+	updaterRows         map[string]updaterRowState
+	updaterBytes        map[string][2]int64
+	updaterRunning      map[string]bool
+	updaterProxyEnabled bool
+	updaterContexts     map[string]context.Context
+	updaterCancels      map[string]context.CancelFunc
+	updaterHTTPOnce     sync.Once
+	updaterHTTPClient   *http.Client
+	cores               *CoreManager
+	singbox             *SingBoxManager
+	xray                *XrayManager
 	// spoofMgr owns the sni-spoof.exe child process (CoreSpoof).
 	// Wired into cores via SetSpoofManager; the SNI tab drives it
 	// directly through the Spoof* bound methods below.
@@ -105,7 +114,11 @@ type App struct {
 	// after the user cancelled it.
 	connMu    sync.Mutex
 	connBusy  bool
+	connID    string
 	connEpoch uint64
+	// coreApply blocks new public connects while an updater replaces a
+	// core image. The updater's reconnect uses the internal connect path.
+	coreApply bool
 	// importMu guards importBusy: at most one link/subscription import
 	// runs at a time. Each one builds its "already have this node" set
 	// BEFORE the network fetch and SaveProfile matches by id only, so two
@@ -371,15 +384,28 @@ func (a *App) refreshTray() {
 // click) must be refused, not run in parallel: both Starts bump the
 // CoreManager epoch and the loser's abort path tears down whatever is
 // current — including the winner's freshly started core.
-func (a *App) tryBeginConnect() (uint64, bool) {
+func (a *App) tryBeginConnect(id string, updating bool) (uint64, bool) {
 	a.connMu.Lock()
 	defer a.connMu.Unlock()
-	if a.connBusy {
+	if a.connBusy || (a.coreApply && !updating) {
 		return 0, false
 	}
 	a.connBusy = true
+	a.connID = id
 	a.connEpoch++
 	return a.connEpoch, true
+}
+
+func (a *App) beginCoreApply() {
+	a.connMu.Lock()
+	a.coreApply = true
+	a.connMu.Unlock()
+}
+
+func (a *App) endCoreApply() {
+	a.connMu.Lock()
+	a.coreApply = false
+	a.connMu.Unlock()
 }
 
 func (a *App) connectCurrent(epoch uint64) bool {
@@ -422,8 +448,19 @@ func (a *App) setConnectBusy(b bool) uint64 {
 	a.connBusy = b
 	if b {
 		a.connEpoch++
+	} else {
+		a.connID = ""
 	}
 	return a.connEpoch
+}
+
+func (a *App) connectingProfile() string {
+	a.connMu.Lock()
+	defer a.connMu.Unlock()
+	if !a.connBusy {
+		return ""
+	}
+	return a.connID
 }
 
 // IsConnectBusy reports whether a Connect (user, tray, or auto-connect)
@@ -801,14 +838,21 @@ func (a *App) SaveSettings(s Settings) error {
 // competing actions; a racing Disconnect aborts the probe via the
 // CoreManager epoch instead of deadlocking behind it.
 func (a *App) Connect(id string) (retErr error) {
+	return a.connect(id, false)
+}
+
+func (a *App) connect(id string, updating bool) (retErr error) {
 	settings := a.store.GetSettings()
 	activeAtStart := settings.ActiveProfileID
 	// One Connect at a time. A second one used to run a parallel Start:
 	// both bump the CoreManager epoch, and the loser's abort path then
 	// stopped whatever was current — including the winner's fresh core,
 	// leaving the UI "connected" with nothing running.
-	epoch, claimed := a.tryBeginConnect()
+	epoch, claimed := a.tryBeginConnect(id, updating)
 	if !claimed {
+		if updating {
+			return fmt.Errorf("a connect is already in progress")
+		}
 		a.emitLog("gui", "warn", "Connect: another connect is already in progress")
 		return fmt.Errorf("a connect is already in progress")
 	}
@@ -1301,6 +1345,16 @@ func (a *App) SpoofGetStats() (*SpoofStats, error) {
 	return a.spoofMgr.GetStats()
 }
 
+func (a *App) SpoofClearStats() (*SpoofStats, error) {
+	if a.spoofMgr == nil {
+		return nil, fmt.Errorf("sni-spoof manager not wired")
+	}
+	if err := a.spoofMgr.ResetStats(); err != nil {
+		return nil, err
+	}
+	return a.spoofMgr.GetStats()
+}
+
 // SpoofGetConfig returns the stored engine options.
 func (a *App) SpoofGetConfig() (SNIConfig, error) {
 	return a.store.GetSettings().SNIConfig, nil
@@ -1332,8 +1386,8 @@ var (
 // rewritten to the engine default instead of rejected, because they
 // arrive from a settings file written before the deletion.
 var retiredSpoofMethods = map[string]string{
-	"delayed_retry": "auto",
-	"double_sni":    "auto",
+	"delayed_retry": "hello_split",
+	"double_sni":    "hello_split",
 }
 
 // retiredSpoofFPS folds the pre-v3 versioned spellings onto the names the
@@ -1366,9 +1420,8 @@ func spoofEnumOk(v string, valid []string) bool {
 }
 
 // SpoofSetConfig validates and persists the engine options. Empty
-// values mean "engine default" and are omitted from the generated
-// config — except Method, which migrates to "auto" (the engine
-// default) so a fresh tab never renders a blank method.
+// values select the engine's current defaults; other zero values are
+// omitted from the generated config.
 func (a *App) SpoofSetConfig(cfg SNIConfig) error {
 	cfg.Method = strings.ToLower(strings.TrimSpace(cfg.Method))
 	cfg.Fingerprint = strings.ToLower(strings.TrimSpace(cfg.Fingerprint))
@@ -1394,9 +1447,24 @@ func (a *App) SpoofSetConfig(cfg SNIConfig) error {
 	if !spoofEnumOk(cfg.Plan, validSpoofPlans) {
 		return fmt.Errorf(`plan must be "A" (resolve the SNI over DoH) or "B" (use the IP list)`)
 	}
+	defaults := DefaultSettings().SNIConfig
 	if cfg.Method == "" {
-		cfg.Method = "auto"
+		cfg.Method = defaults.Method
 	}
+	if cfg.Fingerprint == "" {
+		cfg.Fingerprint = defaults.Fingerprint
+	}
+	if cfg.QUICMode == "" {
+		cfg.QUICMode = defaults.QUICMode
+	}
+	if cfg.IPMode == "" {
+		cfg.IPMode = defaults.IPMode
+	}
+	manualIP, err := normalizeManualSpoofIP(cfg.ManualIP)
+	if err != nil {
+		return err
+	}
+	cfg.ManualIP = manualIP
 	if !spoofEnumOk(cfg.Method, validSpoofMethods) {
 		return fmt.Errorf("method must be one of %s", strings.Join(validSpoofMethods, ", "))
 	}
@@ -1840,7 +1908,7 @@ func (a *App) PreviewLinks(text string) (*LinkImportResult, error) {
 // was saved, listed in Proxies, and only failed at Connect with a message
 // about a field the user never saw. Validate the same way the profile
 // editor does and let the caller count the rejection as invalid.
-func (a *App) saveImportedProfile(p Profile) (Profile, error) {
+func (a *App) prepareImportedProfile(p Profile) (Profile, error) {
 	if p.Protocol == "aether" && strings.TrimSpace(p.RawOutbound) == "" {
 		if err := normalizeAether(&p); err != nil {
 			return Profile{}, err
@@ -1849,7 +1917,38 @@ func (a *App) saveImportedProfile(p Profile) (Profile, error) {
 	if err := validateProfileForSave(p); err != nil {
 		return Profile{}, err
 	}
-	return a.store.SaveProfile(p)
+	return p, nil
+}
+
+func (a *App) saveImportedProfiles(candidates []Profile, known map[string]bool) ([]Profile, int, bool) {
+	pending := make([]Profile, 0, len(candidates))
+	invalid := 0
+	failed := false
+	for _, p := range candidates {
+		if known[dedupeKey(&p)] {
+			continue
+		}
+		prepared, err := a.prepareImportedProfile(p)
+		if err != nil {
+			invalid++
+			failed = true
+			continue
+		}
+		key := dedupeKey(&prepared)
+		if known[key] {
+			continue
+		}
+		known[key] = true
+		pending = append(pending, prepared)
+	}
+	if len(pending) == 0 {
+		return nil, invalid, failed
+	}
+	saved, err := a.store.SaveProfiles(pending)
+	if err != nil {
+		return nil, invalid + len(pending), true
+	}
+	return saved, invalid, false
 }
 
 // ImportLinks parses pasted text, records subscription URLs, and saves all
@@ -1864,7 +1963,7 @@ func (a *App) ImportLinks(text string) (*LinkImportResult, error) {
 	for _, e := range a.store.ListProfiles() {
 		known[dedupeKey(&e)] = true
 	}
-	var out []Profile
+	var candidates []Profile
 	invalid := 0
 	for _, ln := range direct {
 		p, err := parseOneLink(ln)
@@ -1872,16 +1971,7 @@ func (a *App) ImportLinks(text string) (*LinkImportResult, error) {
 			invalid++
 			continue
 		}
-		if known[dedupeKey(p)] {
-			continue
-		}
-		saved, err := a.saveImportedProfile(*p)
-		if err != nil {
-			invalid++
-			continue
-		}
-		known[dedupeKey(&saved)] = true
-		out = append(out, saved)
+		candidates = append(candidates, *p)
 	}
 	for _, su := range subs {
 		added, bad, err := a.importSubscription(su)
@@ -1890,19 +1980,10 @@ func (a *App) ImportLinks(text string) (*LinkImportResult, error) {
 			continue
 		}
 		invalid += bad
-		for _, p := range added {
-			if known[dedupeKey(&p)] {
-				continue
-			}
-			saved, err := a.saveImportedProfile(p)
-			if err != nil {
-				invalid++
-				continue
-			}
-			known[dedupeKey(&saved)] = true
-			out = append(out, saved)
-		}
+		candidates = append(candidates, added...)
 	}
+	out, bad, _ := a.saveImportedProfiles(candidates, known)
+	invalid += bad
 	a.emitLog("gui", "info", fmt.Sprintf("Import: %d new profiles, %d invalid", len(out), invalid))
 	if len(out) > 0 && a.store.GetSettings().GeoIPAutoDetect {
 		a.launchCountryRefresh("import")
@@ -1994,7 +2075,7 @@ func (a *App) UpdateSubscriptions() (*LinkImportResult, error) {
 	for _, e := range a.store.ListProfiles() {
 		known[dedupeKey(&e)] = true
 	}
-	var out []Profile
+	var candidates []Profile
 	invalid := 0
 	for _, sub := range subs {
 		if !sub.IsEnabled() {
@@ -2014,21 +2095,14 @@ func (a *App) UpdateSubscriptions() (*LinkImportResult, error) {
 			}
 			p.Group = sub.Name
 			p.SubURL = sub.URL
-			if known[dedupeKey(p)] {
-				continue
-			}
-			saved, err := a.saveImportedProfile(*p)
-			if err != nil {
-				invalid++
-				continue
-			}
-			known[dedupeKey(&saved)] = true
-			out = append(out, saved)
+			candidates = append(candidates, *p)
 		}
 		if _, err := a.store.TouchSubscription(sub.URL, time.Now().Format(time.RFC3339), info); err != nil {
 			a.emitLog("gui", "error", fmt.Sprintf("save settings: %v", err))
 		}
 	}
+	out, bad, _ := a.saveImportedProfiles(candidates, known)
+	invalid += bad
 	a.emitLog("gui", "info", fmt.Sprintf("Subscriptions updated: %d new profiles", len(out)))
 	if len(out) > 0 && a.store.GetSettings().GeoIPAutoDetect {
 		a.launchCountryRefresh("subscriptions")
@@ -2106,28 +2180,19 @@ func (a *App) EditSubscription(oldURL, newURL, name string) (*LinkImportResult, 
 			}
 			return res, fmt.Errorf("the new address yielded no usable profiles (%d links rejected); the feed stays on its old address", invalid)
 		}
-		saveFailures := 0
 		known := map[string]bool{}
 		for _, e := range a.store.ListProfiles() {
 			known[dedupeKey(&e)] = true
 		}
-		for _, p := range added {
+		for i := range added {
 			if effName != "" {
-				p.Group = effName
+				added[i].Group = effName
 			}
-			if known[dedupeKey(&p)] {
-				continue
-			}
-			saved, err := a.saveImportedProfile(p)
-			if err != nil {
-				res.Invalid++
-				saveFailures++
-				continue
-			}
-			known[dedupeKey(&saved)] = true
-			res.Profiles = append(res.Profiles, saved)
 		}
-		if saveFailures > 0 && len(res.Profiles) == 0 {
+		saved, bad, saveFailed := a.saveImportedProfiles(added, known)
+		res.Profiles = saved
+		res.Invalid += bad
+		if saveFailed && len(res.Profiles) == 0 {
 			if err := rollbackNewRecord(); err != nil {
 				return res, err
 			}
@@ -2147,14 +2212,8 @@ func (a *App) EditSubscription(oldURL, newURL, name string) (*LinkImportResult, 
 		}
 		// Profiles imported from the old URL follow the repoint so a
 		// later delete-with-configs still matches them precisely.
-		for _, e := range a.store.ListProfiles() {
-			if e.SubURL != oldURL {
-				continue
-			}
-			e.SubURL = newURL
-			if _, err := a.store.SaveProfile(e); err != nil {
-				a.emitLog("gui", "error", fmt.Sprintf("repoint profiles: %v", err))
-			}
+		if _, err := a.store.RepointSubscriptionProfiles(oldURL, newURL); err != nil {
+			a.emitLog("gui", "error", fmt.Sprintf("repoint profiles: %v", err))
 		}
 	}
 	// Profiles imported before the rename still carry the old group
@@ -2500,12 +2559,10 @@ func (a *App) RefreshAllCountries() (*CountryRefreshResult, error) {
 		}()
 	}
 	wg.Wait()
-	// One file write for the whole batch — and only when something
-	// actually changed (an unchanged refresh must not touch the file:
-	// this runs in the background, and a late write can outlive the
-	// caller).
+	// Country stamps are runtime state; flush the sidecar once for the
+	// whole batch without rewriting the durable profile document.
 	if res.Updated > 0 {
-		if err := a.store.SaveFile(); err != nil {
+		if err := a.store.Flush(); err != nil {
 			a.emitLog("gui", "error", fmt.Sprintf("GeoIP: saving country results failed: %v", err))
 		}
 	}
@@ -2551,14 +2608,14 @@ func (a *App) ClearCountries() error {
 		if p.CountryCode == "" && p.CountryName == "" && p.CountryAt == nil {
 			continue
 		}
-		// In-memory only; the file is written once below. Country fields
-		// only, so a concurrent edit is not reverted (BUG-043).
+		// Runtime fields only, so a concurrent durable edit is not
+		// reverted (BUG-043).
 		a.store.UpdateProfileCountry(p.ID, "", "", nil)
 		changed++
 	}
-	// One file write for the whole batch (only when something changed).
+	// One sidecar write for the whole batch (only when something changed).
 	if changed > 0 {
-		if err := a.store.SaveFile(); err != nil {
+		if err := a.store.Flush(); err != nil {
 			return err
 		}
 	}
@@ -2588,7 +2645,7 @@ func (a *App) RecentLogs(n int) []LogEntry {
 }
 
 // AppVersion returns the GUI version.
-func (a *App) AppVersion() string { return appVersion }
+func (a *App) AppVersion() string { return appVersionValue() }
 
 // OpenURL opens an http(s) URL in the OS default browser.
 // The Wails3 runtime handles platform differences.
@@ -2956,6 +3013,9 @@ func (a *App) Shutdown() {
 	a.mu.Unlock()
 	a.invalidateConnect()
 	a.waitCountryRefresh()
+	if err := a.store.Flush(); err != nil {
+		a.emitLog("gui", "warn", fmt.Sprintf("config state flush on shutdown failed: %v", err))
+	}
 	a.revertSystemProxyOnExit("shutdown")
 	_ = a.cores.SetSystemDNS(true)
 	_ = a.cores.Stop()

@@ -60,11 +60,13 @@ type SpoofManager struct {
 	running    bool
 	// stopRequested marks an exit Stop asked for, so the reaper reports a
 	// crash only for a death nobody requested (SingBoxManager's contract).
-	stopRequested bool
-	startedAt     time.Time
-	lastError     string
-	lastStats     SpoofStats
-	logCh         chan LogEntry
+	stopRequested     bool
+	startedAt         time.Time
+	lastError         string
+	lastStats         SpoofStats
+	statsGeneration   uint64
+	statsResetPending bool
+	logCh             chan LogEntry
 	// recent keeps the child's last lines for an EngineExit report
 	// (engine_exit.go), like every other engine manager.
 	recent lineRing
@@ -215,14 +217,20 @@ func normalizeFakeSNI(s string) string {
 	return strings.Trim(s, ".")
 }
 
-// spoofPlanA reports whether the SNI tab is in Plan A: the engine
-// derives its connect endpoint by resolving each fake SNI over DoH
-// ("RESOLVE_SNI", CORE_REPORT.md section 17) instead of dialing the
-// curated IP pool. Anything but "A" — including the empty value every
-// settings file written before this switch has — is Plan B, the
-// historical behaviour, unchanged.
 func spoofPlanA(settings Settings) bool {
 	return strings.EqualFold(strings.TrimSpace(settings.SNIConfig.Plan), "A")
+}
+
+func normalizeManualSpoofIP(value string) (string, error) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return "", nil
+	}
+	ip := net.ParseIP(value)
+	if ip == nil || ip.To4() == nil {
+		return "", fmt.Errorf("manualIp must be an IPv4 address")
+	}
+	return ip.To4().String(), nil
 }
 
 // spoofEligibilityIssue reports why a profile cannot ride the
@@ -564,12 +572,18 @@ func buildSpoofConfigJSON(profile *Profile, settings Settings, listenPort int, e
 		"MODE":        "SNI Only",
 	}
 	if spoofPlanA(settings) {
-		// Plan A: the core derives the connect endpoint by resolving the
-		// fake SNIs over DoH, so ENDPOINTS is deactivated for dialing — but
-		// it stays in the document because it still carries the port (the
-		// core reads endpoint[0].port) and because switching the tab back to
-		// Plan B restores the old behaviour with the pool untouched.
-		cfg["RESOLVE_SNI"] = true
+		manualIP, err := normalizeManualSpoofIP(settings.SNIConfig.ManualIP)
+		if err != nil {
+			return nil, err
+		}
+		if manualIP != "" {
+			cfg["ENDPOINTS"] = []map[string]any{{"ip": manualIP, "port": endpointPort}}
+			cfg["CONNECT_OVERRIDE"] = manualIP
+		} else {
+			// ENDPOINTS stays in the document because the core reads its
+			// port even though DoH supplies every dial address.
+			cfg["RESOLVE_SNI"] = true
+		}
 	}
 	sc := settings.SNIConfig
 	if strings.TrimSpace(sc.Method) != "" {
@@ -716,6 +730,8 @@ func (m *SpoofManager) Start(profile *Profile, settings Settings) error {
 	m.startedAt = time.Now()
 	m.lastError = ""
 	m.lastStats = SpoofStats{}
+	m.statsGeneration = 0
+	m.statsResetPending = false
 	m.recent.reset()
 	m.mu.Unlock()
 
@@ -734,17 +750,8 @@ func (m *SpoofManager) Start(profile *Profile, settings Settings) error {
 			m.recent.push(line)
 			switch {
 			case strings.HasPrefix(line, "[STATS]"):
-				raw := strings.TrimSpace(strings.TrimPrefix(line, "[STATS]"))
-				var st SpoofStats
-				if err := json.Unmarshal([]byte(raw), &st); err != nil {
-					m.mu.Lock()
-					m.lastError = fmt.Sprintf("spoof stats parse: %v", err)
-					m.mu.Unlock()
-					continue
-				}
-				m.mu.Lock()
-				m.lastStats = st
-				m.mu.Unlock()
+				m.acceptStatsLine(line, cmd)
+				continue
 			case strings.HasPrefix(line, "[INFO]"):
 				msg := strings.TrimSpace(strings.TrimPrefix(line, "[INFO]"))
 				m.log("info", msg)
@@ -930,6 +937,45 @@ func (m *SpoofManager) GetStats() (*SpoofStats, error) {
 	defer m.mu.Unlock()
 	st := m.lastStats
 	return &st, nil
+}
+
+// source ties a snapshot to its child so a delayed old scanner cannot
+// mutate a restarted engine's counters or error state.
+func (m *SpoofManager) acceptStatsLine(line string, source *exec.Cmd) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if source != nil && m.cmd != source {
+		return
+	}
+	raw := strings.TrimSpace(strings.TrimPrefix(line, "[STATS]"))
+	var wire struct {
+		SpoofStats
+		Generation uint64 `json:"generation"`
+	}
+	if err := json.Unmarshal([]byte(raw), &wire); err != nil {
+		m.lastError = fmt.Sprintf("spoof stats parse: %v", err)
+		return
+	}
+	if wire.Generation < m.statsGeneration || (m.statsResetPending && wire.Generation == m.statsGeneration) {
+		return
+	}
+	m.statsGeneration = wire.Generation
+	m.statsResetPending = false
+	m.lastStats = wire.SpoofStats
+}
+
+func (m *SpoofManager) ResetStats() error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if !m.running || m.stdin == nil {
+		return fmt.Errorf("sni-spoof engine is not running")
+	}
+	if _, err := io.WriteString(m.stdin, "reset-stats\n"); err != nil {
+		return fmt.Errorf("reset sni-spoof stats: %w", err)
+	}
+	m.lastStats = SpoofStats{}
+	m.statsResetPending = true
+	return nil
 }
 
 // GetListenPort returns the engine LISTEN_PORT (0 when stopped).

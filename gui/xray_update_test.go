@@ -4,7 +4,7 @@ package main
 // publishes xray.exe, exactly like the singbox row follows SagerNet and
 // the mihomo row follows MetaCubeX. It used to read the NekoGo app
 // releases (forkOwnerRepo), which compared "Xray 25.9.11" against a
-// NekoGo tag such as "1.0.0-beta.3" — and installed the xray.exe shipped
+// NekoGo tag such as "1.0.0-beta.4" — and installed an xray.exe shipped
 // inside the app's own release.
 
 import (
@@ -51,10 +51,10 @@ type fakeRelease struct {
 // (updateBaseURL holds a single API root):
 //   - /repos/XTLS/Xray-core/releases/latest -> the xray release
 //   - /repos/xenonama/NekoGo/releases -> the NekoGo app release, which
-//     carries its own xray.exe
+//     carries nekogo.exe
 //
-// So a row that resolves the wrong repo reports the wrong tag and
-// downloads the wrong bytes. Assets are served under /dl/<name>.
+// So a row that resolves the wrong repo reports the wrong tag. Assets
+// are served under /dl/<name>.
 func fakeXrayServer(t *testing.T, xray, fork fakeRelease) *httptest.Server {
 	t.Helper()
 	var srv *httptest.Server
@@ -155,7 +155,7 @@ func installedXrayVersion(t *testing.T, a *App, path, line string) {
 // XTLS/Xray-core. The local banner (25.9.11) is OLDER than the Xray
 // release served here (26.11.9) and NEWER than the NekoGo app tag
 // (1.0.0-beta.5), so the row can only report an update by reading the
-// right repo. The nekobox row keeps following the app repo, which is
+// right repo. The nekogo row keeps following the app repo, which is
 // the point of the shared lookups map.
 func TestCheckXrayResolvesTheUpstreamRelease(t *testing.T) {
 	saveUpdateBaseURL(t)
@@ -175,8 +175,7 @@ func TestCheckXrayResolvesTheUpstreamRelease(t *testing.T) {
 			name + ".dgst": []byte("sha256-just-a-text-file"),
 		}, digests: map[string]string{name: "sha256:" + sha256Hex(xrayZip)}},
 		fakeRelease{tag: "1.0.0-beta.5", assets: map[string][]byte{
-			"nekobox_core.exe": []byte("nk"),
-			"xray.exe":         []byte("app-bundled-xray"),
+			"nekogo.exe": []byte("portable-nekogo"),
 		}})
 	defer srv.Close()
 	updateBaseURL["github-api"] = srv.URL
@@ -190,24 +189,24 @@ func TestCheckXrayResolvesTheUpstreamRelease(t *testing.T) {
 	setXrayPath(t, a, dest)
 	installedXrayVersion(t, a, dest, "Xray 25.9.11 (v2fly.org) go1.25.0 windows amd64")
 
-	rows, err := a.CheckUpdates()
+	rows, err := a.CheckUpdates(nil)
 	if err != nil {
 		t.Fatalf("CheckUpdates: %v", err)
 	}
-	var xr, nb *UpdatableComponent
+	var xr, app *UpdatableComponent
 	for i := range rows {
 		switch rows[i].ID {
 		case "xray":
 			xr = &rows[i]
-		case "nekobox":
-			nb = &rows[i]
+		case "nekogo":
+			app = &rows[i]
 		}
 	}
 	if xr == nil {
 		t.Fatal("missing xray row")
 	}
-	if nb == nil {
-		t.Fatal("missing nekobox row")
+	if app == nil {
+		t.Fatal("missing nekogo row")
 	}
 	if xr.Current != "Xray 25.9.11 (v2fly.org) go1.25.0 windows amd64" {
 		t.Fatalf("Current = %q, want the installed banner", xr.Current)
@@ -221,9 +220,9 @@ func TestCheckXrayResolvesTheUpstreamRelease(t *testing.T) {
 	if xr.LastError != "" {
 		t.Fatalf("LastError = %q, want empty", xr.LastError)
 	}
-	// The fork-sourced rows must not drift with this change.
-	if nb.Latest != "1.0.0-beta.5" || !nb.UpdateAvail || nb.LastError != "" {
-		t.Fatalf("nekobox row = %+v, want Latest=1.0.0-beta.5 UpdateAvail=true", *nb)
+	// The app row must not drift with this change.
+	if app.Latest != "1.0.0-beta.5" || !app.UpdateAvail || app.LastError != "" {
+		t.Fatalf("nekogo row = %+v, want Latest=1.0.0-beta.5 UpdateAvail=true", *app)
 	}
 }
 
@@ -379,7 +378,7 @@ func TestUpdateXrayRefusesAnotherRowsBinary(t *testing.T) {
 // TestUpdateXrayFromZip — updating xray downloads the Xray Windows
 // archive from XTLS/Xray-core and installs its xray.exe at the resolved
 // path (the XrayPath override, updated in place). The app's own release
-// also publishes an xray.exe here: installing those bytes is the bug.
+// carries nekogo.exe instead and must never supply the core binary.
 func TestUpdateXrayFromZip(t *testing.T) {
 	saveUpdateBaseURL(t)
 	if runtime.GOOS != "windows" {
@@ -398,7 +397,7 @@ func TestUpdateXrayFromZip(t *testing.T) {
 			name + ".dgst": []byte("sha256-just-a-text-file"),
 		}, digests: map[string]string{name: "sha256:" + sha256Hex(xrayZip)}},
 		fakeRelease{tag: "1.0.0-beta.3", assets: map[string][]byte{
-			"xray.exe": []byte("app-bundled-xray"),
+			"nekogo.exe": []byte("portable-nekogo"),
 		}})
 	defer srv.Close()
 	updateBaseURL["github-api"] = srv.URL

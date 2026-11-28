@@ -8,6 +8,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"reflect"
 	"slices"
 	"strings"
 	"sync"
@@ -119,11 +120,23 @@ func migrateDNSServers(s *Settings) bool {
 // ConfigStore loads/saves profiles and settings as JSON. It replaces the
 // old Qt/RocksDB datastore (src/nekobox/dataStore) which required C++.
 type ConfigStore struct {
-	mu       sync.RWMutex
-	dir      string
-	path     string
-	profiles []Profile
-	settings Settings
+	mu                    sync.RWMutex
+	dir                   string
+	path                  string
+	statePath             string
+	profiles              []Profile
+	settings              Settings
+	statePresent          bool
+	stateDirty            bool
+	stateMigrationPending bool
+	migrationState        configState
+	stateDelay            time.Duration
+	stateMaxDelay         time.Duration
+	stateTimer            *time.Timer
+	stateFirstDirty       time.Time
+	stateNext             time.Time
+	stateRetry            int
+	stateFailureLogged    bool
 }
 
 // NewConfigStore opens (or creates) the config directory and loads
@@ -153,7 +166,13 @@ func NewConfigStore(dir string) (*ConfigStore, error) {
 			}
 		}
 	}
-	c := &ConfigStore{dir: dir, path: filepath.Join(dir, "config.json")}
+	c := &ConfigStore{
+		dir:           dir,
+		path:          filepath.Join(dir, "config.json"),
+		statePath:     filepath.Join(dir, "state.json"),
+		stateDelay:    defaultStateWriteDelay,
+		stateMaxDelay: defaultStateWriteMax,
+	}
 	c.settings = DefaultSettings()
 	loaded := false
 	if data, err := readConfigBytes(c.path); err == nil {
@@ -168,6 +187,11 @@ func NewConfigStore(dir string) (*ConfigStore, error) {
 		// (feeds, core paths, SNI lists, window prefs) and the next save
 		// persisted the loss; only the port itself is repaired here.
 		c.settings = fc.Settings
+		c.loadRuntimeStateLocked(fc)
+		themeMigrated := c.settings.Theme == ""
+		if themeMigrated {
+			c.settings.Theme = DefaultSettings().Theme
+		}
 		if c.settings.MixedPort == 0 {
 			c.settings.MixedPort = DefaultSettings().MixedPort
 		}
@@ -179,19 +203,26 @@ func NewConfigStore(dir string) (*ConfigStore, error) {
 		// empty section override, which used to delete the rendered block.
 		dnsMigrated := migrateDNSServers(&c.settings)
 		overridesMigrated := migrateEmptyCoreOverrides(&c.settings)
-		if (dnsMigrated || overridesMigrated) && loaded {
-			if err := c.saveLocked(); err != nil {
+		if (dnsMigrated || overridesMigrated || themeMigrated) && loaded {
+			if err := c.saveConfigLocked(); err != nil {
 				log.Printf("[config] settings migration: save failed: %v", err)
 			}
 		}
 		if c.profiles == nil {
 			c.profiles = []Profile{}
 		}
-		// SNI-spoof migration: an empty method predates the SNI tab;
-		// default to "auto" (the engine default) so the tab never
-		// renders a blank method.
+		defaults := DefaultSettings().SNIConfig
 		if c.settings.SNIConfig.Method == "" {
-			c.settings.SNIConfig.Method = "auto"
+			c.settings.SNIConfig.Method = defaults.Method
+		}
+		if c.settings.SNIConfig.Fingerprint == "" {
+			c.settings.SNIConfig.Fingerprint = defaults.Fingerprint
+		}
+		if c.settings.SNIConfig.QUICMode == "" {
+			c.settings.SNIConfig.QUICMode = defaults.QUICMode
+		}
+		if c.settings.SNIConfig.IPMode == "" {
+			c.settings.SNIConfig.IPMode = defaults.IPMode
 		}
 		// SNI-tab list migration: configs saved before the curated
 		// defaults shipped have empty IP/SNI lists and no pin, which
@@ -200,6 +231,8 @@ func NewConfigStore(dir string) (*ConfigStore, error) {
 		seedSNIDefaults(&c.settings)
 	} else if !os.IsNotExist(err) {
 		return nil, fmt.Errorf("read config.json: %w", err)
+	} else {
+		c.loadRuntimeStateLocked(fileConfig{Profiles: c.profiles, Settings: c.settings})
 	}
 	// SNI-spoof auto-detect migration (one-time): apply the import
 	// rule (loopback + bare-domain engine-eligible profiles get the
@@ -219,7 +252,7 @@ func NewConfigStore(dir string) (*ConfigStore, error) {
 		// the user had deliberately switched back to the sing-box core.
 		c.settings.SpoofAutoDetectReverted = true
 		if loaded {
-			if err := c.saveLocked(); err != nil {
+			if err := c.saveConfigLocked(); err != nil {
 				log.Printf("[config] spoof auto-detect migration: save failed: %v", err)
 			} else if n > 0 {
 				log.Printf("[config] spoof auto-detect migration: %d profile(s) tagged spoof", n)
@@ -244,7 +277,7 @@ func NewConfigStore(dir string) (*ConfigStore, error) {
 		}
 		c.settings.TunOSStackMigrated = true
 		if loaded {
-			if err := c.saveLocked(); err != nil {
+			if err := c.saveConfigLocked(); err != nil {
 				log.Printf("[config] tun stack migration: save failed: %v", err)
 			} else if c.settings.TunStack != stored {
 				log.Printf("[config] tun stack migration: stored tunStack %q needs the core allowed"+
@@ -408,25 +441,39 @@ func rewriteLegacyPathValue(s string) string {
 // that is only observable by counting the writes.
 var saveCount atomic.Int64
 
-func (c *ConfigStore) saveLocked() error {
-	fc := fileConfig{Profiles: c.profiles, Settings: c.settings}
-	data, err := json.MarshalIndent(fc, "", "  ")
+func (c *ConfigStore) saveConfigLocked() error {
+	if c.stateMigrationPending {
+		if err := c.writeStateValueLocked(c.migrationState); err != nil {
+			c.retryStateWriteLocked(err)
+			return fmt.Errorf("persist legacy runtime state before rewriting config.json: %w", err)
+		}
+		c.stateMigrationPending = false
+		c.migrationState = configState{}
+		c.statePresent = true
+		c.stateDirty = true
+		c.stateRetry = 0
+		c.stateFailureLogged = false
+		c.scheduleStateWriteLocked()
+	}
+	profiles := make([]Profile, len(c.profiles))
+	for i, p := range c.profiles {
+		profiles[i] = durableProfile(p)
+	}
+	fc := fileConfig{Profiles: profiles, Settings: durableSettings(c.settings)}
+	data, err := json.Marshal(fc)
 	if err != nil {
 		return err
 	}
-	tmp := c.path + ".tmp"
-	if err := os.WriteFile(tmp, data, 0o644); err != nil {
-		return err
-	}
-	if err := os.Rename(tmp, c.path); err != nil {
-		// Without this a failed rename leaves a stray config.json.tmp that
-		// the next start could mistake for state.
-		_ = os.Remove(tmp)
+	if err := writeJSONAtomic(c.path, data); err != nil {
 		return err
 	}
 	c.refreshBackupLocked(data)
 	saveCount.Add(1)
 	return nil
+}
+
+func (c *ConfigStore) saveLocked() error {
+	return c.saveConfigLocked()
 }
 
 // configBackupEvery throttles the .bak refresh: saves happen per profile
@@ -443,7 +490,7 @@ func (c *ConfigStore) refreshBackupLocked(data []byte) {
 	if st, err := os.Stat(bak); err == nil && time.Since(st.ModTime()) < configBackupEvery {
 		return
 	}
-	_ = os.WriteFile(bak, data, 0o644)
+	_ = writeJSONAtomic(bak, data)
 }
 
 // readConfigBytes returns the bytes to parse for [path], falling back to
@@ -516,10 +563,15 @@ func (c *ConfigStore) SaveProfile(p Profile) (Profile, error) {
 	}
 	for i, e := range c.profiles {
 		if e.ID == p.ID {
+			p = mergeProfileRuntime(p, e)
+			previous := c.profiles[i]
 			c.profiles[i] = p
 			if err := c.saveLocked(); err != nil {
-				c.profiles[i] = e
+				c.profiles[i] = previous
 				return p, err
+			}
+			if !profileRuntime(p).empty() {
+				c.markStateChangedLocked()
 			}
 			return p, nil
 		}
@@ -529,7 +581,54 @@ func (c *ConfigStore) SaveProfile(p Profile) (Profile, error) {
 		c.profiles = c.profiles[:len(c.profiles)-1]
 		return p, err
 	}
+	if !profileRuntime(p).empty() {
+		c.markStateChangedLocked()
+	}
 	return p, nil
+}
+
+// SaveProfiles inserts or replaces a batch with one durable write.
+func (c *ConfigStore) SaveProfiles(profiles []Profile) ([]Profile, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if len(profiles) == 0 {
+		return []Profile{}, nil
+	}
+	previous := c.profiles
+	next := cloneSlice(c.profiles)
+	index := make(map[string]int, len(next))
+	for i := range next {
+		index[next[i].ID] = i
+	}
+	saved := make([]Profile, len(profiles))
+	hasRuntime := false
+	for i, p := range profiles {
+		if p.ID == "" {
+			id, err := newID()
+			if err != nil {
+				return nil, err
+			}
+			p.ID = id
+		}
+		if at, ok := index[p.ID]; ok {
+			p = mergeProfileRuntime(p, next[at])
+			next[at] = p
+		} else {
+			index[p.ID] = len(next)
+			next = append(next, p)
+		}
+		hasRuntime = hasRuntime || !profileRuntime(p).empty()
+		saved[i] = p
+	}
+	c.profiles = next
+	if err := c.saveLocked(); err != nil {
+		c.profiles = previous
+		return nil, err
+	}
+	if hasRuntime {
+		c.markStateChangedLocked()
+	}
+	return saved, nil
 }
 
 // UpdateProfile replaces an existing profile in the in-memory store
@@ -568,9 +667,13 @@ func (c *ConfigStore) UpdateProfileCountry(id, code, name string, at *time.Time)
 		if e.ID != id {
 			continue
 		}
+		if e.CountryCode == code && e.CountryName == name && sameTime(e.CountryAt, at) {
+			return true
+		}
 		c.profiles[i].CountryCode = code
 		c.profiles[i].CountryName = name
-		c.profiles[i].CountryAt = at
+		c.profiles[i].CountryAt = cloneTimePtr(at)
+		c.markStateChangedLocked()
 		return true
 	}
 	return false
@@ -582,7 +685,11 @@ func (c *ConfigStore) UpdateProfileCountry(id, code, name string, at *time.Time)
 func (c *ConfigStore) SaveFile() error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	return c.saveLocked()
+	if err := c.saveLocked(); err != nil {
+		return err
+	}
+	c.markStateChangedLocked()
+	return nil
 }
 
 // DeleteProfile removes a profile by id.
@@ -591,8 +698,15 @@ func (c *ConfigStore) DeleteProfile(id string) error {
 	defer c.mu.Unlock()
 	for i, e := range c.profiles {
 		if e.ID == id {
-			c.profiles = append(c.profiles[:i], c.profiles[i+1:]...)
-			return c.saveLocked()
+			previous := c.profiles
+			next := cloneSlice(c.profiles)
+			c.profiles = append(next[:i], next[i+1:]...)
+			if err := c.saveLocked(); err != nil {
+				c.profiles = previous
+				return err
+			}
+			c.markStateChangedLocked()
+			return nil
 		}
 	}
 	return fmt.Errorf("profile %q not found", id)
@@ -695,6 +809,7 @@ func (c *ConfigStore) SaveSettings(s Settings) error {
 	s.Subscriptions = c.settings.Subscriptions
 	s.AetherScanResults = c.settings.AetherScanResults
 	s.CoreOverrides = c.settings.CoreOverrides
+	s.SNIConfig = c.settings.SNIConfig
 	s.SNIIPs = mergeSNIIPStamps(s.SNIIPs, c.settings.SNIIPs)
 	s.SNISNIs = mergeSNIStamps(s.SNISNIs, c.settings.SNISNIs)
 	if s.ConsoleLogLimit != nil {
@@ -706,6 +821,9 @@ func (c *ConfigStore) SaveSettings(s Settings) error {
 	if err := c.saveLocked(); err != nil {
 		c.settings = previous
 		return err
+	}
+	if !settingsRuntimeEqual(previous, s) {
+		c.markStateChangedLocked()
 	}
 	return nil
 }
@@ -781,8 +899,23 @@ func (c *ConfigStore) updateProfileFields(id string, fn func(*Profile)) (Profile
 		if c.profiles[i].ID != id {
 			continue
 		}
+		previous := c.profiles[i]
 		fn(&c.profiles[i])
-		return c.profiles[i], true, c.saveLocked()
+		durableChanged := !profilesDurableEqual(previous, c.profiles[i])
+		runtimeChanged := !reflect.DeepEqual(profileRuntime(previous), profileRuntime(c.profiles[i]))
+		if !durableChanged && !runtimeChanged {
+			return c.profiles[i], true, nil
+		}
+		if durableChanged {
+			if err := c.saveLocked(); err != nil {
+				c.profiles[i] = previous
+				return c.profiles[i], true, err
+			}
+		}
+		if runtimeChanged {
+			c.markStateChangedLocked()
+		}
+		return c.profiles[i], true, nil
 	}
 	return Profile{}, false, nil
 }
@@ -823,12 +956,20 @@ func (c *ConfigStore) SetActiveProfileIDIfUnchanged(id, expected string) (bool, 
 func (c *ConfigStore) restoreAll(s Settings, profiles []Profile) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	previousSettings := c.settings
+	previousProfiles := c.profiles
 	c.settings = s
 	c.profiles = append([]Profile(nil), profiles...)
 	if c.profiles == nil {
 		c.profiles = []Profile{}
 	}
-	return c.saveLocked()
+	if err := c.saveLocked(); err != nil {
+		c.settings = previousSettings
+		c.profiles = previousProfiles
+		return err
+	}
+	c.markStateChangedLocked()
+	return nil
 }
 
 // SetCloseToTray persists the close-to-tray toggle atomically (BUG-043):
@@ -859,8 +1000,22 @@ func (c *ConfigStore) SetStartOnBoot(enabled bool) error {
 func (c *ConfigStore) UpdateSNI(fn func(*Settings)) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	previous := c.settings
+	previous.SNIIPs = cloneSlice(c.settings.SNIIPs)
+	previous.SNISNIs = cloneSlice(c.settings.SNISNIs)
 	fn(&c.settings)
-	return c.saveLocked()
+	durableChanged := !settingsDurableEqual(previous, c.settings)
+	runtimeChanged := !settingsRuntimeEqual(previous, c.settings)
+	if durableChanged {
+		if err := c.saveLocked(); err != nil {
+			c.settings = previous
+			return err
+		}
+	}
+	if runtimeChanged {
+		c.markStateChangedLocked()
+	}
+	return nil
 }
 
 // UpdateAetherScanResults applies fn to the persisted scan results
@@ -869,8 +1024,13 @@ func (c *ConfigStore) UpdateSNI(fn func(*Settings)) error {
 func (c *ConfigStore) UpdateAetherScanResults(fn func([]AetherScanResult) []AetherScanResult) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	previous := cloneSlice(c.settings.AetherScanResults)
 	c.settings.AetherScanResults = fn(c.settings.AetherScanResults)
-	return c.saveLocked()
+	if reflect.DeepEqual(previous, c.settings.AetherScanResults) {
+		return nil
+	}
+	c.markStateChangedLocked()
+	return nil
 }
 
 // UpdateAetherKeys applies fn to the persisted WARP-key renewal settings
@@ -992,20 +1152,55 @@ func (c *ConfigStore) DeleteProfilesBySource(subURL, group string) (int, error) 
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	kept := c.profiles[:0]
+	previous := c.profiles
+	next := cloneSlice(c.profiles)
+	kept := next[:0]
 	n := 0
-	for i := range c.profiles {
-		if profileFromSubscription(&c.profiles[i], subURL, group) {
+	for i := range next {
+		if profileFromSubscription(&next[i], subURL, group) {
 			n++
 			continue
 		}
-		kept = append(kept, c.profiles[i])
+		kept = append(kept, next[i])
 	}
 	if n == 0 {
 		return 0, nil
 	}
 	c.profiles = kept
-	return n, c.saveLocked()
+	if err := c.saveLocked(); err != nil {
+		c.profiles = previous
+		return 0, err
+	}
+	c.markStateChangedLocked()
+	return n, nil
+}
+
+// RepointSubscriptionProfiles updates matching live rows under one lock so
+// an intervening edit or deletion cannot be overwritten by a stale batch.
+func (c *ConfigStore) RepointSubscriptionProfiles(oldURL, newURL string) (int, error) {
+	if oldURL == "" || newURL == "" || oldURL == newURL {
+		return 0, nil
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	previous := c.profiles
+	next := cloneSlice(c.profiles)
+	n := 0
+	for i := range next {
+		if next[i].SubURL == oldURL {
+			next[i].SubURL = newURL
+			n++
+		}
+	}
+	if n == 0 {
+		return 0, nil
+	}
+	c.profiles = next
+	if err := c.saveLocked(); err != nil {
+		c.profiles = previous
+		return 0, err
+	}
+	return n, nil
 }
 
 // RenameFeedProfiles re-files the profiles one feed owns after its

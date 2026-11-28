@@ -291,6 +291,56 @@ func TestSpoofProfileEphemeralPing(t *testing.T) {
 	t.Logf("spoof probe latency: %d ms", res.LatencyMs)
 }
 
+func TestSpoofProfilePingUsesTemporaryEngineWhenFrontIsLive(t *testing.T) {
+	buildSpoofRelayMock(t)
+	coreBin, xrayBin := testCoreBins(t)
+	t.Cleanup(clearSpoofFrontPort)
+
+	stalePort, err := freePort()
+	if err != nil {
+		t.Fatalf("pick stale front port: %v", err)
+	}
+	setSpoofFrontPort(stalePort)
+
+	var hits int32
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&hits, 1)
+		fmt.Fprint(w, "current-settings-probe-ok")
+	}))
+	defer origin.Close()
+
+	trojanPort := startTrojanTLSServer(t, "pw")
+	settings := DefaultSettings()
+	settings.SNISelectedIP = "127.0.0.1"
+	settings.SNISelectedSNI = "decoy.example.test"
+	profile := &Profile{
+		ID: "spoof-current", Name: "spoof-current", Core: CoreSpoof,
+		Protocol: "trojan", Address: "decoy.example.test", Port: trojanPort,
+		IDOrPassword: "pw", TLS: true, ServerName: "decoy.example.test",
+		AllowInsecure: true,
+	}
+
+	logs := make(chan LogEntry, 2048)
+	cm := NewCoreManager(NewSingBoxManager(coreBin, logs), NewXrayManager(xrayBin, "", logs))
+	cm.SetSpoofManager(NewSpoofManager(logs))
+
+	res, err := cm.EphemeralURLTest(profile, settings, origin.URL+"/", 15000, probeOwnerProxies)
+	if err != nil {
+		drainLogs(t, logs)
+		t.Fatalf("EphemeralURLTest reused the stale live front: %v", err)
+	}
+	if res == nil || res.Error != "" || res.LatencyMs < 0 {
+		drainLogs(t, logs)
+		t.Fatalf("bad probe result: %+v", res)
+	}
+	if got := atomic.LoadInt32(&hits); got != 1 {
+		t.Fatalf("origin hits = %d, want 1", got)
+	}
+	if port, live := currentSpoofFrontPort(); !live || port != stalePort {
+		t.Fatalf("probe changed the live front port: %d/%v, want %d", port, live, stalePort)
+	}
+}
+
 // A spoof probe owns the process-wide front port only while its
 // throwaway engine runs — and its teardown cleared that slot
 // unconditionally. A connect that commits during the probe publishes its

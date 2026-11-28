@@ -47,6 +47,132 @@ func buildSpoofMock(t *testing.T) {
 	})
 }
 
+type recordingSpoofStdin struct {
+	strings.Builder
+	closed bool
+}
+
+func (w *recordingSpoofStdin) Close() error {
+	w.closed = true
+	return nil
+}
+
+func TestSpoofResetStatsWritesCommandAndClearsSnapshot(t *testing.T) {
+	m := NewSpoofManager(make(chan LogEntry, 8))
+	m.lastStats.Total = 17
+	if err := m.ResetStats(); err == nil {
+		t.Fatal("ResetStats on a stopped engine succeeded")
+	}
+	stdin := &recordingSpoofStdin{}
+	m.running = true
+	m.stdin = stdin
+	if err := m.ResetStats(); err != nil {
+		t.Fatalf("ResetStats: %v", err)
+	}
+	if got := stdin.String(); got != "reset-stats\n" {
+		t.Fatalf("stdin = %q, want reset-stats command", got)
+	}
+	if stdin.closed {
+		t.Fatal("ResetStats closed the command pipe")
+	}
+	if got := m.lastStats; got.Total != 0 || got.Success != 0 || got.Failed != 0 {
+		t.Fatalf("cached stats survived reset: %+v", got)
+	}
+}
+
+func TestSpoofStatsScannerCarriesProcessIdentity(t *testing.T) {
+	raw, err := os.ReadFile("spoof_manager.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(raw), "m.acceptStatsLine(line, cmd)") {
+		t.Fatal("stats scanner does not identify the child process that emitted each snapshot")
+	}
+}
+
+func TestSpoofStatsRejectPreviousProcess(t *testing.T) {
+	m := NewSpoofManager(make(chan LogEntry, 8))
+	oldCmd := &exec.Cmd{}
+	currentCmd := &exec.Cmd{}
+	m.cmd = currentCmd
+	m.lastError = "current error"
+
+	m.acceptStatsLine(`[STATS] {"generation":9,"total":99,"success":90}`, oldCmd)
+	m.acceptStatsLine(`[STATS] {broken`, oldCmd)
+	if got, _ := m.GetStats(); got.Total != 0 {
+		t.Fatalf("old process snapshot changed current stats: %+v", got)
+	}
+	if got := m.GetLastError(); got != "current error" {
+		t.Fatalf("old process changed current error: %q", got)
+	}
+
+	m.acceptStatsLine(`[STATS] {"generation":0,"total":3,"success":3}`, currentCmd)
+	if got, _ := m.GetStats(); got.Total != 3 {
+		t.Fatalf("current process snapshot was rejected: %+v", got)
+	}
+
+	m.acceptStatsLine(`[STATS] {"generation":10,"total":100,"success":91}`, oldCmd)
+	m.acceptStatsLine(`[STATS] {broken`, oldCmd)
+	if got, _ := m.GetStats(); got.Total != 3 {
+		t.Fatalf("late old process snapshot replaced current stats: %+v", got)
+	}
+	if got := m.GetLastError(); got != "current error" {
+		t.Fatalf("late old process changed current error: %q", got)
+	}
+}
+
+func TestSpoofResetStatsRejectsQueuedOldSnapshots(t *testing.T) {
+	m := NewSpoofManager(make(chan LogEntry, 8))
+	m.running = true
+	m.stdin = &recordingSpoofStdin{}
+	m.acceptStatsLine(`[STATS] {"generation":4,"total":99,"success":90}`, nil)
+	if got, _ := m.GetStats(); got.Total != 99 {
+		t.Fatalf("initial snapshot total = %d, want 99", got.Total)
+	}
+	if err := m.ResetStats(); err != nil {
+		t.Fatal(err)
+	}
+	m.acceptStatsLine(`[STATS] {"generation":4,"total":100,"success":91}`, nil)
+	if got, _ := m.GetStats(); got.Total != 0 {
+		t.Fatalf("queued pre-reset snapshot repopulated cleared stats: %+v", got)
+	}
+	m.acceptStatsLine(`[STATS] {"generation":5,"total":1,"success":1}`, nil)
+	if got, _ := m.GetStats(); got.Total != 1 {
+		t.Fatalf("post-reset snapshot was rejected: %+v", got)
+	}
+	m.acceptStatsLine(`[STATS] {"generation":4,"total":101,"success":92}`, nil)
+	if got, _ := m.GetStats(); got.Total != 1 {
+		t.Fatalf("late pre-reset snapshot replaced fresh stats: %+v", got)
+	}
+}
+
+func TestSpoofManagerResetStatsRoundTrip(t *testing.T) {
+	buildSpoofMock(t)
+	m := NewSpoofManager(make(chan LogEntry, 1024))
+	if err := m.Start(spoofTestProfile(), spoofTestSettings()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer m.Stop()
+	waitFor(t, "stats before reset", func() bool {
+		st, _ := m.GetStats()
+		return st != nil && st.Total >= 5
+	})
+	before, _ := m.GetStats()
+	if err := m.ResetStats(); err != nil {
+		t.Fatalf("ResetStats: %v", err)
+	}
+	waitFor(t, "fresh stats after reset", func() bool {
+		st, _ := m.GetStats()
+		return st != nil && st.Total > 0 && st.Total < before.Total
+	})
+	if !m.IsRunning() {
+		t.Fatal("engine stopped after reset-stats")
+	}
+	if err := m.Stop(); err != nil {
+		t.Fatalf("Stop after reset: %v", err)
+	}
+}
+
 func spoofTestSettings() Settings {
 	s := DefaultSettings()
 	s.SNISelectedIP = "104.21.0.1"
@@ -525,6 +651,36 @@ func TestShouldApplySNIFront(t *testing.T) {
 	}
 	if shouldApplySNIFront(nil) {
 		t.Error("shouldApplySNIFront(nil) = true, want false")
+	}
+}
+
+func TestSpoofPortForProfilePrefersPrivateProbePort(t *testing.T) {
+	t.Cleanup(clearSpoofFrontPort)
+	setSpoofFrontPort(41001)
+	profile := spoofTestProfile()
+	profile.SpoofEnginePort = 41002
+	settings := DefaultSettings()
+
+	if port, ok := spoofPortForProfile(profile, settings); !ok || port != 41002 {
+		t.Fatalf("private probe port = %d/%v, want 41002/true", port, ok)
+	}
+	profile.SpoofEnginePort = 0
+	if port, ok := spoofPortForProfile(profile, settings); !ok || port != 41001 {
+		t.Fatalf("live front fallback = %d/%v, want 41001/true", port, ok)
+	}
+	disabled := false
+	settings.SpoofEnabled = &disabled
+	if port, ok := spoofPortForProfile(profile, settings); ok || port != 0 {
+		t.Fatalf("disabled spoof port = %d/%v, want 0/false", port, ok)
+	}
+
+	profile.SpoofEnginePort = 41002
+	raw, err := json.Marshal(profile)
+	if err != nil {
+		t.Fatalf("marshal profile: %v", err)
+	}
+	if strings.Contains(string(raw), "spoofEnginePort") {
+		t.Fatalf("private probe port leaked into profile JSON: %s", raw)
 	}
 }
 

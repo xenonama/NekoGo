@@ -837,9 +837,11 @@ export class SNIConfig {
      * "" or "B" = Plan B, the curated IP list is the endpoint pool
      * (the historical behaviour); "A" = Plan A, the engine resolves
      * each fake SNI itself (DoH) and dials that, so the IP list
-     * becomes a read-out of what Plan A derived.
+     * becomes a read-out of what Plan A derived. ManualIP disables
+     * that resolution and dials one user-supplied IPv4 instead.
      */
     "plan"?: string;
+    "manualIp"?: string;
 
     /** Creates a new SNIConfig instance. */
     constructor($$source: Partial<SNIConfig> = {}) {
@@ -1984,13 +1986,14 @@ export class URLTestResult {
  */
 export class UpdatableComponent {
     /**
-     * "geoip" | "geosite" | "singbox" | "nekobox" | "xray" | "mihomo" | "tor" | "psiphon" | "psiphon-servers" | "gui"
+     * "geoip" | "geosite" | "singbox" | "xray" | "mihomo" | "psiphon" | "psiphon-servers" | "nekogo"
      */
     "id": string;
     "name": string;
     "current": string;
     "latest": string;
     "updateAvail": boolean;
+    "checkEnabled": boolean;
     "notes"?: string;
 
     /**
@@ -2000,11 +2003,24 @@ export class UpdatableComponent {
     "lastError"?: string;
 
     /**
-     * InstallerPath is set by updateGUI after a successful download:
-     * the UI offers an "Open installer" button the user must click.
-     * The backend never opens it on its own (BUG-010).
+     * CheckUnavailable marks an exceptional check failure that must not
+     * block a manual update attempt (currently Psiphon Servers only).
      */
-    "installerPath"?: string;
+    "checkUnavailable"?: boolean;
+
+    /**
+     * DownloadedBytes and TotalBytes drive the live "10/20 MB" display.
+     * A negative total means the source did not declare a length.
+     */
+    "downloadedBytes"?: number;
+    "totalBytes"?: number;
+    "downloading"?: boolean;
+
+    /**
+     * UpdateFoundAt remembers the first check that found this update.
+     * It stays visible until the update is actually installed.
+     */
+    "updateFoundAt"?: string;
 
     /** Creates a new UpdatableComponent instance. */
     constructor($$source: Partial<UpdatableComponent> = {}) {
@@ -2022,6 +2038,9 @@ export class UpdatableComponent {
         }
         if (!("updateAvail" in $$source)) {
             this["updateAvail"] = false;
+        }
+        if (!("checkEnabled" in $$source)) {
+            this["checkEnabled"] = false;
         }
 
         Object.assign(this, $$source);

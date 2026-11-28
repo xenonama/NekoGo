@@ -233,17 +233,28 @@ func (a *App) ScanSNIPairs(ips []string, snis []string) ([]SNIPairResult, error)
 // precisely what the engine will dial on the next connect. A failed
 // resolve is reported as the row's error with the handshake skipped, so
 // the tab shows which half broke.
-func probePlanAPair(ctx context.Context, sni string) SNIPairResult {
+func probePlanAPair(ctx context.Context, sni, manualIP string) SNIPairResult {
 	res := SNIPairResult{SNI: sni}
-	ip, err := resolveA(ctx, sni)
+	ip, err := normalizeManualSpoofIP(manualIP)
 	if err != nil {
 		res.Error = err.Error()
 		return res
 	}
+	if ip == "" {
+		ip, err = resolveA(ctx, sni)
+		if err != nil {
+			res.Error = err.Error()
+			return res
+		}
+	}
 	res.IP = ip
 	out := probeOnePair(ctx, ip, sni)
 	if out.OK && !isCloudflareIP(ip) {
-		out.Warning = fmt.Sprintf("resolved to %s, which is not a Cloudflare edge — the engine dials this address directly", ip)
+		origin := "resolved to"
+		if manualIP != "" {
+			origin = "manually set to"
+		}
+		out.Warning = fmt.Sprintf("%s %s, which is not a Cloudflare edge — the engine dials this address directly", origin, ip)
 	}
 	return out
 }
@@ -254,6 +265,10 @@ func probePlanAPair(ctx context.Context, sni string) SNIPairResult {
 // read and never written: in Plan A the "IPs" card is a read-out of
 // these stamps, and the curated Plan B pool stays exactly as it was.
 func (a *App) scanPlanA(snis []string) ([]SNIPairResult, error) {
+	manualIP, err := normalizeManualSpoofIP(a.store.GetSettings().SNIConfig.ManualIP)
+	if err != nil {
+		return nil, err
+	}
 	clean := make([]string, 0, len(snis))
 	seen := map[string]bool{}
 	for _, s := range snis {
@@ -298,7 +313,7 @@ func (a *App) scanPlanA(snis []string) ([]SNIPairResult, error) {
 		go func() {
 			defer wg.Done()
 			for host := range jobs {
-				r := probePlanAPair(ctx, host)
+				r := probePlanAPair(ctx, host, manualIP)
 				results <- r
 				sniScanState.mu.Lock()
 				sniScanState.done++

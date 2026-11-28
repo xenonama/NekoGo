@@ -77,6 +77,9 @@ func assertProxyGroupSnapshot(t *testing.T, store *ConfigStore, want fileConfig)
 
 func assertProxyGroupReload(t *testing.T, store *ConfigStore, want fileConfig) {
 	t.Helper()
+	if err := store.Flush(); err != nil {
+		t.Fatal(err)
+	}
 	reloaded, err := NewConfigStore(store.Dir())
 	if err != nil {
 		t.Fatal(err)

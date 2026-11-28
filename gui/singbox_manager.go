@@ -540,6 +540,8 @@ func (m *SingBoxManager) Stop() error {
 	if cmd == nil || cmd.Process == nil {
 		m.mu.Lock()
 		m.running = false
+		m.cmd = nil
+		m.stopRequested = false
 		m.mu.Unlock()
 		return nil
 	}

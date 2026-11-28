@@ -295,11 +295,17 @@ func resolvePlanATarget(p *Profile, settings Settings) (ip, sni string, port int
 	if sni == "" {
 		return "", "", 0, fmt.Errorf("plan A has nothing to resolve: check a decoy SNI in the SNI Spoofing tab, or set sni/host on profile %q", p.Name)
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 2*dohAttemptTimeout)
-	defer cancel()
-	ip, err = resolveA(ctx, sni)
+	ip, err = normalizeManualSpoofIP(settings.SNIConfig.ManualIP)
 	if err != nil {
-		return "", "", 0, fmt.Errorf("plan A: %w (switch the SNI tab back to Plan B, or check a plain IP there)", err)
+		return "", "", 0, fmt.Errorf("plan A: %w", err)
+	}
+	if ip == "" {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*dohAttemptTimeout)
+		defer cancel()
+		ip, err = resolveA(ctx, sni)
+		if err != nil {
+			return "", "", 0, fmt.Errorf("plan A: %w (switch the SNI tab back to Plan B, or check a plain IP there)", err)
+		}
 	}
 	port = p.Port
 	if isLoopbackAddress(p.Address) || port < 1 || port > 65535 {
@@ -318,9 +324,13 @@ func spoofPortForProfile(profile *Profile, settings Settings) (port int, ok bool
 	if profile == nil || !spoofEnabled(settings) {
 		return 0, false
 	}
-	p, live := currentSpoofFrontPort()
-	if !live {
-		return 0, false
+	p := profile.SpoofEnginePort
+	if p < 1 || p > 65535 {
+		var live bool
+		p, live = currentSpoofFrontPort()
+		if !live {
+			return 0, false
+		}
 	}
 	if profile.Core.IsSpoof() {
 		return p, true

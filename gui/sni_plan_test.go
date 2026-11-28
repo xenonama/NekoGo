@@ -116,6 +116,13 @@ func planTestApp(t *testing.T, plan string) (*App, *ConfigStore) {
 	return NewApp(store, make(chan LogEntry, 64)), store
 }
 
+func TestDefaultSNIConfigMatchesEngine(t *testing.T) {
+	got := DefaultSettings().SNIConfig
+	if got.Method != "hello_split" || got.Fingerprint != "legacy" || got.QUICMode != "block" || got.IPMode != "ipv4" {
+		t.Fatalf("default SNI config = %+v, want hello_split/legacy/block/ipv4", got)
+	}
+}
+
 func TestSpoofPlanARecognizesPlan(t *testing.T) {
 	for _, tc := range []struct {
 		plan string
@@ -220,6 +227,81 @@ func TestResolvePlanATargetFromDoH(t *testing.T) {
 	}
 }
 
+func TestResolvePlanATargetManualIPSkipsDoH(t *testing.T) {
+	forgetDoH(t, "example.com")
+	f := newFakeDoH(t, map[string]string{"example.com": "203.0.113.99"})
+	useDoH(t, f)
+
+	s := DefaultSettings()
+	s.SNIConfig.Plan = "A"
+	s.SNIConfig.ManualIP = "198.51.100.44"
+	s.SNISNIs = []SNISNI{{Host: "example.com", Source: "test"}}
+	s.SNISelectedSNI = "example.com"
+	ip, sni, port, err := resolvePlanATarget(&Profile{Name: "p", Address: "www.node.example", Port: 8443}, s)
+	if err != nil {
+		t.Fatalf("resolvePlanATarget(manual): %v", err)
+	}
+	if ip != "198.51.100.44" || sni != "example.com" || port != 8443 {
+		t.Fatalf("got %q/%q/%d, want manual 198.51.100.44/example.com/8443", ip, sni, port)
+	}
+	if q := f.queries(); len(q) != 0 {
+		t.Fatalf("manual Plan A queried DoH: %v", q)
+	}
+	if _, _, lp, err := resolvePlanATarget(&Profile{Name: "loop", Address: "127.0.0.1", Port: 40443}, s); err != nil {
+		t.Fatalf("resolvePlanATarget(manual loopback): %v", err)
+	} else if lp != 443 {
+		t.Fatalf("manual loopback remote port = %d, want 443", lp)
+	}
+}
+
+func TestBuildSpoofConfigJSONPlanAManualOverride(t *testing.T) {
+	s := DefaultSettings()
+	s.SNIConfig.Plan = "A"
+	s.SNIConfig.ManualIP = "198.51.100.44"
+	raw, err := buildSpoofConfigJSON(spoofTestProfile(), s, 40443, "198.51.100.44", 443, "example.com")
+	if err != nil {
+		t.Fatalf("buildSpoofConfigJSON(manual): %v", err)
+	}
+	var cfg map[string]any
+	if err := json.Unmarshal(raw, &cfg); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := cfg["RESOLVE_SNI"]; ok {
+		t.Fatal("manual Plan A still enables automatic DoH resolution")
+	}
+	if got := cfg["CONNECT_OVERRIDE"]; got != "198.51.100.44" {
+		t.Fatalf("CONNECT_OVERRIDE = %v, want the manual address", got)
+	}
+	eps, ok := cfg["ENDPOINTS"].([]any)
+	if !ok || len(eps) != 1 {
+		t.Fatalf("manual Plan A ENDPOINTS = %v, want one manual endpoint", cfg["ENDPOINTS"])
+	}
+	ep := eps[0].(map[string]any)
+	if ep["ip"] != "198.51.100.44" || int(ep["port"].(float64)) != 443 {
+		t.Fatalf("manual endpoint = %v", ep)
+	}
+}
+
+func TestSpoofSetConfigManualIPValidationAndDefaults(t *testing.T) {
+	a, store := planTestApp(t, "A")
+	if err := a.SpoofSetConfig(SNIConfig{Plan: "A", ManualIP: " 198.51.100.44 "}); err != nil {
+		t.Fatalf("SpoofSetConfig(manual): %v", err)
+	}
+	got := store.GetSettings().SNIConfig
+	if got.ManualIP != "198.51.100.44" || got.Method != "hello_split" || got.Fingerprint != "legacy" || got.QUICMode != "block" || got.IPMode != "ipv4" {
+		t.Fatalf("stored manual config = %+v", got)
+	}
+	before := got
+	for _, bad := range []string{"example.com", "2001:db8::1", "999.1.2.3", "198.51.100.44:443"} {
+		if err := a.SpoofSetConfig(SNIConfig{Plan: "A", ManualIP: bad}); err == nil {
+			t.Errorf("SpoofSetConfig(manual %q) succeeded, want rejection", bad)
+		}
+	}
+	if got := store.GetSettings().SNIConfig; got != before {
+		t.Fatalf("rejected manual IP rewrote the config: %+v, was %+v", got, before)
+	}
+}
+
 func TestResolvePlanAErrors(t *testing.T) {
 	forgetDoH(t, "dead.example", "example.com")
 	f := newFakeDoH(t, map[string]string{})
@@ -288,6 +370,34 @@ func TestScanSNIPairsPlanAStampsResolvedIP(t *testing.T) {
 	}
 	if len(after.SNIIPs) != len(before) || after.SNIIPs[0].IP != before[0].IP || after.SNIIPs[0].LastAt != "" {
 		t.Fatalf("plan A touched the Plan B IP pool: %+v (was %+v)", after.SNIIPs, before)
+	}
+}
+
+func TestScanSNIPairsPlanAManualIPSkipsDoH(t *testing.T) {
+	forgetDoH(t, "example.com")
+	ts := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	defer ts.Close()
+	withLocalTLS(t, ts)
+	f := newFakeDoH(t, map[string]string{"example.com": "203.0.113.99"})
+	useDoH(t, f)
+
+	a, store := planTestApp(t, "A")
+	if err := store.UpdateSNI(func(s *Settings) { s.SNIConfig.ManualIP = "127.0.0.1" }); err != nil {
+		t.Fatal(err)
+	}
+	res, err := a.ScanSNIPairs(nil, []string{"example.com"})
+	if err != nil {
+		t.Fatalf("ScanSNIPairs(manual): %v", err)
+	}
+	if len(res) != 1 || !res[0].OK || res[0].IP != "127.0.0.1" || res[0].SNI != "example.com" {
+		t.Fatalf("manual result = %+v, want OK 127.0.0.1/example.com", res)
+	}
+	if q := f.queries(); len(q) != 0 {
+		t.Fatalf("manual scan queried DoH: %v", q)
+	}
+	after := store.GetSettings()
+	if after.SNISNIs[0].LastIP != "127.0.0.1" || !after.SNISNIs[0].LastOK {
+		t.Fatalf("manual scan did not stamp the SNI: %+v", after.SNISNIs[0])
 	}
 }
 
@@ -549,7 +659,7 @@ func TestSpoofStatsMirrorTheEngineSnapshot(t *testing.T) {
 		unread []string
 	}{
 		{"Ranked", "SpoofRanked", SpoofRanked{}, nil},
-		{"Snapshot", "SpoofStats", SpoofStats{}, []string{"type"}},
+		{"Snapshot", "SpoofStats", SpoofStats{}, []string{"type", "generation"}},
 	} {
 		body := regexp.MustCompile(`(?s)pub struct ` + tc.rustStruct + ` \{(.*?)\n\}`).FindSubmatch(src)
 		if body == nil {
@@ -614,8 +724,8 @@ func TestSpoofSetConfigMigratesRetiredSpellings(t *testing.T) {
 		t.Fatalf("SpoofSetConfig(retired spellings): %v", err)
 	}
 	got := store.GetSettings().SNIConfig
-	if got.Method != "auto" {
-		t.Fatalf("retired method stored as %q, want auto", got.Method)
+	if got.Method != "hello_split" {
+		t.Fatalf("retired method stored as %q, want hello_split", got.Method)
 	}
 	if got.Fingerprint != "chrome" {
 		t.Fatalf("versioned fingerprint stored as %q, want chrome", got.Fingerprint)
@@ -625,7 +735,7 @@ func TestSpoofSetConfigMigratesRetiredSpellings(t *testing.T) {
 	} else if !strings.Contains(err.Error(), "hello_split") {
 		t.Fatalf("error %q does not name the current method set", err)
 	}
-	if got := store.GetSettings().SNIConfig.Method; got != "auto" {
+	if got := store.GetSettings().SNIConfig.Method; got != "hello_split" {
 		t.Fatalf("rejected method persisted: %q", got)
 	}
 	// "custom" is not a fingerprint the engine can produce: config.rs lists

@@ -370,6 +370,9 @@ func TestAetherScanResultsRoundTrip(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("persist results: %v", err)
 	}
+	if err := store.Flush(); err != nil {
+		t.Fatalf("flush results: %v", err)
+	}
 	reopened, err := NewConfigStore(dir)
 	if err != nil {
 		t.Fatalf("reopen store: %v", err)

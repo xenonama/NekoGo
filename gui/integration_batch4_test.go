@@ -157,6 +157,7 @@ func TestStopEphemeralTestsOwnerScope(t *testing.T) {
 		t.Fatal("proxies ctx cancelled by network stop")
 	}
 	m.ephProbeForget(gen2)
+	m.ephProbeForget(gen3)
 	if m.StopEphemeralTests("") {
 		t.Fatal("stop with nothing in flight = true, want false")
 	}

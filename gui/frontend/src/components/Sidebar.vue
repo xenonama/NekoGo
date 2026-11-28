@@ -52,7 +52,9 @@
         @click="toggleMode"
       >
         <span class="nb-side-advlabel">{{ modeLabel }}</span>
-        <span class="adv-switch" :class="{ on: isAdvancedMode }" aria-hidden="true" />
+        <span class="stg-toggle" :class="{ on: isAdvancedMode }" aria-hidden="true">
+          <span class="knob" />
+        </span>
       </button>
     </div>
   </aside>

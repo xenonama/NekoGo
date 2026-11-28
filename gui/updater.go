@@ -2,30 +2,10 @@ package main
 
 // Update policy (v2rayN-style manager, in-app):
 //
-// NekoGo runs two sing-box binaries, and each has its own updater:
-//   - sing-box.exe: the official SagerNet CLI, used when Settings →
-//     Connection selects CoreEngine=upstream. It has no Thrift RPC, so
-//     traffic stats/connections go through the Clash API.
-//   - nekobox_core.exe: the NekoBox fork with the Thrift server, used
-//     by CoreEngine=custom; it also carries the NekoGo-only protocols.
-//
-// The official binary comes straight from SagerNet/sing-box (stable
-// releases). The NekoBox core still ships in the fork's own releases
-// (xenonama/NekoGo) until a dedicated core repo exists; pickForkAsset
-// only matches fork-published assets, so the two sources can never be
-// mixed up. xray is not fork-published at all: the row follows
-// XTLS/Xray-core and installs the xray.exe of that release, which is
-// the binary the Xray engine runs and the one BuildXrayConfig's stock
-// Xray JSON is written for.
-//
-// Covered components (see updatableIDs):
-//   - geoip/geosite: plain data files, updated in place.
-//   - singbox (official CLI), nekobox (Thrift core), xray: replaced in
-//     place with .bak backup + smoke-verify + rollback. Refused while
-//     a core is running.
-//   - gui (NekoGo.exe): the installer is downloaded and opened
-//     manually, never applied silently (a running exe cannot replace
-//     itself, and there is no signature check yet).
+// Core and data rows download through the selected proxy without stopping
+// the active connection. Installation replaces only the target image; a
+// connection using that image is stopped and reconnected afterwards.
+// NekoGo itself is staged as raw nekogo.exe and applied by a post-exit helper.
 
 import (
 	"archive/zip"
@@ -50,11 +30,8 @@ import (
 	"time"
 )
 
-// Manual update manager (no auto-check, no GPG yet — see TODOs below).
-// All network access uses a NekoGo User-Agent: updateHTTP (15s whole-request
-// timeout) for the small API/HEAD calls, downloadHTTP for binaries. Tests
-// redirect every source via updateBaseURL so the suite never touches the
-// real GitHub API.
+// Manual update manager (no auto-check). Checks and downloads share the
+// selected proxy-aware transport; tests redirect sources through updateBaseURL.
 
 // updateBaseURL redirects updater source roots in tests (httptest
 // servers). Production uses the defaults. Keys:
@@ -71,32 +48,119 @@ func updateBase(key, def string) string {
 	return def
 }
 
-// updateHTTP bounds the small API/HEAD calls. Its Timeout covers the WHOLE
-// request including the body, so it must never be used for a binary
-// download: 15s aborts a 30-80 MB core (or the ~70 MB setup) on any link
-// slower than a few MB/s, which made every core update fail with
-// "context deadline exceeded" and read like a dead source.
-var updateHTTP = &http.Client{Timeout: 15 * time.Second}
+func (a *App) updaterCheckClient() *http.Client {
+	return &http.Client{
+		Timeout:   15 * time.Second,
+		Transport: a.updaterDownloadClient().Transport,
+	}
+}
 
-// downloadHTTP serves binaries: the connection phases are bounded, the
-// body is allowed to stream. Compression is off so Content-Length stays
-// the real byte count — a transparently gzipped body reports -1, which
-// would leave a resumed download unable to tell truncation from completion.
-var downloadHTTP = &http.Client{
-	Transport: &http.Transport{
-		Proxy:                 http.ProxyFromEnvironment,
+// The download client bounds connection phases while allowing the body to
+// stream. Compression is off so Content-Length stays the real byte count.
+func newUpdaterDownloadTransport(proxy func(*http.Request) (*url.URL, error)) *http.Transport {
+	return &http.Transport{
+		Proxy:                 proxy,
 		DialContext:           (&net.Dialer{Timeout: 20 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
 		TLSHandshakeTimeout:   20 * time.Second,
 		ResponseHeaderTimeout: 30 * time.Second,
 		ExpectContinueTimeout: 1 * time.Second,
 		DisableCompression:    true,
-	},
+	}
+}
+
+func (a *App) updaterDownloadClient() *http.Client {
+	a.updaterHTTPOnce.Do(func() {
+		a.updaterHTTPClient = &http.Client{Transport: newUpdaterDownloadTransport(a.updaterProxy)}
+	})
+	return a.updaterHTTPClient
+}
+
+func (a *App) updaterProxy(req *http.Request) (*url.URL, error) {
+	if req == nil || req.URL == nil || proxyBypassHost(req.URL.Hostname()) {
+		return nil, nil
+	}
+	target := req.URL
+	if !a.UpdaterProxyEnabled() {
+		return nil, nil
+	}
+	if a.cores != nil {
+		ports := a.ActiveProxyPorts()
+		if ports.HTTP > 0 || ports.SOCKS > 0 {
+			return &url.URL{Scheme: "http", Host: proxyServerValue(ports)}, nil
+		}
+	}
+	if on, server, err := a.proxyStateRead()(); err == nil && on {
+		if proxy, ok := parseSystemProxyServer(server, target.Scheme); ok {
+			return proxy, nil
+		}
+	}
+	return http.ProxyFromEnvironment(req)
+}
+
+func proxyBypassHost(host string) bool {
+	host = strings.TrimSpace(host)
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		return ip.IsLoopback()
+	}
+	return false
+}
+
+func parseSystemProxyServer(value, scheme string) (*url.URL, bool) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return nil, false
+	}
+	if strings.Contains(value, "=") {
+		keys := []string{"https", "http", "socks"}
+		if scheme == "http" {
+			keys = []string{"http", "https", "socks"}
+		}
+		for _, key := range keys {
+			for _, part := range strings.Split(value, ";") {
+				name, address, ok := strings.Cut(strings.TrimSpace(part), "=")
+				if ok && strings.EqualFold(strings.TrimSpace(name), key) {
+					defaultScheme := "http"
+					if key == "socks" {
+						defaultScheme = "socks5"
+					}
+					return parseProxyURL(address, defaultScheme)
+				}
+			}
+		}
+		return nil, false
+	}
+	return parseProxyURL(value, "http")
+}
+
+func parseProxyURL(value, defaultScheme string) (*url.URL, bool) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return nil, false
+	}
+	if !strings.Contains(value, "://") {
+		value = defaultScheme + "://" + value
+	}
+	u, err := url.Parse(value)
+	if err != nil || u.Host == "" {
+		return nil, false
+	}
+	switch strings.ToLower(u.Scheme) {
+	case "http", "https", "socks5", "socks5h":
+		return u, true
+	default:
+		return nil, false
+	}
 }
 
 // errAlreadyUpToDate marks a download whose bytes match the installed
 // file. It is a successful no-op, not a failure: the rows used to log it
 // as an ERROR, so "Update" on a current component looked broken.
 var errAlreadyUpToDate = errors.New("already up to date")
+
+var errUpdateCancelled = errors.New("download cancelled")
 
 // maxDownloadBytes caps a single download (cores are tens of MB).
 const maxDownloadBytes = 512 << 20
@@ -107,7 +171,7 @@ const maxDownloadBytes = 512 << 20
 // Vars, not consts, so tests can shrink the waits to milliseconds.
 var (
 	// downloadIdleTimeout is the longest a body may produce zero bytes.
-	// downloadHTTP deliberately has no whole-request Timeout (a slow link
+	// the download client deliberately has no whole-request Timeout (a slow link
 	// needs minutes), so without this a connection that dies mid-transfer
 	// — the common case when the network drops — blocks Read forever.
 	downloadIdleTimeout = 30 * time.Second
@@ -123,27 +187,45 @@ const downloadRetryCap = 20 * time.Second
 
 // UpdatableComponent is one row of the Updates panel.
 type UpdatableComponent struct {
-	ID          string `json:"id"` // "geoip" | "geosite" | "singbox" | "nekobox" | "xray" | "mihomo" | "tor" | "psiphon" | "psiphon-servers" | "gui"
-	Name        string `json:"name"`
-	Current     string `json:"current"`
-	Latest      string `json:"latest"`
-	UpdateAvail bool   `json:"updateAvail"`
-	Notes       string `json:"notes,omitempty"`
-	LastCheck   string `json:"lastCheck,omitempty"` // RFC3339
-	LastError   string `json:"lastError,omitempty"`
-	// InstallerPath is set by updateGUI after a successful download:
-	// the UI offers an "Open installer" button the user must click.
-	// The backend never opens it on its own (BUG-010).
-	InstallerPath string `json:"installerPath,omitempty"`
+	ID           string `json:"id"` // "geoip" | "geosite" | "singbox" | "xray" | "mihomo" | "psiphon" | "psiphon-servers" | "nekogo"
+	Name         string `json:"name"`
+	Current      string `json:"current"`
+	Latest       string `json:"latest"`
+	UpdateAvail  bool   `json:"updateAvail"`
+	CheckEnabled bool   `json:"checkEnabled"`
+	Notes        string `json:"notes,omitempty"`
+	LastCheck    string `json:"lastCheck,omitempty"` // RFC3339
+	LastError    string `json:"lastError,omitempty"`
+	// CheckUnavailable marks an exceptional check failure that must not
+	// block a manual update attempt (currently Psiphon Servers only).
+	CheckUnavailable bool `json:"checkUnavailable,omitempty"`
+	// DownloadedBytes and TotalBytes drive the live "10/20 MB" display.
+	// A negative total means the source did not declare a length.
+	DownloadedBytes int64 `json:"downloadedBytes,omitempty"`
+	TotalBytes      int64 `json:"totalBytes,omitempty"`
+	Downloading     bool  `json:"downloading,omitempty"`
+	// UpdateFoundAt remembers the first check that found this update.
+	// It stays visible until the update is actually installed.
+	UpdateFoundAt string `json:"updateFoundAt,omitempty"`
 }
 
-// updatableIDs are the fixed rows. "singbox" is the official CLI
-// (upstream engine); "nekobox" is the Thrift core (custom engine);
-// "mihomo" is the Clash Meta engine; "tor" is the Tor Project's own
-// tor.exe; "psiphon" is aether.exe, the engine carrying Psiphon (and,
-// with its Arti client, the fallback Tor hop); "psiphon-servers" is the
-// signed server list that engine starts from.
-var updatableIDs = []string{"geoip", "geosite", "singbox", "nekobox", "xray", "mihomo", "tor", "psiphon", "psiphon-servers", "gui"}
+type updaterRowState struct {
+	CheckEnabled     *bool  `json:"checkEnabled,omitempty"`
+	Latest           string `json:"latest,omitempty"`
+	UpdateAvail      bool   `json:"updateAvail,omitempty"`
+	Notes            string `json:"notes,omitempty"`
+	LastCheck        string `json:"lastCheck,omitempty"`
+	LastError        string `json:"lastError,omitempty"`
+	CheckUnavailable bool   `json:"checkUnavailable,omitempty"`
+	UpdateFoundAt    string `json:"updateFoundAt,omitempty"`
+	CompletedLatest  string `json:"completedLatest,omitempty"`
+}
+
+type updaterState struct {
+	Version      int                        `json:"version"`
+	ProxyEnabled *bool                      `json:"proxyEnabled,omitempty"`
+	Rows         map[string]updaterRowState `json:"rows"`
+}
 
 // --- local state (no network) ---
 
@@ -173,9 +255,8 @@ func updaterDataDir() string {
 }
 
 // coreExeDir is where replacement core exes go: the PattN-style bin\
-// folder next to the GUI exe (created on install). An existing core
-// installed elsewhere is updated in place instead (updateCoreExe uses
-// the resolved path).
+// folder next to the GUI exe (created on install). Existing resolved
+// core paths are updated in place.
 func coreExeDir() string {
 	return engineInstallDir()
 }
@@ -240,24 +321,19 @@ func (a *App) localUpdatables() []UpdatableComponent {
 	if sbCurrent == "" {
 		sbNote = "Not installed — only the Upstream core engine needs it"
 	}
-	nbCurrent, nbNote := a.coreDisplayVersion("nekobox", a.CoreVersion())
 	xrCurrent, xrNote := a.coreDisplayVersion("xray", a.XrayVersion())
 	mhCurrent, mhNote := a.coreDisplayVersion("mihomo", a.MihomoVersion())
-	torCurrent, torNote := a.coreDisplayVersion("tor", a.TorVersion())
-	torNote = a.torTransportNote(torNote)
 	psCurrent, psNote := a.coreDisplayVersion("psiphon", a.AetherVersion())
 	psNote = a.psiphonTransportNote(psNote)
 	out := []UpdatableComponent{
 		{ID: "geoip", Name: "GeoIP Database", Current: dataFileCurrent(geoPath)},
 		{ID: "geosite", Name: "GeoSite Rule-set", Current: dataFileCurrent(geoSitePath)},
 		{ID: "singbox", Name: "sing-box Core (official)", Current: sbCurrent, Notes: sbNote},
-		{ID: "nekobox", Name: "NekoBox Core (nekobox_core)", Current: nbCurrent, Notes: nbNote},
 		{ID: "xray", Name: "Xray Core", Current: xrCurrent, Notes: xrNote},
 		{ID: "mihomo", Name: "mihomo Core (Clash Meta)", Current: mhCurrent, Notes: mhNote},
-		{ID: "tor", Name: "Tor (tor.exe, standalone)", Current: torCurrent, Notes: torNote},
 		{ID: "psiphon", Name: "Aether", Current: psCurrent, Notes: psNote},
 		psiphonServersRow(),
-		{ID: "gui", Name: "NekoGo GUI", Current: appVersion},
+		{ID: "nekogo", Name: "NekoGo", Current: appVersionValue()},
 	}
 	if _, err := os.Stat(geoPath); err != nil {
 		out[0].Notes = "Not installed"
@@ -285,26 +361,6 @@ func (a *App) coreDisplayVersion(id, line string) (current, note string) {
 	return "", "Not installed"
 }
 
-// torTransportNote adds what is missing BESIDE tor.exe to the Tor row.
-// The standalone daemon speaks no obfs4 or webtunnel itself: it spawns
-// the transport named in its ClientTransportPlugin line. A tree without
-// lyrebird.exe starts Tor, fails to launch a transport for every bridge
-// line, and then sits in a bootstrap that reads as a network problem
-// rather than as the missing file it is.
-func (a *App) torTransportNote(note string) string {
-	bin := a.currentCorePath("tor")
-	missing := missingStandaloneTorTransports(bin)
-	if len(missing) == 0 {
-		return note
-	}
-	pt := fmt.Sprintf("pluggable_transports\\%s is missing next to %s — Tor bridges (obfs4, webtunnel) cannot launch",
-		strings.Join(missing, ", pluggable_transports\\"), filepath.Base(bin))
-	if note != "" {
-		return note + "; " + pt
-	}
-	return pt
-}
-
 // psiphonTransportNote is the same report for aether.exe, which carries
 // Psiphon in its own pt\ folder and runs its Arti client from there too.
 func (a *App) psiphonTransportNote(note string) string {
@@ -326,6 +382,14 @@ func (a *App) psiphonTransportNote(note string) string {
 // call — so tests can stub the smoke-verify step without shipping a
 // real executable.
 var exeVersionQuery = runVersionQuery
+
+var (
+	nekogoExecutable        = os.Executable
+	startNekoGoUpdateHelper = startSelfUpdateHelper
+	coreApplyReconnect      = func(a *App, id string) error { return a.connect(id, true) }
+	coreApplyConnectWait    = 60 * time.Second
+	coreApplyProbeWait      = 45 * time.Second
+)
 
 // psiphonServersLocal reports the list the Psiphon engine starts from: a
 // downloaded list when the one in the aether work dir is Psiphon's signed
@@ -358,10 +422,278 @@ func psiphonServersRow() UpdatableComponent {
 	return UpdatableComponent{ID: "psiphon-servers", Name: "Psiphon Servers", Current: current, Notes: note}
 }
 
+func (a *App) loadUpdaterStateLocked() {
+	if a.updaterLoaded {
+		return
+	}
+	a.updaterLoaded = true
+	a.updaterRows = make(map[string]updaterRowState)
+	a.updaterBytes = make(map[string][2]int64)
+	a.updaterRunning = make(map[string]bool)
+	a.updaterContexts = make(map[string]context.Context)
+	a.updaterCancels = make(map[string]context.CancelFunc)
+	a.updaterProxyEnabled = true
+	if a.store == nil {
+		return
+	}
+	data, err := os.ReadFile(filepath.Join(a.store.Dir(), "updates.json"))
+	if err != nil {
+		return
+	}
+	var state updaterState
+	if err := json.Unmarshal(data, &state); err != nil {
+		updateLog := a.updateLog
+		updateLog("gui", "warn", "[update:gui] ignoring unreadable updates.json")
+		return
+	}
+	if state.ProxyEnabled != nil {
+		a.updaterProxyEnabled = *state.ProxyEnabled
+	}
+	for id, row := range state.Rows {
+		row.UpdateFoundAt = strings.TrimSpace(row.UpdateFoundAt)
+		row.CompletedLatest = strings.TrimSpace(row.CompletedLatest)
+		a.updaterRows[id] = row
+	}
+}
+
+func (a *App) saveUpdaterStateLocked() {
+	if a.store == nil {
+		return
+	}
+	proxyEnabled := a.updaterProxyEnabled
+	state := updaterState{Version: 1, Rows: a.updaterRows, ProxyEnabled: &proxyEnabled}
+	data, err := json.Marshal(state)
+	if err != nil {
+		return
+	}
+	path := filepath.Join(a.store.Dir(), "updates.json")
+	if err := os.WriteFile(path+".tmp", data, 0o644); err != nil {
+		a.updateLog("gui", "warn", "[update:gui] could not save update reminders: "+err.Error())
+		return
+	}
+	if err := os.Rename(path+".tmp", path); err != nil {
+		_ = os.Remove(path + ".tmp")
+		a.updateLog("gui", "warn", "[update:gui] could not save update reminders: "+err.Error())
+	}
+}
+
+func (a *App) overlayUpdaterStateLocked(rows []UpdatableComponent) {
+	for i := range rows {
+		row := &rows[i]
+		row.CheckEnabled = true
+		state, ok := a.updaterRows[row.ID]
+		if ok {
+			if state.CheckEnabled != nil {
+				row.CheckEnabled = *state.CheckEnabled
+			}
+			row.Latest = state.Latest
+			row.CheckUnavailable = state.CheckUnavailable
+			if state.Latest != "" && state.CompletedLatest != state.Latest && updateNeeded(row.Current, state.Latest) {
+				row.UpdateAvail = state.UpdateAvail
+			} else if state.CheckUnavailable && row.ID == "psiphon-servers" {
+				row.UpdateAvail = state.UpdateAvail
+			}
+			if row.UpdateAvail && state.UpdateFoundAt != "" {
+				row.UpdateFoundAt = state.UpdateFoundAt
+			}
+			row.LastCheck = state.LastCheck
+			row.LastError = state.LastError
+			if state.Notes != "" {
+				row.Notes = state.Notes
+			}
+		}
+		if bytes, ok := a.updaterBytes[row.ID]; ok {
+			row.DownloadedBytes, row.TotalBytes = bytes[0], bytes[1]
+		}
+		row.Downloading = a.updaterRunning[row.ID]
+	}
+}
+
 // ListUpdatables returns the current local state of every updatable
-// component (no network).
+// component (no network), including remembered checks and live progress.
 func (a *App) ListUpdatables() ([]UpdatableComponent, error) {
-	return a.localUpdatables(), nil
+	rows := a.localUpdatables()
+	a.updaterMu.Lock()
+	a.loadUpdaterStateLocked()
+	a.overlayUpdaterStateLocked(rows)
+	a.updaterMu.Unlock()
+	return rows, nil
+}
+
+func (a *App) SetUpdatableEnabled(id string, enabled bool) error {
+	known := false
+	for _, row := range a.localUpdatables() {
+		if row.ID == id {
+			known = true
+			break
+		}
+	}
+	if !known {
+		return fmt.Errorf("unknown component %q", id)
+	}
+	a.updaterMu.Lock()
+	defer a.updaterMu.Unlock()
+	a.loadUpdaterStateLocked()
+	state := a.updaterRows[id]
+	state.CheckEnabled = &enabled
+	a.updaterRows[id] = state
+	a.saveUpdaterStateLocked()
+	return nil
+}
+
+func (a *App) UpdaterProxyEnabled() bool {
+	a.updaterMu.Lock()
+	defer a.updaterMu.Unlock()
+	a.loadUpdaterStateLocked()
+	return a.updaterProxyEnabled
+}
+
+func (a *App) SetUpdaterProxyEnabled(enabled bool) error {
+	a.updaterMu.Lock()
+	defer a.updaterMu.Unlock()
+	a.loadUpdaterStateLocked()
+	a.updaterProxyEnabled = enabled
+	a.saveUpdaterStateLocked()
+	return nil
+}
+
+func (a *App) CancelUpdate(id string) bool {
+	a.updaterMu.Lock()
+	cancel := a.updaterCancels[id]
+	if cancel != nil {
+		delete(a.updaterCancels, id)
+	}
+	a.updaterMu.Unlock()
+	if cancel == nil {
+		return false
+	}
+	cancel()
+	return true
+}
+
+func (a *App) updaterDownloadContext(id string) context.Context {
+	a.updaterMu.Lock()
+	defer a.updaterMu.Unlock()
+	a.loadUpdaterStateLocked()
+	if ctx := a.updaterContexts[id]; ctx != nil {
+		return ctx
+	}
+	return context.Background()
+}
+
+func (a *App) rememberUpdaterRows(rows []UpdatableComponent) {
+	a.updaterMu.Lock()
+	defer a.updaterMu.Unlock()
+	a.loadUpdaterStateLocked()
+	now := time.Now().Format(time.RFC3339)
+	for _, row := range rows {
+		state := a.updaterRows[row.ID]
+		if row.CheckUnavailable {
+			if row.Latest != "" {
+				state.Latest = row.Latest
+			}
+			state.UpdateAvail = true
+			state.Notes = row.Notes
+			state.LastCheck = row.LastCheck
+			state.LastError = ""
+			state.CheckUnavailable = true
+			a.updaterRows[row.ID] = state
+			continue
+		}
+		if row.LastError != "" && state.Latest != "" {
+			state.LastCheck = row.LastCheck
+			state.LastError = row.LastError
+			a.updaterRows[row.ID] = state
+			continue
+		}
+		previousLatest := state.Latest
+		state.Latest = row.Latest
+		state.UpdateAvail = row.UpdateAvail
+		state.Notes = row.Notes
+		state.LastCheck = row.LastCheck
+		state.LastError = row.LastError
+		state.CheckUnavailable = false
+		if row.UpdateAvail && row.Latest != "" && row.Latest != state.CompletedLatest {
+			if state.UpdateFoundAt == "" || previousLatest != row.Latest {
+				state.UpdateFoundAt = now
+			}
+		} else {
+			state.UpdateFoundAt = ""
+		}
+		a.updaterRows[row.ID] = state
+	}
+	a.saveUpdaterStateLocked()
+}
+
+func (a *App) beginUpdaterDownload(id string) {
+	a.updaterMu.Lock()
+	defer a.updaterMu.Unlock()
+	a.loadUpdaterStateLocked()
+	if cancel := a.updaterCancels[id]; cancel != nil {
+		cancel()
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	a.updaterContexts[id] = ctx
+	a.updaterCancels[id] = cancel
+	a.updaterBytes[id] = [2]int64{0, -1}
+	a.updaterRunning[id] = true
+}
+
+func (a *App) setUpdaterProgress(id string, downloaded, total int64) {
+	a.updaterMu.Lock()
+	defer a.updaterMu.Unlock()
+	a.loadUpdaterStateLocked()
+	a.updaterBytes[id] = [2]int64{downloaded, total}
+}
+
+func (a *App) setUpdaterTotal(id string, total int64) {
+	a.updaterMu.Lock()
+	defer a.updaterMu.Unlock()
+	a.loadUpdaterStateLocked()
+	bytes := a.updaterBytes[id]
+	bytes[1] = total
+	a.updaterBytes[id] = bytes
+}
+
+func (a *App) finishUpdaterDownload(id string, row *UpdatableComponent, err error) {
+	a.updaterMu.Lock()
+	defer a.updaterMu.Unlock()
+	a.loadUpdaterStateLocked()
+	delete(a.updaterBytes, id)
+	delete(a.updaterRunning, id)
+	delete(a.updaterContexts, id)
+	if cancel := a.updaterCancels[id]; cancel != nil {
+		cancel()
+		delete(a.updaterCancels, id)
+	}
+	if err != nil || row == nil {
+		return
+	}
+	state := a.updaterRows[id]
+	state.Latest = row.Latest
+	state.Notes = row.Notes
+	state.LastError = ""
+	state.CheckUnavailable = false
+	if id == "nekogo" {
+		state.UpdateAvail = row.UpdateAvail
+		if state.UpdateAvail {
+			if state.UpdateFoundAt == "" {
+				state.UpdateFoundAt = time.Now().Format(time.RFC3339)
+			}
+		} else {
+			state.UpdateFoundAt = ""
+		}
+		row.UpdateAvail = state.UpdateAvail
+		row.UpdateFoundAt = state.UpdateFoundAt
+	} else {
+		state.CompletedLatest = row.Latest
+		state.UpdateAvail = false
+		state.UpdateFoundAt = ""
+		row.UpdateAvail = false
+		row.UpdateFoundAt = ""
+	}
+	a.updaterRows[id] = state
+	a.saveUpdaterStateLocked()
 }
 
 // --- GitHub release resolution ---
@@ -383,23 +715,14 @@ type ghRelease struct {
 	Assets  []ghAsset `json:"assets"`
 }
 
-// releaseLookup is one GitHub release lookup shared by every row that
-// reads the same repo. CheckUpdates fills these before starting its
-// goroutines, so the rows only read them.
-type releaseLookup struct {
-	repo string
-	rel  *ghRelease
-	err  error
-}
-
-func updateGet(url string) (*http.Response, error) {
-	req, err := http.NewRequest("GET", url, nil)
+func (a *App) updateGet(rawURL string) (*http.Response, error) {
+	req, err := http.NewRequest("GET", rawURL, nil)
 	if err != nil {
 		return nil, err
 	}
-	req.Header.Set("User-Agent", "NekoGo/"+appVersion)
+	req.Header.Set("User-Agent", "NekoGo/"+appVersionValue())
 	req.Header.Set("Accept", "application/vnd.github+json")
-	return updateHTTP.Do(req)
+	return a.updaterCheckClient().Do(req)
 }
 
 // downloadGet issues one attempt of a binary download through
@@ -408,24 +731,24 @@ func updateGet(url string) (*http.Response, error) {
 // strong ETag or Last-Modified of the first response, sent as If-Range so
 // an asset that changed since then comes back whole rather than letting
 // two different releases be spliced together.
-func downloadGet(ctx context.Context, rawURL string, offset int64, validator string) (*http.Response, error) {
+func (a *App) downloadGet(ctx context.Context, rawURL string, offset int64, validator string) (*http.Response, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
 	if err != nil {
 		return nil, err
 	}
-	req.Header.Set("User-Agent", "NekoGo/"+appVersion)
+	req.Header.Set("User-Agent", "NekoGo/"+appVersionValue())
 	if offset > 0 {
 		req.Header.Set("Range", fmt.Sprintf("bytes=%d-", offset))
 		if validator != "" {
 			req.Header.Set("If-Range", validator)
 		}
 	}
-	return downloadHTTP.Do(req)
+	return a.updaterDownloadClient().Do(req)
 }
 
-func githubLatest(ownerRepo string) (*ghRelease, error) {
+func (a *App) githubLatest(ownerRepo string) (*ghRelease, error) {
 	url := updateBase("github-api", "https://api.github.com") + "/repos/" + ownerRepo + "/releases/latest"
-	resp, err := updateGet(url)
+	resp, err := a.updateGet(url)
 	if err != nil {
 		return nil, err
 	}
@@ -448,27 +771,19 @@ func githubLatest(ownerRepo string) (*ghRelease, error) {
 //
 //	| Component | Source repo           | Asset pattern                        | Install path |
 //	| singbox   | SagerNet/sing-box     | sing-box-<ver>-windows-<arch>.zip    | resolveUpstreamCore path, else exe dir |
-//	| nekobox   | xenonama/NekoGo       | nekobox_core.exe (or .zip holding it) | resolved core path, else exe dir |
+//	| nekogo    | xenonama/NekoGo       | nekogo.exe                            | running executable, applied after exit |
 //	| xray      | XTLS/Xray-core        | Xray-windows-64.zip                  | resolved xray path, else exe dir |
 //	| mihomo    | MetaCubeX/mihomo      | mihomo-windows-<arch>[-v1]-v<ver>.zip | resolved mihomo path, else exe dir\bin\mihomo.exe |
-//	| gui       | xenonama/NekoGo       | NekoGo-Setup-*.exe / NekoGo-Portable-*.zip | %APPDATA%/NekoGo/updates/ (manual open via Open installer button; never auto-opened) |
+//	| psiphon   | CluvexStudio/Aether   | aether-windows-x86_64.zip            | resolved aether path, else exe dir |
 //	| geoip     | Loyalsoldier/geoip    | Country.mmdb (@release)              | gui/assets/GeoLite2-Country.mmdb |
 //	| geosite   | Loyalsoldier/v2ray-rules-dat | geosite.dat                     | gui/assets/geosite.dat |
 //	| psiphon-servers | Psiphon (signed list) | psiphon_servers.dat (the list Psiphon publishes) | embedded in the app (gui/psiphon_servers.dat), unpacked into the aether work dir as psiphon-servers.txt |
-//
-// The NekoBox core row points at the app repo today; a dedicated core
-// repo is planned (nekoCoreOwnerRepo), and only that constant changes.
 const forkOwnerRepo = "xenonama/NekoGo"
 
 // officialSingBoxOwnerRepo is the upstream sing-box project. The
 // official CLI is the only source for the singbox row; it is a drop-in
 // for CoreEngine=upstream and needs none of the fork's patches.
 const officialSingBoxOwnerRepo = "SagerNet/sing-box"
-
-// nekoCoreOwnerRepo hosts the NekoBox Thrift core (nekobox_core.exe).
-// A dedicated core repo is planned; until it exists the fork's app
-// releases carry the binaries, so this points at the same repo.
-const nekoCoreOwnerRepo = forkOwnerRepo
 
 // mihomoOwnerRepo publishes the Clash Meta engine. Its STABLE release is
 // the source: the newest entry in /releases is the rolling
@@ -561,32 +876,6 @@ func xrayAsset(assets []ghAsset) *ghAsset {
 	return nil
 }
 
-// pickForkAsset selects a fork-published core binary asset: either the
-// raw "<exeBase>.exe" (or bare "<exeBase>" on non-Windows), or a
-// *.zip containing it (matched by name).
-func pickForkAsset(assets []ghAsset, exeBase string) *ghAsset {
-	want := strings.ToLower(exeBase + ".exe")
-	for i := range assets {
-		if strings.ToLower(assets[i].Name) == want {
-			return &assets[i]
-		}
-	}
-	// Bare name (linux/macOS assets ship without .exe).
-	wantBare := strings.ToLower(exeBase)
-	for i := range assets {
-		if strings.ToLower(assets[i].Name) == wantBare {
-			return &assets[i]
-		}
-	}
-	for i := range assets {
-		n := strings.ToLower(assets[i].Name)
-		if strings.HasSuffix(n, ".zip") && strings.Contains(n, strings.ToLower(exeBase)) {
-			return &assets[i]
-		}
-	}
-	return nil
-}
-
 // isNotFoundErr reports a GitHub 404 (no release published yet) as
 // opposed to other network/API failures.
 func isNotFoundErr(err error) bool {
@@ -598,9 +887,9 @@ func isNotFoundErr(err error) bool {
 // which GitHub restricts to full releases, this keeps NekoGo
 // pre-releases visible to the GUI updater. An empty list means the
 // fork has not published anything yet.
-func githubFirstRelease(ownerRepo string) (*ghRelease, error) {
+func (a *App) githubFirstRelease(ownerRepo string) (*ghRelease, error) {
 	url := updateBase("github-api", "https://api.github.com") + "/repos/" + ownerRepo + "/releases?per_page=1"
-	resp, err := updateGet(url)
+	resp, err := a.updateGet(url)
 	if err != nil {
 		return nil, err
 	}
@@ -635,32 +924,8 @@ func pickAssetExact(assets []ghAsset, name string) *ghAsset {
 	return nil
 }
 
-// pickGUIAsset selects the GUI installer asset with anchored suffixes
-// (BUG-041): exact "NekoGo-Setup-*.exe" first, then
-// "NekoGo-Portable-*.zip", then any *nekogo* name still anchored to
-// .exe/.zip. Bare generic substrings ("setup"/"nekogo") never match
-// non-installer files (e.g. NekoGo-Setup-notes.txt), which the old
-// pickNamed call matched and then downloaded/auto-opened.
-func pickGUIAsset(assets []ghAsset) *ghAsset {
-	for i := range assets {
-		n := strings.ToLower(assets[i].Name)
-		if strings.HasPrefix(n, "nekogo-setup-") && strings.HasSuffix(n, ".exe") {
-			return &assets[i]
-		}
-	}
-	for i := range assets {
-		n := strings.ToLower(assets[i].Name)
-		if strings.HasPrefix(n, "nekogo-portable-") && strings.HasSuffix(n, ".zip") {
-			return &assets[i]
-		}
-	}
-	for i := range assets {
-		n := strings.ToLower(assets[i].Name)
-		if strings.Contains(n, "nekogo") && (strings.HasSuffix(n, ".exe") || strings.HasSuffix(n, ".zip")) {
-			return &assets[i]
-		}
-	}
-	return nil
+func pickNekoGoAsset(assets []ghAsset) *ghAsset {
+	return pickAssetExact(assets, "nekogo.exe")
 }
 
 // normTag strips a leading "v" for comparison ("v1.14.1" vs "1.14.1").
@@ -909,8 +1174,8 @@ func (a *App) checkGeoIP(c *UpdatableComponent) {
 		c.LastError = err.Error()
 		return
 	}
-	req.Header.Set("User-Agent", "NekoGo/"+appVersion)
-	resp, err := updateHTTP.Do(req)
+	req.Header.Set("User-Agent", "NekoGo/"+appVersionValue())
+	resp, err := a.updaterCheckClient().Do(req)
 	if err != nil {
 		c.LastError = err.Error()
 		return
@@ -949,7 +1214,7 @@ func (a *App) checkGeoIP(c *UpdatableComponent) {
 }
 
 func (a *App) checkGeosite(c *UpdatableComponent) {
-	rel, err := githubLatest("Loyalsoldier/v2ray-rules-dat")
+	rel, err := a.githubLatest("Loyalsoldier/v2ray-rules-dat")
 	if err != nil {
 		c.LastError = err.Error()
 		return
@@ -981,41 +1246,12 @@ func geositeMarker() string {
 	return filepath.Join(updaterDataDir(), "geosite.version")
 }
 
-// checkCore resolves a singbox/xray row against a fork release list
-// (prereleases included): fork-published patched cores are the only
-// installable source — upstream binaries stay rejected by
-// construction (pickForkAsset never looks at upstream repos).
-func (a *App) checkCore(c *UpdatableComponent, exeBase string, lk releaseLookup) {
-	rel, err := lk.rel, lk.err
-	if err != nil {
-		if isNotFoundErr(err) || strings.Contains(err.Error(), "no releases") {
-			c.UpdateAvail = false
-			c.Notes = "No core release published yet — manual update only (run build.bat)."
-			a.updateLog(c.ID, "info", fmt.Sprintf("[update:%s] source=%s latest=(none)", c.ID, lk.repo))
-			return
-		}
-		c.LastError = err.Error()
-		return
-	}
-	a.updateLog(c.ID, "info", fmt.Sprintf("[update:%s] source=%s latest=%s", c.ID, lk.repo, rel.TagName))
-	asset := pickForkAsset(rel.Assets, exeBase)
-	c.Latest = rel.TagName
-	if asset == nil {
-		c.UpdateAvail = false
-		c.Notes = fmt.Sprintf("%s is not published in %s — manual update only (run build.bat).", coreExeName(exeBase), rel.TagName)
-		return
-	}
-	if coreUpdateNeeded(c.Current, rel.TagName, asset) {
-		c.UpdateAvail = true
-	}
-}
-
 // checkOfficialSingBox resolves the singbox row against SagerNet's
 // stable releases. The official CLI is a separate binary from
 // nekobox_core.exe; only the Windows zip is unpacked in-app, so other
 // platforms stay on the manual note.
 func (a *App) checkOfficialSingBox(c *UpdatableComponent) {
-	rel, err := githubLatest(officialSingBoxOwnerRepo)
+	rel, err := a.githubLatest(officialSingBoxOwnerRepo)
 	if err != nil {
 		c.LastError = err.Error()
 		return
@@ -1056,7 +1292,7 @@ func officialSingBoxAsset(assets []ghAsset) *ghAsset {
 // /releases: that is the rolling "Prerelease-Alpha" tag, which carries
 // no version to compare and would never stop offering itself.
 func (a *App) checkMihomo(c *UpdatableComponent) {
-	rel, err := githubLatest(mihomoOwnerRepo)
+	rel, err := a.githubLatest(mihomoOwnerRepo)
 	if err != nil {
 		c.LastError = err.Error()
 		return
@@ -1103,7 +1339,7 @@ func aetherAsset(assets []ghAsset) *ghAsset {
 // installed" and offers the update — which is the only way a user learns
 // that the Aether core was never there.
 func (a *App) checkPsiphon(c *UpdatableComponent) {
-	rel, err := githubLatest(aetherOwnerRepo)
+	rel, err := a.githubLatest(aetherOwnerRepo)
 	if err != nil {
 		c.LastError = err.Error()
 		return
@@ -1130,12 +1366,21 @@ func (a *App) checkPsiphonServers(c *UpdatableComponent) {
 	current, published, note := psiphonServersLocal()
 	c.Current = current
 	c.Notes = note
-	latest, err := psiphonServersPublished(psiphonServersSource())
+	latest, err := a.psiphonServersPublished(psiphonServersSource())
 	if err != nil {
-		c.LastError = err.Error()
+		c.CheckUnavailable = true
+		c.UpdateAvail = true
+		c.LastError = ""
+		c.Notes = "Update check unavailable — you can still try Update."
+		a.updateLog(c.ID, "warn", "[update:"+c.ID+"] check unavailable: "+err.Error())
 		return
 	}
+	c.CheckUnavailable = false
 	if latest.IsZero() {
+		c.CheckUnavailable = true
+		c.UpdateAvail = true
+		c.LastError = ""
+		c.Notes = "Publication time unknown — you can still try Update."
 		return
 	}
 	c.Latest = latest.Format("2006-01-02")
@@ -1151,13 +1396,13 @@ func psiphonServersSource() string {
 
 // psiphonServersPublished returns the Last-Modified time of the list at
 // url; zero when the server does not name one.
-func psiphonServersPublished(url string) (time.Time, error) {
-	req, err := http.NewRequest("HEAD", url, nil)
+func (a *App) psiphonServersPublished(rawURL string) (time.Time, error) {
+	req, err := http.NewRequest("HEAD", rawURL, nil)
 	if err != nil {
 		return time.Time{}, err
 	}
-	req.Header.Set("User-Agent", "NekoGo/"+appVersion)
-	resp, err := updateHTTP.Do(req)
+	req.Header.Set("User-Agent", "NekoGo/"+appVersionValue())
+	resp, err := a.updaterCheckClient().Do(req)
 	if err != nil {
 		return time.Time{}, errors.New(downloadErrorText(err))
 	}
@@ -1180,7 +1425,7 @@ func psiphonServersPublished(url string) (time.Time, error) {
 // that row compared an Xray banner against a NekoGo tag such as
 // "1.0.0-beta.3" and installed the binary bundled with the app.
 func (a *App) checkXray(c *UpdatableComponent) {
-	rel, err := githubLatest(xrayOwnerRepo)
+	rel, err := a.githubLatest(xrayOwnerRepo)
 	if err != nil {
 		c.LastError = err.Error()
 		return
@@ -1198,66 +1443,67 @@ func (a *App) checkXray(c *UpdatableComponent) {
 	}
 }
 
-func (a *App) checkGUI(c *UpdatableComponent, lk releaseLookup) {
-	// AUDIT (hotfix Task 2): queries xenonama/NekoGo/releases (list,
-	// newest first, prereleases included) — NOT /releases/latest, so
-	// pre-releases are visible.
-	rel, err := lk.rel, lk.err
+func (a *App) checkNekoGo(c *UpdatableComponent) {
+	rel, err := a.githubFirstRelease(forkOwnerRepo)
 	if err != nil {
 		if isNotFoundErr(err) || strings.Contains(err.Error(), "no releases published yet") {
 			c.UpdateAvail = false
 			c.Notes = "No NekoGo release published yet."
-			a.updateLog(c.ID, "info", fmt.Sprintf("[update:%s] source=%s latest=(none)", c.ID, lk.repo))
+			a.updateLog(c.ID, "info", fmt.Sprintf("[update:%s] source=%s latest=(none)", c.ID, forkOwnerRepo))
 			return
 		}
 		c.LastError = err.Error()
 		return
 	}
-	a.updateLog(c.ID, "info", fmt.Sprintf("[update:%s] source=%s latest=%s", c.ID, lk.repo, rel.TagName))
+	a.updateLog(c.ID, "info", fmt.Sprintf("[update:%s] source=%s latest=%s", c.ID, forkOwnerRepo, rel.TagName))
 	c.Latest = rel.TagName
-	asset := pickGUIAsset(rel.Assets)
-	if asset == nil {
+	if pickNekoGoAsset(rel.Assets) == nil {
 		c.UpdateAvail = false
-		c.Notes = "Manual update only"
+		c.Notes = "nekogo.exe is not published in this release"
 		return
 	}
-	if updateNeeded(appVersion, rel.TagName) {
+	if updateNeeded(appVersionValue(), rel.TagName) {
 		c.UpdateAvail = true
 		return
 	}
-	// A locally built GUI can be ahead of everything published (the fork's
-	// newest release is still 1.0.0-beta.1 while VERSION has moved on).
-	// "Already up to date" would be the wrong reason for the disabled
-	// button, so say which side is newer.
-	if updateNeeded(rel.TagName, appVersion) {
+	if updateNeeded(rel.TagName, appVersionValue()) {
 		c.Notes = "This build is newer than the published release"
 	}
 }
 
-// CheckUpdates queries every component (own goroutine each) and returns
-// the merged result. It never downloads. Partial failures land in
-// LastError; the call itself only fails if nothing could be checked... in
-// practice it always returns the rows with nil error so the UI can
-// render per-row state.
-func (a *App) CheckUpdates() ([]UpdatableComponent, error) {
+// CheckUpdates queries only the selected components and returns the merged
+// result. A nil selection checks every component for Go callers; an empty
+// non-nil selection checks none. Partial failures land in LastError.
+func (a *App) CheckUpdates(ids []string) ([]UpdatableComponent, error) {
+	a.updaterOpMu.Lock()
+	defer a.updaterOpMu.Unlock()
 	rows := a.localUpdatables()
-	now := time.Now().Format(time.RFC3339)
-	// nekobox and gui both read the fork's newest release: one
-	// lookup per repo, not one per row. GitHub allows 60 unauthenticated
-	// calls an hour and the panel's per-row Check button runs a whole
-	// pass, so identical requests spent half that budget for
-	// nothing. Written here and only read inside the goroutines below,
-	// so the map needs no lock.
-	lookups := map[string]releaseLookup{}
-	for _, repo := range []string{nekoCoreOwnerRepo, forkOwnerRepo} {
-		if _, ok := lookups[repo]; ok {
-			continue
-		}
-		rel, err := githubFirstRelease(repo)
-		lookups[repo] = releaseLookup{repo: repo, rel: rel, err: err}
+	known := make(map[string]bool, len(rows))
+	for _, row := range rows {
+		known[row.ID] = true
 	}
+	selected := make(map[string]bool, len(rows))
+	if ids == nil {
+		for id := range known {
+			selected[id] = true
+		}
+	} else {
+		for _, id := range ids {
+			if !known[id] {
+				return nil, fmt.Errorf("unknown component %q", id)
+			}
+			selected[id] = true
+		}
+	}
+	if len(selected) == 0 {
+		return a.ListUpdatables()
+	}
+	now := time.Now().Format(time.RFC3339)
 	var wg sync.WaitGroup
 	for i := range rows {
+		if !selected[rows[i].ID] {
+			continue
+		}
 		wg.Add(1)
 		go func(c *UpdatableComponent) {
 			defer wg.Done()
@@ -1268,26 +1514,29 @@ func (a *App) CheckUpdates() ([]UpdatableComponent, error) {
 				a.checkGeosite(c)
 			case "singbox":
 				a.checkOfficialSingBox(c)
-			case "nekobox":
-				a.checkCore(c, "nekobox_core", lookups[nekoCoreOwnerRepo])
 			case "xray":
 				a.checkXray(c)
 			case "mihomo":
 				a.checkMihomo(c)
-			case "tor":
-				a.checkTorRelease(c)
 			case "psiphon":
 				a.checkPsiphon(c)
 			case "psiphon-servers":
 				a.checkPsiphonServers(c)
-			case "gui":
-				a.checkGUI(c, lookups[forkOwnerRepo])
+			case "nekogo":
+				a.checkNekoGo(c)
 			}
 			c.LastCheck = now
 		}(&rows[i])
 	}
 	wg.Wait()
-	return rows, nil
+	checked := make([]UpdatableComponent, 0, len(selected))
+	for _, row := range rows {
+		if selected[row.ID] {
+			checked = append(checked, row)
+		}
+	}
+	a.rememberUpdaterRows(checked)
+	return a.ListUpdatables()
 }
 
 // --- download + install ---
@@ -1308,10 +1557,17 @@ type downloadState struct {
 // failures are retried with backoff. A permanent answer (404, an oversized
 // body) is returned at once instead of being retried.
 func (a *App) downloadFile(id, rawURL string) ([]byte, error) {
+	ctx := a.updaterDownloadContext(id)
+	if ctx.Err() != nil {
+		return nil, errUpdateCancelled
+	}
 	a.updateLog(id, "info", "[update:"+id+"] downloading from "+redactURLQuery(rawURL))
 	st := downloadState{total: -1}
 	for attempt := 1; ; attempt++ {
 		complete, retryable, err := a.downloadAttempt(id, rawURL, &st)
+		if ctx.Err() != nil {
+			return nil, errUpdateCancelled
+		}
 		if err == nil && complete {
 			a.updateLog(id, "info", fmt.Sprintf("[update:%s] downloaded %d bytes", id, len(st.data)))
 			return st.data, nil
@@ -1328,7 +1584,13 @@ func (a *App) downloadFile(id, rawURL string) ([]byte, error) {
 		}
 		a.updateLog(id, "warn", fmt.Sprintf("[update:%s] attempt %d/%d failed (%s); retrying in %s, %d bytes kept",
 			id, attempt, downloadMaxAttempts, err, delay.Round(time.Millisecond), len(st.data)))
-		time.Sleep(delay)
+		timer := time.NewTimer(delay)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return nil, errUpdateCancelled
+		case <-timer.C:
+		}
 	}
 }
 
@@ -1342,18 +1604,25 @@ var psiphonListDownloadLimit = 3 * time.Minute
 // again. It returns the bytes, the publication time from Last-Modified
 // (zero when the server names none), and whether the server answered 304.
 func (a *App) downloadPsiphonList(id, rawURL string, since time.Time) (data []byte, published time.Time, notModified bool, err error) {
-	ctx, cancel := context.WithTimeout(context.Background(), psiphonListDownloadLimit)
+	parent := a.updaterDownloadContext(id)
+	if parent.Err() != nil {
+		return nil, time.Time{}, false, errUpdateCancelled
+	}
+	ctx, cancel := context.WithTimeout(parent, psiphonListDownloadLimit)
 	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
 	if err != nil {
 		return nil, time.Time{}, false, err
 	}
-	req.Header.Set("User-Agent", "NekoGo/"+appVersion)
+	req.Header.Set("User-Agent", "NekoGo/"+appVersionValue())
 	if !since.IsZero() {
 		req.Header.Set("If-Modified-Since", since.UTC().Format(http.TimeFormat))
 	}
-	resp, err := downloadHTTP.Do(req)
+	resp, err := a.updaterDownloadClient().Do(req)
 	if err != nil {
+		if parent.Err() != nil {
+			return nil, time.Time{}, false, errUpdateCancelled
+		}
 		return nil, time.Time{}, false, errors.New(downloadErrorText(err))
 	}
 	defer resp.Body.Close()
@@ -1371,12 +1640,19 @@ func (a *App) downloadPsiphonList(id, rawURL string, since time.Time) (data []by
 	timer := time.AfterFunc(downloadIdleTimeout, cancel)
 	defer timer.Stop()
 	body := &idleBody{r: resp.Body, t: timer, d: downloadIdleTimeout}
-	data, err = io.ReadAll(io.LimitReader(body, maxDownloadBytes+1))
+	a.setUpdaterTotal(id, resp.ContentLength)
+	data, err = io.ReadAll(io.LimitReader(&updaterProgressReader{app: a, id: id, r: body, total: resp.ContentLength}, maxDownloadBytes+1))
 	if err != nil {
+		if parent.Err() != nil {
+			return nil, published, false, errUpdateCancelled
+		}
 		return nil, published, false, fmt.Errorf("download %s: %w", redactURLQuery(rawURL), err)
 	}
 	if len(data) > maxDownloadBytes {
 		return nil, published, false, fmt.Errorf("download exceeds %d bytes", maxDownloadBytes)
+	}
+	if parent.Err() != nil {
+		return nil, published, false, errUpdateCancelled
 	}
 	a.updateLog(id, "info", fmt.Sprintf("[update:%s] %s received", id, humanBytes(int64(len(data)))))
 	return data, published, false, nil
@@ -1386,11 +1662,18 @@ func (a *App) downloadPsiphonList(id, rawURL string, since time.Time) (data []by
 // reports a finished body that matches the declared length; retryable
 // says another attempt could plausibly succeed.
 func (a *App) downloadAttempt(id, rawURL string, st *downloadState) (complete, retryable bool, err error) {
-	ctx, cancel := context.WithCancel(context.Background())
+	parent := a.updaterDownloadContext(id)
+	if parent.Err() != nil {
+		return false, false, errUpdateCancelled
+	}
+	ctx, cancel := context.WithCancel(parent)
 	defer cancel()
 	offset := int64(len(st.data))
-	resp, err := downloadGet(ctx, rawURL, offset, st.validator)
+	resp, err := a.downloadGet(ctx, rawURL, offset, st.validator)
 	if err != nil {
+		if parent.Err() != nil {
+			return false, false, errUpdateCancelled
+		}
 		return false, true, errors.New(downloadErrorText(err))
 	}
 	defer resp.Body.Close()
@@ -1426,8 +1709,10 @@ func (a *App) downloadAttempt(id, rawURL string, st *downloadState) (complete, r
 		return false, retry, fmt.Errorf("download %s: %s", redactURLQuery(rawURL), resp.Status)
 	}
 
+	a.setUpdaterTotal(id, st.total)
+
 	// The network going away mid-transfer usually leaves the socket open
-	// with no FIN, so Read blocks forever. downloadHTTP has no whole-request
+	// with no FIN, so Read blocks forever. The download client has no whole-request
 	// timeout on purpose (a slow link legitimately needs minutes); this
 	// watchdog bounds the silence instead, and cancels the request so the
 	// blocked Read actually returns.
@@ -1444,6 +1729,7 @@ func (a *App) downloadAttempt(id, rawURL string, st *downloadState) (complete, r
 			if len(st.data) > maxDownloadBytes {
 				return false, false, fmt.Errorf("download exceeds %d bytes", maxDownloadBytes)
 			}
+			a.setUpdaterProgress(id, int64(len(st.data)), st.total)
 			if time.Since(lastProgress) >= downloadProgressEvery {
 				a.updateLog(id, "info", downloadProgressText(id, int64(len(st.data)), st.total))
 				lastProgress = time.Now()
@@ -1453,6 +1739,9 @@ func (a *App) downloadAttempt(id, rawURL string, st *downloadState) (complete, r
 			break
 		}
 		if readErr != nil {
+			if parent.Err() != nil {
+				return false, false, errUpdateCancelled
+			}
 			return false, true, fmt.Errorf("download %s: %w", redactURLQuery(rawURL), readErr)
 		}
 	}
@@ -1463,6 +1752,23 @@ func (a *App) downloadAttempt(id, rawURL string, st *downloadState) (complete, r
 		return false, true, fmt.Errorf("download %s: got %d of %d bytes", redactURLQuery(rawURL), len(st.data), st.total)
 	}
 	return true, false, nil
+}
+
+type updaterProgressReader struct {
+	app   *App
+	id    string
+	r     io.Reader
+	n     int64
+	total int64
+}
+
+func (r *updaterProgressReader) Read(p []byte) (int, error) {
+	n, err := r.r.Read(p)
+	if n > 0 {
+		r.n += int64(n)
+		r.app.setUpdaterProgress(r.id, r.n, r.total)
+	}
+	return n, err
 }
 
 // idleBody restarts the stall timer on every read that produced bytes.
@@ -1797,7 +2103,7 @@ func geoipMarker() string {
 // writeGeoIPMarker stores the current revision marker of [fileURL].
 // Best-effort: a missing marker only makes the row offer the update again.
 func (a *App) writeGeoIPMarker(fileURL string) {
-	etag := remoteETag(fileURL)
+	etag := a.remoteETag(fileURL)
 	if etag == "" {
 		return
 	}
@@ -1807,13 +2113,13 @@ func (a *App) writeGeoIPMarker(fileURL string) {
 }
 
 // remoteETag is the source's revision marker for [url] ("" when unknown).
-func remoteETag(url string) string {
-	req, err := http.NewRequest("HEAD", url, nil)
+func (a *App) remoteETag(rawURL string) string {
+	req, err := http.NewRequest("HEAD", rawURL, nil)
 	if err != nil {
 		return ""
 	}
-	req.Header.Set("User-Agent", "NekoGo/"+appVersion)
-	resp, err := updateHTTP.Do(req)
+	req.Header.Set("User-Agent", "NekoGo/"+appVersionValue())
+	resp, err := a.updaterCheckClient().Do(req)
 	if err != nil {
 		return ""
 	}
@@ -1856,44 +2162,120 @@ func samePath(a, b string) bool {
 	return strings.EqualFold(aa, bb)
 }
 
-// forkCoreAsset resolves the newest fork release (prereleases
-// included) and selects the asset for exeBase. Shared by the core
-// install paths so check and install can never disagree on
-// the source.
-func (a *App) forkCoreAsset(id, repo, exeBase string) (*ghRelease, *ghAsset, error) {
-	rel, err := githubFirstRelease(repo)
-	if err != nil {
-		return nil, nil, err
-	}
-	asset := pickForkAsset(rel.Assets, exeBase)
-	if asset == nil {
-		return nil, nil, fmt.Errorf("%s is not published in %s — manual update only (run build.bat)", coreExeName(exeBase), rel.TagName)
-	}
-	a.updateLog(id, "info", fmt.Sprintf("[update:%s] installing %s from %s", id, asset.Name, rel.TagName))
-	return rel, asset, nil
-}
-
-// forkAssetBytes downloads a fork asset, unpacking the exe when the
-// asset is a zip archive.
-func (a *App) forkAssetBytes(id string, asset *ghAsset, exeBase string) ([]byte, error) {
-	data, err := a.downloadFile(id, asset.BrowserDownloadURL)
-	if err != nil {
-		a.updateLog(id, "error", "[update:"+id+"] ERROR: "+err.Error())
-		return nil, err
-	}
-	// The digest covers the ARCHIVE, so it is checked before unpacking:
-	// a tampered zip must never reach the extractor or the install path.
-	if err := a.verifyDigest(id, asset.Name, asset.Digest, data); err != nil {
-		a.updateLog(id, "error", "[update:"+id+"] ERROR: "+err.Error())
-		return nil, err
-	}
-	if strings.HasSuffix(strings.ToLower(asset.Name), ".zip") {
-		data, err = extractExeFromZip(data, coreExeName(exeBase))
-		if err != nil {
-			return nil, err
+func (a *App) waitConnectSettled(timeout time.Duration) error {
+	ticker := time.NewTicker(20 * time.Millisecond)
+	defer ticker.Stop()
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	for a.IsConnectBusy() {
+		select {
+		case <-ticker.C:
+		case <-timer.C:
+			return errors.New("timed out waiting for the current connection attempt")
 		}
 	}
-	return data, nil
+	return nil
+}
+
+func (a *App) profileUsesCoreImage(id string, profile Profile, settings Settings, dest string) bool {
+	choice, err := resolveProfileCore(&profile, settings)
+	if err != nil {
+		return false
+	}
+	var path string
+	switch id {
+	case "singbox":
+		if choice.Engine != "upstream" {
+			return false
+		}
+		if choice.Profile.Core.IsSpoof() && settings.SpoofXray {
+			return false
+		}
+		path, err = a.upstreamCoreInstallPath()
+	case "xray":
+		if choice.Profile.Core.IsSpoof() {
+			if !settings.SpoofXray {
+				return false
+			}
+		} else if !choice.Profile.Core.IsXray() {
+			return false
+		}
+		path, err = a.xrayInstallPath()
+	case "mihomo":
+		if !choice.Profile.Core.IsMihomo() {
+			return false
+		}
+		path, err = a.mihomoInstallPath()
+	case "psiphon":
+		if !aetherDriverProfile(&choice.Profile) && !(choice.Profile.Core.IsSpoof() && spoofChain(&choice.Profile, settings)) {
+			return false
+		}
+		path, err = a.aetherInstallPath()
+	default:
+		return false
+	}
+	return err == nil && samePath(path, dest)
+}
+
+func (a *App) applyCoreImage(id, dest string, data []byte, force bool, install func() error) (installed bool, installErr, reconnectErr error) {
+	if !force {
+		if old, err := fileSHA256Hex(dest); err == nil && old == sha256Hex(data) {
+			return false, nil, nil
+		}
+	}
+	if a.cores == nil {
+		return false, errors.New("core manager is not wired"), nil
+	}
+	a.beginCoreApply()
+	defer a.endCoreApply()
+	a.cores.beginImageApply()
+	defer a.cores.endImageApply()
+
+	connectingID := a.connectingProfile()
+	reconnectID := ""
+	if connectingID != "" {
+		if profile, ok := a.store.GetProfile(connectingID); ok && a.profileUsesCoreImage(id, profile, a.store.GetSettings(), dest) {
+			reconnectID = connectingID
+			a.invalidateConnect()
+			_ = a.cores.Stop()
+		}
+		if err := a.waitConnectSettled(coreApplyConnectWait); err != nil {
+			return false, err, nil
+		}
+	}
+	if err := a.cores.waitImageApplyProbes(coreApplyProbeWait); err != nil {
+		return false, err, nil
+	}
+
+	_, activeID, running := a.cores.Status()
+	targetActive := running && a.cores.usesImage(dest)
+	if targetActive {
+		reconnectID = activeID
+		if err := a.disconnectCores(false); err != nil {
+			return false, fmt.Errorf("disconnect before updating %s: %w", id, err), nil
+		}
+	}
+	if err := a.cores.stopImageUsers(dest); err != nil {
+		return false, fmt.Errorf("stop processes using %s: %w", filepath.Base(dest), err), nil
+	}
+	if a.cores.usesImage(dest) {
+		return false, fmt.Errorf("%s is still in use; close the process using it and retry", filepath.Base(dest)), nil
+	}
+
+	installErr = install()
+	if errors.Is(installErr, errAlreadyUpToDate) {
+		installErr = nil
+		installed = false
+	} else if installErr == nil {
+		installed = true
+	}
+	if reconnectID != "" {
+		reconnectErr = coreApplyReconnect(a, reconnectID)
+		if reconnectErr != nil {
+			a.updateLog(id, "warn", fmt.Sprintf("[update:%s] installed, but reconnect failed: %v", id, reconnectErr))
+		}
+	}
+	return installed, installErr, reconnectErr
 }
 
 // installExeWithBackup replaces dest with data: the previous binary
@@ -1929,56 +2311,6 @@ func (a *App) installExeWithBackup(id, dest string, data []byte, verifyArgs ...s
 	}
 	os.Remove(bak)
 	return nil
-}
-
-// updateCoreExe installs a nekobox/xray row from a fork release's
-// assets. Refused while a core is running (Windows cannot replace a
-// mapped exe, and the version caches must stay trustworthy).
-func (a *App) updateCoreExe(id, repo, exeBase string, verifyArgs ...string) (*UpdatableComponent, error) {
-	if a.coreBusy() {
-		return nil, fmt.Errorf("disconnect before updating")
-	}
-	rel, asset, err := a.forkCoreAsset(id, repo, exeBase)
-	if err != nil {
-		return nil, err
-	}
-	data, err := a.forkAssetBytes(id, asset, exeBase)
-	if err != nil {
-		return nil, err
-	}
-	dest := filepath.Join(coreExeDir(), coreExeName(exeBase))
-	if cur := a.currentCorePath(id); cur != "" {
-		dest = cur
-	}
-	if owner := coreImageOwner(dest); owner != "" && owner != id {
-		return nil, fmt.Errorf("%s update would overwrite %s, which belongs to the %s row; fix corePath in settings", id, filepath.Base(dest), owner)
-	}
-	installed := true
-	if err := a.installExeWithBackup(id, dest, data, verifyArgs...); err != nil {
-		if !errors.Is(err, errAlreadyUpToDate) {
-			a.updateLog(id, "error", "[update:"+id+"] ERROR: "+err.Error())
-			return nil, err
-		}
-		installed = false
-		a.updateLog(id, "info", "[update:"+id+"] already up to date (identical binary)")
-	}
-	// The version caches are keyed on path: same path, new bytes —
-	// drop the stale value so Current refreshes immediately.
-	a.invalidateCoreVersion(id)
-	c := UpdatableComponent{ID: id, Latest: rel.TagName, UpdateAvail: false}
-	for _, base := range a.localUpdatables() {
-		if base.ID == id {
-			c = base
-			break
-		}
-	}
-	c.Latest = rel.TagName
-	c.UpdateAvail = false
-	c.Notes = ""
-	if !installed {
-		c.Notes = "Already up to date"
-	}
-	return &c, nil
 }
 
 // upstreamCoreInstallPath is where the official sing-box.exe belongs,
@@ -2036,10 +2368,7 @@ func coreImageOwner(path string) string {
 // updateOfficialSingBox installs the official CLI from SagerNet's
 // stable release into the path resolveUpstreamCore reads.
 func (a *App) updateOfficialSingBox() (*UpdatableComponent, error) {
-	if a.coreBusy() {
-		return nil, fmt.Errorf("disconnect before updating")
-	}
-	rel, err := githubLatest(officialSingBoxOwnerRepo)
+	rel, err := a.githubLatest(officialSingBoxOwnerRepo)
 	if err != nil {
 		return nil, err
 	}
@@ -2051,7 +2380,11 @@ func (a *App) updateOfficialSingBox() (*UpdatableComponent, error) {
 	if err != nil {
 		return nil, err
 	}
+	if owner := coreImageOwner(dest); owner != "" && owner != "singbox" {
+		return nil, fmt.Errorf("sing-box update would overwrite %s, which belongs to the %s row; fix upstreamCorePath in settings", filepath.Base(dest), owner)
+	}
 	a.updateLog("singbox", "info", fmt.Sprintf("[update:singbox] installing %s from %s", asset.Name, rel.TagName))
+	a.setUpdaterTotal("singbox", asset.Size)
 	data, err := a.downloadFile("singbox", asset.BrowserDownloadURL)
 	if err != nil {
 		a.updateLog("singbox", "error", "[update:singbox] ERROR: "+err.Error())
@@ -2066,15 +2399,14 @@ func (a *App) updateOfficialSingBox() (*UpdatableComponent, error) {
 		a.updateLog("singbox", "error", "[update:singbox] ERROR: "+err.Error())
 		return nil, err
 	}
-	installed := true
-	if err := a.installExeWithBackup("singbox", dest, data, "version"); err != nil {
-		if !errors.Is(err, errAlreadyUpToDate) {
-			a.updateLog("singbox", "error", "[update:singbox] ERROR: "+err.Error())
-			return nil, err
-		}
-		// Re-downloading the identical binary is a successful no-op, not
-		// the ERROR row this used to surface as a failed update.
-		installed = false
+	installed, installErr, reconnectErr := a.applyCoreImage("singbox", dest, data, false, func() error {
+		return a.installExeWithBackup("singbox", dest, data, "version")
+	})
+	if installErr != nil {
+		a.updateLog("singbox", "error", "[update:singbox] ERROR: "+installErr.Error())
+		return nil, installErr
+	}
+	if !installed {
 		a.updateLog("singbox", "info", "[update:singbox] already up to date (identical binary)")
 	}
 	a.invalidateCoreVersion("singbox")
@@ -2090,6 +2422,9 @@ func (a *App) updateOfficialSingBox() (*UpdatableComponent, error) {
 	c.Notes = ""
 	if !installed {
 		c.Notes = "Already up to date"
+	}
+	if reconnectErr != nil {
+		c.Notes = "Updated, but reconnect failed: " + reconnectErr.Error()
 	}
 	return &c, nil
 }
@@ -2121,10 +2456,7 @@ func (a *App) mihomoInstallPath() (string, error) {
 // the resolved path — mihomo.exe in the shipped layout, the name the
 // resolver prefers and build.bat stages.
 func (a *App) updateMihomo() (*UpdatableComponent, error) {
-	if a.coreBusy() {
-		return nil, fmt.Errorf("disconnect before updating")
-	}
-	rel, err := githubLatest(mihomoOwnerRepo)
+	rel, err := a.githubLatest(mihomoOwnerRepo)
 	if err != nil {
 		return nil, err
 	}
@@ -2140,6 +2472,7 @@ func (a *App) updateMihomo() (*UpdatableComponent, error) {
 		return nil, fmt.Errorf("mihomo update would overwrite %s, which belongs to the %s row; fix mihomoPath in settings", filepath.Base(dest), owner)
 	}
 	a.updateLog("mihomo", "info", fmt.Sprintf("[update:mihomo] installing %s from %s", asset.Name, rel.TagName))
+	a.setUpdaterTotal("mihomo", asset.Size)
 	data, err := a.downloadFile("mihomo", asset.BrowserDownloadURL)
 	if err != nil {
 		a.updateLog("mihomo", "error", "[update:mihomo] ERROR: "+err.Error())
@@ -2157,13 +2490,14 @@ func (a *App) updateMihomo() (*UpdatableComponent, error) {
 		a.updateLog("mihomo", "error", "[update:mihomo] ERROR: "+err.Error())
 		return nil, err
 	}
-	installed := true
-	if err := a.installExeWithBackup("mihomo", dest, data, "-v"); err != nil {
-		if !errors.Is(err, errAlreadyUpToDate) {
-			a.updateLog("mihomo", "error", "[update:mihomo] ERROR: "+err.Error())
-			return nil, err
-		}
-		installed = false
+	installed, installErr, reconnectErr := a.applyCoreImage("mihomo", dest, data, false, func() error {
+		return a.installExeWithBackup("mihomo", dest, data, "-v")
+	})
+	if installErr != nil {
+		a.updateLog("mihomo", "error", "[update:mihomo] ERROR: "+installErr.Error())
+		return nil, installErr
+	}
+	if !installed {
 		a.updateLog("mihomo", "info", "[update:mihomo] already up to date (identical binary)")
 	}
 	a.invalidateCoreVersion("mihomo")
@@ -2179,6 +2513,9 @@ func (a *App) updateMihomo() (*UpdatableComponent, error) {
 	c.Notes = ""
 	if !installed {
 		c.Notes = "Already up to date"
+	}
+	if reconnectErr != nil {
+		c.Notes = "Updated, but reconnect failed: " + reconnectErr.Error()
 	}
 	return &c, nil
 }
@@ -2213,10 +2550,7 @@ func (a *App) xrayInstallPath() (string, error) {
 // the binary (measured in v26.11.9), so only xray.exe is extracted, and
 // it goes to the path resolveXray reads.
 func (a *App) updateXray() (*UpdatableComponent, error) {
-	if a.coreBusy() {
-		return nil, fmt.Errorf("disconnect before updating")
-	}
-	rel, err := githubLatest(xrayOwnerRepo)
+	rel, err := a.githubLatest(xrayOwnerRepo)
 	if err != nil {
 		return nil, err
 	}
@@ -2232,6 +2566,7 @@ func (a *App) updateXray() (*UpdatableComponent, error) {
 		return nil, fmt.Errorf("xray update would overwrite %s, which belongs to the %s row; fix xrayPath in settings", filepath.Base(dest), owner)
 	}
 	a.updateLog("xray", "info", fmt.Sprintf("[update:xray] installing %s from %s", asset.Name, rel.TagName))
+	a.setUpdaterTotal("xray", asset.Size)
 	data, err := a.downloadFile("xray", asset.BrowserDownloadURL)
 	if err != nil {
 		a.updateLog("xray", "error", "[update:xray] ERROR: "+err.Error())
@@ -2246,13 +2581,14 @@ func (a *App) updateXray() (*UpdatableComponent, error) {
 		a.updateLog("xray", "error", "[update:xray] ERROR: "+err.Error())
 		return nil, err
 	}
-	installed := true
-	if err := a.installExeWithBackup("xray", dest, data, "version"); err != nil {
-		if !errors.Is(err, errAlreadyUpToDate) {
-			a.updateLog("xray", "error", "[update:xray] ERROR: "+err.Error())
-			return nil, err
-		}
-		installed = false
+	installed, installErr, reconnectErr := a.applyCoreImage("xray", dest, data, false, func() error {
+		return a.installExeWithBackup("xray", dest, data, "version")
+	})
+	if installErr != nil {
+		a.updateLog("xray", "error", "[update:xray] ERROR: "+installErr.Error())
+		return nil, installErr
+	}
+	if !installed {
 		a.updateLog("xray", "info", "[update:xray] already up to date (identical binary)")
 	}
 	a.invalidateCoreVersion("xray")
@@ -2268,6 +2604,9 @@ func (a *App) updateXray() (*UpdatableComponent, error) {
 	c.Notes = ""
 	if !installed {
 		c.Notes = "Already up to date"
+	}
+	if reconnectErr != nil {
+		c.Notes = "Updated, but reconnect failed: " + reconnectErr.Error()
 	}
 	return &c, nil
 }
@@ -2296,18 +2635,6 @@ func (a *App) aetherInstallPath() (string, error) {
 	return filepath.Join(coreExeDir(), aetherExeName), nil
 }
 
-// aetherBusy reports whether any aether.exe child is running: the engine
-// or either chain leg. Windows cannot replace a mapped image, and
-// pt\lyrebird.exe is a child of a live Tor run, so both have to be down.
-func (a *App) aetherBusy() bool {
-	for _, m := range []*AetherManager{a.aetherMgr, a.psiphonMgr, a.torMgr} {
-		if m != nil && m.Running() {
-			return true
-		}
-	}
-	return false
-}
-
 // updatePsiphon installs the Aether core from the release that
 // publishes aether.exe. The archive's aether.exe goes to the resolved
 // path with the usual backup + smoke verify + rollback, and the pt\
@@ -2315,10 +2642,7 @@ func (a *App) aetherBusy() bool {
 // fails to spawn a transport for every bridge line, which reads as a
 // bootstrap stall with nothing on screen naming the missing file.
 func (a *App) updatePsiphon() (*UpdatableComponent, error) {
-	if a.coreBusy() || a.aetherBusy() {
-		return nil, fmt.Errorf("disconnect before updating")
-	}
-	rel, err := githubLatest(aetherOwnerRepo)
+	rel, err := a.githubLatest(aetherOwnerRepo)
 	if err != nil {
 		return nil, err
 	}
@@ -2334,6 +2658,7 @@ func (a *App) updatePsiphon() (*UpdatableComponent, error) {
 		return nil, fmt.Errorf("psiphon update would overwrite %s, which belongs to the %s row; fix aetherPath in settings", filepath.Base(dest), owner)
 	}
 	a.updateLog("psiphon", "info", fmt.Sprintf("[update:psiphon] installing %s from %s", asset.Name, rel.TagName))
+	a.setUpdaterTotal("psiphon", asset.Size)
 	data, err := a.downloadFile("psiphon", asset.BrowserDownloadURL)
 	if err != nil {
 		a.updateLog("psiphon", "error", "[update:psiphon] ERROR: "+err.Error())
@@ -2350,30 +2675,46 @@ func (a *App) updatePsiphon() (*UpdatableComponent, error) {
 		a.updateLog("psiphon", "error", "[update:psiphon] ERROR: "+err.Error())
 		return nil, err
 	}
-	installed := true
-	if err := a.installExeWithBackup("psiphon", dest, exe, "-v"); err != nil {
-		if !errors.Is(err, errAlreadyUpToDate) {
-			a.updateLog("psiphon", "error", "[update:psiphon] ERROR: "+err.Error())
-			return nil, err
-		}
-		installed = false
-		a.updateLog("psiphon", "info", "[update:psiphon] already up to date (identical binary)")
-	}
-	// The transports beside the engine, written only after it verified. A
-	// release that ships fewer is not a failed install — the row reports
-	// what is missing the next time it is read, which is where a user
-	// looks, and the engine it did get is the one that runs.
+	transportsChanged := false
 	for _, name := range aetherZipTransports {
 		body, err := extractExeFromZip(data, name)
 		if err != nil {
-			a.updateLog("psiphon", "warn", fmt.Sprintf("[update:psiphon] %s is not in %s — Tor/Psiphon transports need it", name, asset.Name))
 			continue
 		}
-		if err := a.installFile("psiphon", filepath.Join(aetherPtDir(dest), name), body); err != nil &&
-			!errors.Is(err, errAlreadyUpToDate) {
-			a.updateLog("psiphon", "error", "[update:psiphon] ERROR: "+err.Error())
-			return nil, err
+		current, err := fileSHA256Hex(filepath.Join(aetherPtDir(dest), name))
+		if err != nil || current != sha256Hex(body) {
+			transportsChanged = true
+			break
 		}
+	}
+	installed, installErr, reconnectErr := a.applyCoreImage("psiphon", dest, exe, transportsChanged, func() error {
+		if err := a.installExeWithBackup("psiphon", dest, exe, "-v"); err != nil &&
+			!errors.Is(err, errAlreadyUpToDate) {
+			return err
+		}
+		// The transports beside the engine, written only after it verified. A
+		// release that ships fewer is not a failed install — the row reports
+		// what is missing the next time it is read, which is where a user
+		// looks, and the engine it did get is the one that runs.
+		for _, name := range aetherZipTransports {
+			body, err := extractExeFromZip(data, name)
+			if err != nil {
+				a.updateLog("psiphon", "warn", fmt.Sprintf("[update:psiphon] %s is not in %s — Tor/Psiphon transports need it", name, asset.Name))
+				continue
+			}
+			if err := a.installFile("psiphon", filepath.Join(aetherPtDir(dest), name), body); err != nil &&
+				!errors.Is(err, errAlreadyUpToDate) {
+				return err
+			}
+		}
+		return nil
+	})
+	if installErr != nil {
+		a.updateLog("psiphon", "error", "[update:psiphon] ERROR: "+installErr.Error())
+		return nil, installErr
+	}
+	if !installed {
+		a.updateLog("psiphon", "info", "[update:psiphon] already up to date (identical binary)")
 	}
 	// The version cache is keyed on path, and an in-place replace keeps
 	// the path: drop the stale line so Current refreshes at once.
@@ -2390,6 +2731,155 @@ func (a *App) updatePsiphon() (*UpdatableComponent, error) {
 	if !installed {
 		c.Notes = "Already up to date"
 	}
+	if reconnectErr != nil {
+		c.Notes = "Updated, but reconnect failed: " + reconnectErr.Error()
+	}
+	return &c, nil
+}
+
+func selfUpdateUnusedPath(dir, pattern string) (string, error) {
+	f, err := os.CreateTemp(dir, pattern)
+	if err != nil {
+		return "", err
+	}
+	path := f.Name()
+	if err := f.Close(); err != nil {
+		_ = os.Remove(path)
+		return "", err
+	}
+	// The helper requires a nonexisting status path and repeats this check.
+	if err := os.Remove(path); err != nil {
+		return "", err
+	}
+	return path, nil
+}
+
+func (a *App) updateNekoGo() (*UpdatableComponent, error) {
+	rel, err := a.githubFirstRelease(forkOwnerRepo)
+	if err != nil {
+		return nil, err
+	}
+	asset := pickNekoGoAsset(rel.Assets)
+	if asset == nil {
+		return nil, fmt.Errorf("nekogo.exe not found in %s", rel.TagName)
+	}
+	target, err := nekogoExecutable()
+	if err != nil {
+		return nil, fmt.Errorf("resolve NekoGo executable: %w", err)
+	}
+	target, err = filepath.Abs(target)
+	if err != nil {
+		return nil, fmt.Errorf("resolve NekoGo executable path: %w", err)
+	}
+	if !strings.EqualFold(filepath.Base(target), "nekogo.exe") {
+		return nil, fmt.Errorf("self-update target must be named nekogo.exe, got %s", filepath.Base(target))
+	}
+	c := UpdatableComponent{ID: "nekogo", Name: "NekoGo", Current: appVersionValue(), Latest: rel.TagName}
+	a.setUpdaterTotal("nekogo", asset.Size)
+	a.updateLog("nekogo", "info", fmt.Sprintf("[update:nekogo] downloading %s from %s", asset.Name, rel.TagName))
+	data, err := a.downloadFile("nekogo", asset.BrowserDownloadURL)
+	if err != nil {
+		a.updateLog("nekogo", "error", "[update:nekogo] ERROR: "+err.Error())
+		return nil, err
+	}
+	if err := a.verifyDigest("nekogo", asset.Name, asset.Digest, data); err != nil {
+		a.updateLog("nekogo", "error", "[update:nekogo] ERROR: "+err.Error())
+		return nil, err
+	}
+	current, err := os.ReadFile(target)
+	if err != nil {
+		return nil, fmt.Errorf("read running NekoGo executable: %w", err)
+	}
+	if bytes.Equal(current, data) {
+		c.Notes = "Already up to date"
+		return &c, nil
+	}
+	if err := a.updaterDownloadContext("nekogo").Err(); err != nil {
+		return nil, err
+	}
+
+	dir := filepath.Dir(target)
+	sourceFile, err := os.CreateTemp(dir, ".nekogo-update-*.exe")
+	if err != nil {
+		return nil, fmt.Errorf("stage NekoGo update: %w", err)
+	}
+	source := sourceFile.Name()
+	readyPath, resultPath := "", ""
+	committed := false
+	defer func() {
+		if !committed {
+			_ = os.Remove(source)
+			if readyPath != "" {
+				_ = os.Remove(readyPath)
+			}
+			if resultPath != "" {
+				_ = os.Remove(resultPath)
+			}
+		}
+	}()
+	if _, err := sourceFile.Write(data); err != nil {
+		_ = sourceFile.Close()
+		return nil, fmt.Errorf("stage NekoGo update: %w", err)
+	}
+	if err := sourceFile.Sync(); err != nil {
+		_ = sourceFile.Close()
+		return nil, fmt.Errorf("sync NekoGo update: %w", err)
+	}
+	if err := sourceFile.Close(); err != nil {
+		return nil, fmt.Errorf("close NekoGo update: %w", err)
+	}
+	if err := os.Chmod(source, 0o755); err != nil {
+		return nil, fmt.Errorf("prepare NekoGo update: %w", err)
+	}
+	readyPath, err = selfUpdateUnusedPath(dir, ".nekogo-update-ready-*.json")
+	if err != nil {
+		return nil, fmt.Errorf("reserve self-update readiness path: %w", err)
+	}
+	resultPath, err = selfUpdateUnusedPath(dir, ".nekogo-update-result-*.json")
+	if err != nil {
+		return nil, fmt.Errorf("reserve self-update result path: %w", err)
+	}
+
+	connectID := ""
+	if a.cores != nil {
+		_, id, running := a.cores.Status()
+		if running {
+			connectID = id
+		}
+	}
+	if connectID == "" {
+		connectID = a.connectingProfile()
+	}
+	plan := selfUpdatePlan{
+		Version:      rel.TagName,
+		Source:       source,
+		SourceSize:   int64(len(data)),
+		SourceSHA256: sha256Hex(data),
+		Target:       target,
+		ReadyPath:    readyPath,
+		ResultPath:   resultPath,
+		ParentPID:    os.Getpid(),
+		ConnectID:    connectID,
+	}
+	cmd, err := startNekoGoUpdateHelper(plan)
+	if err != nil {
+		a.updateLog("nekogo", "error", "[update:nekogo] ERROR: "+err.Error())
+		return nil, err
+	}
+	if err := a.updaterDownloadContext("nekogo").Err(); err != nil {
+		if cmd != nil && cmd.Process != nil {
+			_ = cmd.Process.Kill()
+			_ = cmd.Wait()
+		}
+		return nil, err
+	}
+	committed = true
+	c.UpdateAvail = true
+	c.Notes = "NekoGo will restart to install the update."
+	// os.Exit bypasses UpdateComponent's deferred state flush.
+	a.finishUpdaterDownload("nekogo", &c, nil)
+	a.Shutdown()
+	selfUpdateExit(0)
 	return &c, nil
 }
 
@@ -2514,82 +3004,19 @@ func (a *App) invalidateCoreVersion(id string) {
 	}
 }
 
-// installerAutoOpen is a test seam for updateGUI. It stays nil in
-// production: a downloaded GUI installer must NEVER auto-open — there
-// is no publisher signature/hash check yet, so an unverified asset
-// would mean remote code execution on update (BUG-010). The UI offers
-// an explicit "Open installer" button instead (which surfaces open
-// errors verbatim via OpenURL). Tests set this hook to a spy to prove
-// updateGUI makes no auto-open attempt.
-// TODO: GPG/Sigstore verification of the downloaded asset before any
-// auto-open behavior may be re-enabled.
-var installerAutoOpen func(path string) error
-
-// updateGUI downloads the installer to %APPDATA%/NekoGo/updates (via
-// ConfigStore.Dir) and reports its path for a manual, user-initiated
-// open (the GUI cannot replace its own running exe, so nothing is
-// applied silently).
-// Source: xenonama/NekoGo/releases (list endpoint, prereleases
-// included — same audit as checkGUI).
-func (a *App) updateGUI() (*UpdatableComponent, error) {
-	c := UpdatableComponent{ID: "gui", Name: "NekoGo GUI", Current: appVersion}
-	rel, err := githubFirstRelease(forkOwnerRepo)
-	if err != nil {
-		return nil, err
-	}
-	asset := pickGUIAsset(rel.Assets)
-	if asset == nil {
-		c.UpdateAvail = false
-		c.Notes = "Manual update only"
-		return &c, nil
-	}
-	data, err := a.downloadFile("gui", asset.BrowserDownloadURL)
-	if err != nil {
-		a.updateLog("gui", "error", "[update:gui] ERROR: "+err.Error())
-		return nil, err
-	}
-	if err := a.verifyDigest("gui", asset.Name, asset.Digest, data); err != nil {
-		a.updateLog("gui", "error", "[update:gui] ERROR: "+err.Error())
-		return nil, err
-	}
-	dir := filepath.Join(a.store.Dir(), "updates")
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return nil, err
-	}
-	name := filepath.Base(asset.BrowserDownloadURL)
-	if name == "" || name == "/" {
-		name = "NekoGo-setup.exe"
-	}
-	dest := filepath.Join(dir, name)
-	if err := a.installFile("gui", dest, data); err != nil {
-		// The same installer is already downloaded: report its path for a
-		// manual open instead of failing the row.
-		if !errors.Is(err, errAlreadyUpToDate) {
-			a.updateLog("gui", "error", "[update:gui] ERROR: "+err.Error())
-			return nil, err
-		}
-	}
-	a.updateLog("gui", "info", "[update:gui] installer ready: "+dest)
-	if installerAutoOpen != nil {
-		if err := installerAutoOpen(dest); err != nil {
-			return nil, err
-		}
-	}
-	c.Latest = rel.TagName
-	c.InstallerPath = dest
-	c.Notes = "downloaded to " + dest + " — open it manually to install"
-	return &c, nil
-}
-
 // UpdateComponent downloads and installs one component by ID, returning
 // the refreshed row.
-func (a *App) UpdateComponent(id string) (*UpdatableComponent, error) {
+func (a *App) UpdateComponent(id string) (row *UpdatableComponent, err error) {
+	a.updaterOpMu.Lock()
+	defer a.updaterOpMu.Unlock()
+	a.beginUpdaterDownload(id)
+	defer func() { a.finishUpdaterDownload(id, row, err) }()
 	switch id {
 	case "geoip":
 		url := updateBase("jsdelivr", "https://cdn.jsdelivr.net") + "/gh/Loyalsoldier/geoip@release/Country.mmdb"
 		return a.updateDataFile(id, url, "GeoLite2-Country.mmdb", "")
 	case "geosite":
-		rel, err := githubLatest("Loyalsoldier/v2ray-rules-dat")
+		rel, err := a.githubLatest("Loyalsoldier/v2ray-rules-dat")
 		if err != nil {
 			return nil, err
 		}
@@ -2597,6 +3024,7 @@ func (a *App) UpdateComponent(id string) (*UpdatableComponent, error) {
 		if asset == nil {
 			return nil, fmt.Errorf("geosite.dat not found in %s", rel.TagName)
 		}
+		a.setUpdaterTotal(id, asset.Size)
 		c, err := a.updateDataFile(id, asset.BrowserDownloadURL, "geosite.dat", asset.Digest)
 		if err != nil {
 			return nil, err
@@ -2606,23 +3034,16 @@ func (a *App) UpdateComponent(id string) (*UpdatableComponent, error) {
 		return c, nil
 	case "singbox":
 		return a.updateOfficialSingBox()
-	case "nekobox":
-		if a.coreBusy() {
-			return nil, fmt.Errorf("disconnect before updating")
-		}
-		return a.updateCoreExe(id, nekoCoreOwnerRepo, "nekobox_core", "sing-box", "version")
 	case "xray":
 		return a.updateXray()
 	case "mihomo":
 		return a.updateMihomo()
-	case "tor":
-		return a.updateTorRelease()
 	case "psiphon":
 		return a.updatePsiphon()
 	case "psiphon-servers":
 		return a.updatePsiphonServers()
-	case "gui":
-		return a.updateGUI()
+	case "nekogo":
+		return a.updateNekoGo()
 	default:
 		return nil, fmt.Errorf("unknown component %q", id)
 	}

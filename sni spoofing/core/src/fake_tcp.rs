@@ -117,7 +117,10 @@ impl BypassMethod {
         match self {
             Self::Auto => Strategy::plain(Self::WrongSeq),
             Self::SplitHello => Strategy::split_only(),
-            other => Strategy::plain(*other),
+            other => Strategy {
+                decoy: *other,
+                split_real: true,
+            },
         }
     }
 }
@@ -1149,6 +1152,41 @@ mod tests {
         assert!(plan_fake(BypassMethod::SplitHello, 100, &h, &params).is_empty());
         assert!(!BypassMethod::SplitHello.plan_decoy());
         assert!(BypassMethod::WrongSeq.plan_decoy());
+    }
+
+    #[test]
+    fn explicit_methods_keep_decoy_and_split_real_hello() {
+        for method in [
+            BypassMethod::WrongSeq,
+            BypassMethod::WrongSeqTtl,
+            BypassMethod::SplitSeq,
+            BypassMethod::Fragmented,
+            BypassMethod::Padding,
+            BypassMethod::HostFakeSplit,
+            BypassMethod::FakeSplit,
+        ] {
+            assert_eq!(
+                method.into_strategy(),
+                Strategy {
+                    decoy: method,
+                    split_real: true,
+                },
+                "{} must keep its decoy and split the real hello",
+                method.as_str()
+            );
+        }
+        assert_eq!(
+            BypassMethod::SplitHello.into_strategy(),
+            Strategy::split_only()
+        );
+    }
+
+    #[test]
+    fn auto_strategy_mapping_remains_compatible() {
+        let strategy = BypassMethod::Auto.into_strategy();
+        assert_eq!(strategy, Strategy::plain(BypassMethod::WrongSeq));
+        assert!(Strategy::pool().contains(&strategy));
+        assert_eq!(resolve_method("auto"), Ok(BypassMethod::WrongSeq));
     }
 
     #[test]

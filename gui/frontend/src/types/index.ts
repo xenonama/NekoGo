@@ -439,7 +439,7 @@ export interface BackupBlob {
 /** Local defaults mirroring the Go DefaultSettings (single source for
  *  the api.ts null fallback and the settings store initial state). */
 export const defaultSettings: Settings = {
-  theme: 'light',
+  theme: 'dark',
   mixedPort: 2080,
   tproxyPort: 0,
   tunEnabled: false,
@@ -480,7 +480,7 @@ export const defaultSettings: Settings = {
   geoIPDBPath: '',
   advancedMode: false,
   logOutputPath: '',
-  sniConfig: { method: 'auto' },
+  sniConfig: { method: 'hello_split', fingerprint: 'legacy', quicMode: 'block', ipMode: 'ipv4' },
   spoofPsiphon: false,
   spoofXray: false,
   spoofEnabled: true,
@@ -553,10 +553,14 @@ export interface UpdatableComponent {
   current: string
   latest: string
   updateAvail: boolean
+  checkEnabled: boolean
   notes?: string
   lastCheck?: string
   lastError?: string
-  installerPath?: string
+  downloadedBytes?: number
+  totalBytes?: number
+  downloading?: boolean
+  updateFoundAt?: string
 }
 
 // Advanced Mode Phase C: core network tools (Console -> Network).
@@ -615,6 +619,9 @@ export interface SNIConfig {
    *  (the IP list becomes a read-out); "B" (or absent) dials the curated
    *  IP pool — the historical behaviour. Backend normalizes "" to "B". */
   plan?: string
+  /** Plan A endpoint override. Empty uses DoH; an IPv4 disables DoH and
+   *  is dialed for every checked decoy SNI. */
+  manualIp?: string
 }
 
 export interface SNIIP {

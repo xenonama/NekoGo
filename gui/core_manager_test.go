@@ -69,3 +69,38 @@ func TestStartReturnsStopError(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 }
+
+func TestStoppedManagersReleaseCommandImage(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		stop func(*CoreManager, *exec.Cmd) error
+	}{
+		{"sing-box", func(m *CoreManager, cmd *exec.Cmd) error {
+			m.singboxMgr = &SingBoxManager{cmd: cmd, running: true}
+			return m.singboxMgr.Stop()
+		}},
+		{"xray", func(m *CoreManager, cmd *exec.Cmd) error {
+			m.xrayMgr = &XrayManager{cmd: cmd, running: true}
+			return m.xrayMgr.Stop()
+		}},
+		{"upstream sing-box", func(m *CoreManager, cmd *exec.Cmd) error {
+			m.upstreamMgr = &UpstreamSingBoxManager{cmd: cmd, running: true}
+			return m.upstreamMgr.Stop()
+		}},
+		{"mihomo", func(m *CoreManager, cmd *exec.Cmd) error {
+			m.mihomoMgr = &MihomoManager{cmd: cmd, running: true}
+			return m.mihomoMgr.Stop()
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cmd := exec.Command("unused-core.exe")
+			cores := &CoreManager{}
+			if err := tc.stop(cores, cmd); err != nil {
+				t.Fatalf("Stop: %v", err)
+			}
+			if cores.usesImage(cmd.Path) {
+				t.Fatal("stopped manager still reports its executable image in use")
+			}
+		})
+	}
+}

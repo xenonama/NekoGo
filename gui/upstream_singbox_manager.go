@@ -299,6 +299,7 @@ func (m *UpstreamSingBoxManager) Stop() error {
 	if cmd == nil || cmd.Process == nil {
 		m.mu.Lock()
 		m.running = false
+		m.cmd = nil
 		m.apiPort = 0
 		m.apiSecret = ""
 		m.mu.Unlock()

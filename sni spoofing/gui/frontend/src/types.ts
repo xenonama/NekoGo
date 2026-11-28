@@ -25,11 +25,15 @@ export interface AppConfig {
   PROBE_TIMEOUT: number;
   // FIX(#1c): SOCKS5_PORT/HTTP_PORT removed. Engine is raw TCP; Xray owns
   // those listeners. Rust Config still accepts them on load for compat.
+  RESOLVE_SNI: boolean;
+  CONNECT_OVERRIDE: string;
   // Lowercase aliases accepted by the Rust migrate() layer.
   listen_host?: string;
   listen_port?: number;
   endpoints?: Endpoint[];
   fake_snis?: string[];
+  resolve_sni?: boolean;
+  connect_override?: string;
   [key: string]: unknown;
 }
 
@@ -128,7 +132,7 @@ export function defaultConfig(): AppConfig {
     LISTEN_PORT: 40443,
     ENDPOINTS: [{ ip: "1.1.1.1", port: 443 }],
     FAKE_SNIS: ["example.com"],
-    BYPASS_METHOD: "auto",
+    BYPASS_METHOD: "hello_split",
     HANDSHAKE_TIMEOUT: 2.0,
     MAX_CONNECTIONS: 200,
     FAKE_DELAY: 0.001,
@@ -143,6 +147,8 @@ export function defaultConfig(): AppConfig {
     MODE: "SNI Only",
     PROBE_TRIES: 2,
     PROBE_TIMEOUT: 3.0,
+    RESOLVE_SNI: false,
+    CONNECT_OVERRIDE: "",
     // FIX(#1c): dead SOCKS5/HTTP defaults removed (see AppConfig).
   };
 }
@@ -185,6 +191,8 @@ export function normalizeConfig(raw: any): AppConfig {
     MODE: String(get("MODE", "mode", base.MODE)),
     PROBE_TRIES: Number(get("PROBE_TRIES", "probe_tries", base.PROBE_TRIES)),
     PROBE_TIMEOUT: Number(get("PROBE_TIMEOUT", "probe_timeout", base.PROBE_TIMEOUT)),
+    RESOLVE_SNI: coerceTrayBool(get("RESOLVE_SNI", "resolve_sni", base.RESOLVE_SNI), base.RESOLVE_SNI),
+    CONNECT_OVERRIDE: String(get("CONNECT_OVERRIDE", "connect_override", base.CONNECT_OVERRIDE)),
     // FIX(#1c): SOCKS5/HTTP keys no longer normalized; old files still load, keys ignored.
   };
 }

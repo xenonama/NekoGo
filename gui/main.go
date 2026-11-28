@@ -22,7 +22,22 @@ func main() {
 	}
 }
 
+// Windows replaces this no-op with the post-exit self-update dispatcher. Keep
+// the hook here so non-Windows builds retain their normal startup path.
+var runSelfUpdateAtStartup = func([]string) (bool, error) { return false, nil }
+
 func run() error {
+	// The update helper must run before the normal single-instance barrier,
+	// config, cleanup, or Wails: its parent is still alive and will exit only
+	// after this process has published readiness.
+	handled, err := runSelfUpdateAtStartup(os.Args[1:])
+	if err != nil {
+		return fmt.Errorf("self update: %w", err)
+	}
+	if handled {
+		return nil
+	}
+
 	// Exclude duplicates before config, core reaping, or proxy recovery. An
 	// elevated relaunch only waits for its parent; it takes this same guard.
 	instance, err := acquireSingleInstance(singleInstanceScope, os.Args[1:])

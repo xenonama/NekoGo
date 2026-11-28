@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"encoding/json"
 	"image/png"
 	"os"
 	"path/filepath"
@@ -461,8 +462,12 @@ func TestSetCloseToTrayPersistsSettings(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(raw), `"closeToTray": false`) {
-		t.Fatalf("config.json lacks closeToTray=false:\n%s", raw)
+	var fc fileConfig
+	if err := json.Unmarshal(raw, &fc); err != nil {
+		t.Fatal(err)
+	}
+	if fc.Settings.CloseToTray {
+		t.Fatalf("config.json closeToTray = true, want false:\n%s", raw)
 	}
 }
 

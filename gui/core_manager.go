@@ -4,9 +4,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os/exec"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -137,13 +139,6 @@ const (
 	probeOwnerNetwork = "network"
 )
 
-// spoofProbeMu serializes probes that need a temporary SNI-spoof engine:
-// sni_front.go publishes the live engine port through one process-wide
-// atomic, so two temporary engines must never race on it. The lock is
-// only taken for CoreSpoof profiles, never for ordinary sing-box/xray
-// probes, so Test All stays concurrent.
-var spoofProbeMu sync.Mutex
-
 // aetherProbeMu serializes probes that spawn a temporary aether engine:
 // aether.exe is the heaviest child of the app, and a Test All running
 // one engine per ping piled up processes. Probes are serialized and reuse
@@ -157,6 +152,10 @@ var aetherProbeMu sync.Mutex
 // The latency probe itself runs outside this lock.
 var ephemeralStartMu sync.Mutex
 
+var ephemeralImageApply atomic.Bool
+
+var errCoreImageApply = errors.New("core update in progress")
+
 // ephProbe is one in-flight ephemeral latency test. stops holds the
 // teardown hooks for the throwaway core that belongs to this probe, so
 // StopEphemeralTests can abort the right process without touching
@@ -166,6 +165,7 @@ type ephProbe struct {
 	cancel  context.CancelFunc
 	stopped bool
 	stops   []func()
+	done    chan struct{}
 }
 
 // NewCoreManager wires both engine managers to one log channel and
@@ -1562,11 +1562,15 @@ func (m *CoreManager) ephProbeCtx(owner string) (context.Context, context.Cancel
 	m.ephMu.Lock()
 	defer m.ephMu.Unlock()
 	ctx, cancel := context.WithCancel(context.Background())
+	if ephemeralImageApply.Load() {
+		cancel()
+		return ctx, cancel, 0
+	}
 	if m.ephProbes == nil {
 		m.ephProbes = make(map[uint64]*ephProbe)
 	}
 	m.ephGen++
-	m.ephProbes[m.ephGen] = &ephProbe{owner: owner, cancel: cancel}
+	m.ephProbes[m.ephGen] = &ephProbe{owner: owner, cancel: cancel, done: make(chan struct{})}
 	return ctx, cancel, m.ephGen
 }
 
@@ -1575,7 +1579,10 @@ func (m *CoreManager) ephProbeCtx(owner string) (context.Context, context.Cancel
 // newer sibling's entry.
 func (m *CoreManager) ephProbeForget(gen uint64) {
 	m.ephMu.Lock()
-	delete(m.ephProbes, gen)
+	if p, ok := m.ephProbes[gen]; ok {
+		delete(m.ephProbes, gen)
+		close(p.done)
+	}
 	m.ephMu.Unlock()
 }
 
@@ -1604,14 +1611,13 @@ func (m *CoreManager) StopEphemeralTests(owner string) bool {
 	m.ephMu.Lock()
 	var cancels []context.CancelFunc
 	var stops []func()
-	for gen, p := range m.ephProbes {
+	for _, p := range m.ephProbes {
 		if owner != "" && p.owner != owner {
 			continue
 		}
 		p.stopped = true
 		cancels = append(cancels, p.cancel)
 		stops = append(stops, p.stops...)
-		delete(m.ephProbes, gen)
 	}
 	m.ephMu.Unlock()
 	if len(cancels) == 0 {
@@ -1626,6 +1632,160 @@ func (m *CoreManager) StopEphemeralTests(owner string) bool {
 	return true
 }
 
+func (m *CoreManager) beginImageApply() {
+	ephemeralStartMu.Lock()
+	ephemeralImageApply.Store(true)
+	ephemeralStartMu.Unlock()
+	m.StopEphemeralTests("")
+}
+
+func (m *CoreManager) waitImageApplyProbes(timeout time.Duration) error {
+	m.ephMu.Lock()
+	var done []<-chan struct{}
+	for _, p := range m.ephProbes {
+		done = append(done, p.done)
+	}
+	m.ephMu.Unlock()
+	if len(done) == 0 {
+		return nil
+	}
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	for _, ch := range done {
+		select {
+		case <-ch:
+		case <-timer.C:
+			return errors.New("timed out stopping ephemeral core tests")
+		}
+	}
+	return nil
+}
+
+func (m *CoreManager) endImageApply() {
+	ephemeralImageApply.Store(false)
+}
+
+func commandUsesImage(cmd *exec.Cmd, path string) bool {
+	return cmd != nil && samePath(cmd.Path, path)
+}
+
+func (m *CoreManager) usesImage(path string) bool {
+	if m.singboxMgr != nil {
+		m.singboxMgr.mu.Lock()
+		used := commandUsesImage(m.singboxMgr.cmd, path) || commandUsesImage(m.singboxMgr.ephCmd, path)
+		m.singboxMgr.mu.Unlock()
+		if used {
+			return true
+		}
+	}
+	if m.xrayMgr != nil {
+		m.xrayMgr.mu.Lock()
+		used := commandUsesImage(m.xrayMgr.cmd, path) || commandUsesImage(m.xrayMgr.ephCmd, path)
+		m.xrayMgr.mu.Unlock()
+		if used {
+			return true
+		}
+	}
+	if m.upstreamMgr != nil {
+		m.upstreamMgr.mu.Lock()
+		used := commandUsesImage(m.upstreamMgr.cmd, path)
+		m.upstreamMgr.mu.Unlock()
+		if used {
+			return true
+		}
+	}
+	if m.mihomoMgr != nil {
+		m.mihomoMgr.mu.Lock()
+		used := commandUsesImage(m.mihomoMgr.cmd, path) || commandUsesImage(m.mihomoMgr.ephCmd, path)
+		m.mihomoMgr.mu.Unlock()
+		if used {
+			return true
+		}
+	}
+	for _, mgr := range []*AetherManager{m.aetherMgr, m.psiphonMgr, m.torMgr} {
+		if mgr == nil {
+			continue
+		}
+		mgr.mu.Lock()
+		used := commandUsesImage(mgr.cmd, path)
+		mgr.mu.Unlock()
+		if used {
+			return true
+		}
+	}
+	return false
+}
+
+func (m *CoreManager) stopImageUsers(path string) error {
+	var err error
+	if m.singboxMgr != nil {
+		m.singboxMgr.mu.Lock()
+		active := commandUsesImage(m.singboxMgr.cmd, path)
+		ephemeral := commandUsesImage(m.singboxMgr.ephCmd, path)
+		m.singboxMgr.mu.Unlock()
+		if active {
+			if e := m.singboxMgr.Stop(); e != nil && err == nil {
+				err = e
+			}
+		}
+		if ephemeral {
+			m.singboxMgr.StopEphemeral()
+		}
+	}
+	if m.xrayMgr != nil {
+		m.xrayMgr.mu.Lock()
+		active := commandUsesImage(m.xrayMgr.cmd, path)
+		ephemeral := commandUsesImage(m.xrayMgr.ephCmd, path)
+		m.xrayMgr.mu.Unlock()
+		if active {
+			if e := m.xrayMgr.Stop(); e != nil && err == nil {
+				err = e
+			}
+		}
+		if ephemeral {
+			m.xrayMgr.StopEphemeral()
+		}
+	}
+	if m.upstreamMgr != nil {
+		m.upstreamMgr.mu.Lock()
+		active := commandUsesImage(m.upstreamMgr.cmd, path)
+		m.upstreamMgr.mu.Unlock()
+		if active {
+			if e := m.upstreamMgr.Stop(); e != nil && err == nil {
+				err = e
+			}
+		}
+	}
+	if m.mihomoMgr != nil {
+		m.mihomoMgr.mu.Lock()
+		active := commandUsesImage(m.mihomoMgr.cmd, path)
+		ephemeral := commandUsesImage(m.mihomoMgr.ephCmd, path)
+		m.mihomoMgr.mu.Unlock()
+		if active {
+			if e := m.mihomoMgr.Stop(); e != nil && err == nil {
+				err = e
+			}
+		}
+		if ephemeral {
+			m.mihomoMgr.StopEphemeral()
+		}
+	}
+	for _, mgr := range []*AetherManager{m.aetherMgr, m.psiphonMgr, m.torMgr} {
+		if mgr == nil {
+			continue
+		}
+		mgr.mu.Lock()
+		active := commandUsesImage(mgr.cmd, path)
+		mgr.mu.Unlock()
+		if active {
+			if e := mgr.Stop(); e != nil && err == nil {
+				err = e
+			}
+		}
+	}
+	return err
+}
+
 // startEphemeralProbe picks a free mixed port and starts the throwaway
 // core under ephemeralStartMu. prepare (optional) runs under the same
 // lock before the spawn and returns a teardown func owned by the caller
@@ -1635,6 +1795,9 @@ func (m *CoreManager) StopEphemeralTests(owner string) bool {
 func startEphemeralProbe(ctx context.Context, prepare func() (func(), error), start func(mixedPort int) (int, error)) (port int, teardown func(), err error) {
 	ephemeralStartMu.Lock()
 	defer ephemeralStartMu.Unlock()
+	if ephemeralImageApply.Load() {
+		return 0, nil, errCoreImageApply
+	}
 	if err := ctx.Err(); err != nil {
 		return 0, nil, err
 	}
@@ -1690,8 +1853,13 @@ func (m *CoreManager) EphemeralURLTest(profile *Profile, settings Settings, url 
 		timeoutMs = maxProbeTimeoutMs
 	}
 	ctx, cancel, gen := m.ephProbeCtx(owner)
-	defer cancel()
-	defer m.ephProbeForget(gen)
+	if gen == 0 {
+		return nil, errCoreImageApply
+	}
+	defer func() {
+		cancel()
+		m.ephProbeForget(gen)
+	}()
 	timeout := time.Duration(timeoutMs) * time.Millisecond
 	// Aether profiles probe THROUGH their own thrownaway engine: the
 	// ephemeral config dials 127.0.0.1:<engine port>, so a temp engine
@@ -1720,27 +1888,18 @@ func (m *CoreManager) EphemeralURLTest(profile *Profile, settings Settings, url 
 	// start.
 	useXray := profile.Core.IsXray() || spoofTransportXray(profile, settings)
 
-	// Spoof profiles must be probed THROUGH the spoof engine: an
-	// ephemeral core rendered without a live engine dials the remote (or
-	// a dead loopback) directly, so DPI blocks it and the Test button
-	// reported fail/slow even when Connect works. When no engine runs,
-	// spin a temporary one for the probe; when the user is connected,
-	// reuse the live engine port. Both transports need it.
+	// Spoof profiles are probed through a temporary engine rendered from
+	// this profile and the current settings. Reusing a published live front
+	// would test whichever config started that engine, not the selected row.
+	// The temporary port stays on the profile copy, so the live connection's
+	// process-wide front is never replaced or cleared.
 	//
 	// Settings → SNI spoofing turns this off together with the engine
 	// itself: the probe then dials the profile's own address (e.g. a
 	// local tunnel), exactly like its connect would.
-	//
-	// sni_front.go publishes that port process-wide, so temporary
-	// engines are serialized. Ordinary probes stay concurrent.
 	var prepare func() (func(), error)
 	if spoofConnectEnabled(profile, settings) {
-		spoofProbeMu.Lock()
-		defer spoofProbeMu.Unlock()
 		prepare = func() (func(), error) {
-			if _, live := currentSpoofFrontPort(); live {
-				return nil, nil
-			}
 			if spoofMgr == nil {
 				return nil, fmt.Errorf("sni-spoof manager not wired")
 			}
@@ -1748,8 +1907,8 @@ func (m *CoreManager) EphemeralURLTest(profile *Profile, settings Settings, url 
 			// Share the exe override path: tmp.Start resolves the
 			// same binary via the package-level overrides. Start
 			// blocks until the engine reports its listener ready, so
-			// the port published here is guaranteed to accept the
-			// transport dial that follows.
+			// the private port is guaranteed to accept the transport
+			// dial that follows.
 			if err := tmp.Start(profile, settings); err != nil {
 				return nil, fmt.Errorf("spoof probe engine: %w", err)
 			}
@@ -1759,14 +1918,10 @@ func (m *CoreManager) EphemeralURLTest(profile *Profile, settings Settings, url 
 				return nil, fmt.Errorf("spoof probe engine: not listening after start")
 			}
 			m.ephProbeAddStop(gen, func() { _ = tmp.Stop() })
-			setSpoofFrontPort(listenPort)
-			return func() {
-				// By value: a connect that committed during the probe
-				// published its own engine here, and clearing on sight
-				// took that live port down.
-				clearSpoofFrontPortIf(listenPort)
-				_ = tmp.Stop()
-			}, nil
+			clone := *probeProfile
+			clone.SpoofEnginePort = listenPort
+			probeProfile = &clone
+			return func() { _ = tmp.Stop() }, nil
 		}
 	}
 

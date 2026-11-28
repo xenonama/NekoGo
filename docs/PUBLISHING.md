@@ -1,73 +1,81 @@
 # Publishing a NekoGo Release
 
-The Update Manager (`gui/updater.go`) is v2rayN-style: every row installs
-from the repo that publishes that binary.
+The in-app Updates panel has exactly eight rows. Each row installs from the
+project that publishes its binary or data.
 
-| Row | Source | Asset it looks for |
+| Row | Source | Asset or data it uses |
 | --- | --- | --- |
-| `nekobox` | `github.com/xenonama/NekoGo` | `nekobox_core.exe`, else a `*.zip` named `*nekobox_core*` |
-| `xray` | `github.com/xenonama/NekoGo` | `xray.exe`, else a `*.zip` named `*xray*` |
-| `gui` | `github.com/xenonama/NekoGo` | `NekoGo-Setup-*.exe`, else `NekoGo-Portable-*.zip`, else any `*nekogo*.exe`/`.zip` |
-| `singbox` | `SagerNet/sing-box` | the official Windows zip (Settings → Connection → Core engine = upstream) |
-| `mihomo` | `MetaCubeX/mihomo` | the STABLE release's Windows zip |
-| `geoip` / `geosite` | `Loyalsoldier/geoip`, `Loyalsoldier/v2ray-rules-dat` | `Country.mmdb`, `geosite.dat` |
+| GeoIP Database (`geoip`) | `Loyalsoldier/geoip`, `release` branch via jsDelivr | `Country.mmdb` |
+| GeoSite Rule-set (`geosite`) | `Loyalsoldier/v2ray-rules-dat` | `geosite.dat` |
+| official sing-box (`singbox`) | `SagerNet/sing-box` | `sing-box-<version>-windows-<arch>.zip` |
+| Xray (`xray`) | `XTLS/Xray-core` | `Xray-windows-<arch>.zip` |
+| mihomo (`mihomo`) | `MetaCubeX/mihomo` | the STABLE release's exact baseline Windows zip |
+| Aether (`psiphon`) | `CluvexStudio/Aether` | `aether-windows-x86_64.zip` |
+| Psiphon Servers (`psiphon-servers`) | Psiphon's signed server list | `server_list_compressed`, stored as `psiphon_servers.dat` |
+| NekoGo (`nekogo`) | `github.com/xenonama/NekoGo` | exactly `nekogo.exe` |
 
-Names are matched case-insensitively, and the GUI patterns are anchored to
-an extension, so an asset like `NekoGo-Setup-notes.txt` is never offered
-as an installer.
+Names are matched case-insensitively. The NekoGo row accepts only the raw
+`nekogo.exe` asset; setup executables, portable archives, and similarly named
+files are not updater assets. There is no NekoBox core updater row and no
+legacy GUI-installer row. Tor is runtime/diagnostics only and has no updater
+row.
 
-The fork's own `nekobox_core.exe` carries the NekoBox Thrift server, and
-`xray.exe` must match the config format NekoBox writes, so those two rows
-never fall back to an upstream release — publishing them is part of this
-procedure. `singbox`, `mihomo`, `geoip` and `geosite` resolve from their
-own projects and need nothing here.
+All rows except NekoGo resolve from their own upstream or data sources and
+need no assets in the NekoGo release.
 
-Until you publish a release, the fork's rows report:
+## Update behavior
 
-- `gui`: `UpdateAvail=false`, `Notes="No NekoGo release published yet."`
-- `nekobox` / `xray`: `UpdateAvail=false`,
-  `Notes="No core release published yet — manual update only (run build.bat)."`
-- `geoip` / `geosite`: still work (independent sources).
+Core and data rows download while the current connection stays up. Applying a
+core update disconnects and reconnects only when the exact target image is in
+use; an update to an unused image does not interrupt the active profile.
+
+The NekoGo row downloads `nekogo.exe`, verifies the download (against GitHub's
+published SHA-256 digest when available), and stages a post-exit helper. After
+NekoGo exits, the helper rechecks the staged image's size and hash, replaces the
+running executable with a `.bak` backup, and rolls back if replacement or
+verification fails. It then relaunches NekoGo, passing `--connect <profile-id>`
+to reconnect the prior profile when one was active.
+
+Before a NekoGo release is published, its row reports `UpdateAvail=false` and
+`Notes="No NekoGo release published yet."` If the newest release lacks the
+exact `nekogo.exe` asset, it reports `UpdateAvail=false` and
+`Notes="nekogo.exe is not published in this release"`. The other seven rows
+continue to use their independent sources.
 
 ## Steps
 
-1. **Build everything:**
+1. **Build the release artifacts:**
    ```bat
    build.bat
    ```
-   This produces `gui/build/bin/nekobox_core.exe`,
-   `gui/build/bin/xray.exe` and `gui/build/bin/nekogo.exe` (plus
-   `sni-spoof.exe` and the optional engines), and
-   `dist/NekoGo-Setup-*.exe` / `dist/NekoGo-Portable-*.zip`.
+   This produces `gui\build\bin\nekogo.exe` and publishes the raw self-update
+   asset as `dist\nekogo.exe`. For version `1.0.0-beta.4`, that file sits beside
+   `dist\NekoGo-Setup-v1.0.0-beta.4.exe`; the optional portable ZIP may also be
+   produced. Neither package is consumed by the Updates panel.
 
 2. **Create a release** on `github.com/xenonama/NekoGo`
    (Releases → Draft a new release).
 
-3. **Upload as release assets:**
-   - `gui/build/bin/nekobox_core.exe` (or a `*.zip` containing it)
-   - `gui/build/bin/xray.exe` (or a `*.zip` containing it)
-   - `dist/NekoGo-Setup-*.exe` and/or `dist/NekoGo-Portable-*.zip`
+3. **Upload the required release asset:**
+   - `dist\nekogo.exe`
 
-   Keep the `NekoGo-Setup-` and `NekoGo-Portable-` prefixes exactly as
-   `build.bat` writes them — the `gui` row matches on them.
+   Keep the filename exactly `nekogo.exe`. No `nekobox_core.exe`,
+   `NekoGo-Setup-*.exe`, or `NekoGo-Portable-*.zip` upload is needed by the
+   Updates panel.
 
 4. **Tag with the version from `VERSION`:**
-   The current version is the `VERSION` file at the repo root
-   (e.g. `1.0.0-beta.4`). Tag the release with that version — a leading
-   `v` is accepted, so `v1.0.0-beta.4` matches `1.0.0-beta.4`. The tag is
-   what the GUI compares against its own link-time `appVersion`, and a
-   local build that is ahead of the published tag gets
+   The tag must match the version embedded by `build.bat` (for example,
+   `1.0.0-beta.4`). A leading `v` is accepted, so `v1.0.0-beta.4` matches
+   `1.0.0-beta.4`. The NekoGo row compares the tag with its link-time
+   `appVersion`; unstamped builds fall back to the repository's `VERSION`
+   file. A local build ahead of the published tag gets
    `Notes="This build is newer than the published release"`.
-   The `nekobox`, `xray` and `gui` rows all read the fork's newest
-   release via `/releases?per_page=1`, so marking the release as a
-   prerelease keeps it visible; `/releases/latest` would hide it.
+   The row reads the newest release via `/releases?per_page=1`, so prereleases
+   remain visible; `/releases/latest` would hide them.
 
-5. **Verify:** open NekoGo → Updates → Check. Each row logs
-   `[update:<id>] source=<repo> latest=<tag>` (e.g.
-   `[update:nekobox] source=xenonama/NekoGo latest=1.0.0-beta.4`).
-   `nekobox` / `xray` replace the engine binaries in place — the updater
-   refuses while a core is running, so disconnect first — and the GUI
-   installer downloads to `%APPDATA%\NekoGo\updates\`, where it is run
-   only when you press its **Open** button, never automatically.
-   GeoIP (`gui/assets/GeoLite2-Country.mmdb`) and GeoSite
-   (`gui/assets/geosite.dat`) update from their independent sources.
+5. **Verify:** open NekoGo → Updates → Check. Confirm the eight rows listed
+   above and inspect the per-row logs, which use
+   `[update:<id>] source=<repo> latest=<tag>` (for example,
+   `[update:nekogo] source=xenonama/NekoGo latest=1.0.0-beta.4`).
+   A NekoGo update restarts the app to install the raw executable and then
+   reconnects the prior profile when applicable.

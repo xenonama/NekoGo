@@ -357,6 +357,8 @@ func (m *XrayManager) Stop() error {
 	if cmd == nil || cmd.Process == nil {
 		m.mu.Lock()
 		m.running = false
+		m.cmd = nil
+		m.stopRequested = false
 		workDir := m.workDir
 		m.workDir = ""
 		m.mu.Unlock()

@@ -68,6 +68,34 @@ func TestSetActiveProfileIDIfUnchanged(t *testing.T) {
 	}
 }
 
+func TestConfigThemeDefaults(t *testing.T) {
+	if got := DefaultSettings().Theme; got != "dark" {
+		t.Fatalf("fresh theme = %q, want dark", got)
+	}
+	for _, tc := range []struct {
+		name string
+		raw  string
+		want string
+	}{
+		{"missing theme", `{"profiles":[],"settings":{"mixedPort":2080}}`, "dark"},
+		{"explicit light", `{"profiles":[],"settings":{"mixedPort":2080,"theme":"light"}}`, "light"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			if err := os.WriteFile(filepath.Join(dir, "config.json"), []byte(tc.raw), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			store, err := NewConfigStore(dir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := store.GetSettings().Theme; got != tc.want {
+				t.Fatalf("theme = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
 func TestLegacyMigrationOnlyRewritesFilesystemSettings(t *testing.T) {
 	oldRoot := t.TempDir()
 	newRoot := t.TempDir()
@@ -458,6 +486,37 @@ func TestSaveSettingsKeepsBackendOwnedFields(t *testing.T) {
 	}
 }
 
+func TestSaveSettingsKeepsNewerSNIConfig(t *testing.T) {
+	store, err := NewConfigStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	stale := store.GetSettings()
+	stale.SNIConfig.Method = "auto"
+	stale.SNIConfig.Plan = "B"
+	want := SNIConfig{
+		Plan: "A", Method: "hello_split", Fingerprint: "chrome", QUICMode: "spoof", IPMode: "ipv4",
+		ManualIP: "192.0.2.10", HandshakeTimeout: 3, MaxConnections: 200,
+	}
+	if err := store.UpdateSNI(func(s *Settings) { s.SNIConfig = want }); err != nil {
+		t.Fatal(err)
+	}
+	stale.Theme = "light"
+	if err := store.SaveSettings(stale); err != nil {
+		t.Fatal(err)
+	}
+	if got := store.GetSettings().SNIConfig; got != want {
+		t.Fatalf("stale settings save replaced newer SNI config: got %+v, want %+v", got, want)
+	}
+	reloaded, err := NewConfigStore(store.Dir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := reloaded.GetSettings().SNIConfig; got != want {
+		t.Fatalf("persisted SNI config = %+v, want %+v", got, want)
+	}
+}
+
 // The SNI lists are shared: the tab curates them (add, remove, check) and
 // the scanner stamps LastOK/LastMs/LastAt/LastTLS/LastIP onto the live
 // store, even when the run is cancelled. SaveSettings used to take the
@@ -507,6 +566,9 @@ func TestSaveSettingsKeepsSNIScanStamps(t *testing.T) {
 	}
 	if len(got.SNISNIs) != 1 || !got.SNISNIs[0].LastOK || got.SNISNIs[0].LastIP != "192.0.2.20" {
 		t.Fatalf("SNISNIs = %+v, want the scan stamps the backend wrote", got.SNISNIs)
+	}
+	if err := store.Flush(); err != nil {
+		t.Fatal(err)
 	}
 	reloaded, err := NewConfigStore(store.Dir())
 	if err != nil {
@@ -592,11 +654,16 @@ func TestLoadConfigKeepsSettingsWhenMixedPortZero(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	zeroed := strings.Replace(string(raw), `"mixedPort": 2080`, `"mixedPort": 0`, 1)
-	if zeroed == string(raw) {
-		t.Fatalf("config.json has no mixedPort 2080 to zero out:\n%s", raw)
+	var fc fileConfig
+	if err := json.Unmarshal(raw, &fc); err != nil {
+		t.Fatal(err)
 	}
-	if err := os.WriteFile(path, []byte(zeroed), 0o644); err != nil {
+	fc.Settings.MixedPort = 0
+	zeroed, err := json.Marshal(fc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, zeroed, 0o644); err != nil {
 		t.Fatal(err)
 	}
 	reloaded, err := NewConfigStore(dir)

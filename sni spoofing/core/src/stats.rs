@@ -88,6 +88,7 @@ impl Cell {
 
 #[derive(Debug, Default)]
 struct Inner {
+    generation: u64,
     active: u64,
     total: u64,
     success: u64,
@@ -115,6 +116,7 @@ pub struct Ranked {
 pub struct Snapshot {
     #[serde(rename = "type")]
     pub kind: String,
+    pub generation: u64,
     pub active: u64,
     pub total: u64,
     pub success: u64,
@@ -311,6 +313,7 @@ impl Stats {
         let methods = ranked(&g.methods, 3);
         Snapshot {
             kind: "stats".to_string(),
+            generation: g.generation,
             active: g.active,
             total: g.total,
             success: g.success,
@@ -331,6 +334,7 @@ impl Stats {
 
     pub fn reset(&self) {
         let mut g = self.inner.lock();
+        g.generation = g.generation.wrapping_add(1);
         g.active = 0;
         g.total = 0;
         g.success = 0;
@@ -418,7 +422,29 @@ pub fn connection_verdict(bytes_moved: u64, interceptor_answered: bool) -> bool 
 
 #[cfg(test)]
 mod tests {
-    use super::connection_verdict;
+    use super::{connection_verdict, Stats};
+
+    #[test]
+    fn reset_clears_counters_and_advances_snapshot_generation() {
+        let stats = Stats::new();
+        stats.increment_total();
+        stats.record_result("192.0.2.10:443", "example.com", true, "hello_split");
+        stats.add_traffic(100, 200);
+        let before = stats.snapshot();
+        assert_eq!(before.generation, 0);
+        assert_eq!(before.total, 1);
+        assert_eq!(before.methods.len(), 1);
+
+        stats.reset();
+        let after = stats.snapshot();
+        assert_eq!(after.generation, before.generation + 1);
+        assert_eq!(after.total, 0);
+        assert_eq!(after.success, 0);
+        assert_eq!(after.failed, 0);
+        assert_eq!(after.up_bytes, 0);
+        assert_eq!(after.down_bytes, 0);
+        assert!(after.methods.is_empty());
+    }
 
     #[test]
     fn an_interceptor_answer_overrides_the_byte_count() {

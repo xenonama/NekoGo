@@ -253,15 +253,17 @@ export function CancelSNIScan(): $CancellablePromise<void> {
     return $Call.ByID(668749092);
 }
 
+export function CancelUpdate(id: string): $CancellablePromise<boolean> {
+    return $Call.ByID(1981887714, id);
+}
+
 /**
- * CheckUpdates queries every component (own goroutine each) and returns
- * the merged result. It never downloads. Partial failures land in
- * LastError; the call itself only fails if nothing could be checked... in
- * practice it always returns the rows with nil error so the UI can
- * render per-row state.
+ * CheckUpdates queries only the selected components and returns the merged
+ * result. A nil selection checks every component for Go callers; an empty
+ * non-nil selection checks none. Partial failures land in LastError.
  */
-export function CheckUpdates(): $CancellablePromise<$models.UpdatableComponent[]> {
-    return $Call.ByID(2263355335).then(($result: any) => {
+export function CheckUpdates(ids: string[]): $CancellablePromise<$models.UpdatableComponent[]> {
+    return $Call.ByID(2263355335, ids).then(($result: any) => {
         return $$createType12($result);
     });
 }
@@ -567,7 +569,7 @@ export function ListSubscriptions(): $CancellablePromise<$models.Subscription[]>
 
 /**
  * ListUpdatables returns the current local state of every updatable
- * component (no network).
+ * component (no network), including remembered checks and live progress.
  */
 export function ListUpdatables(): $CancellablePromise<$models.UpdatableComponent[]> {
     return $Call.ByID(3240550730).then(($result: any) => {
@@ -845,6 +847,14 @@ export function SetSystemProxy(p: $models.ProxyPorts): $CancellablePromise<void>
     return $Call.ByID(2213240030, p);
 }
 
+export function SetUpdatableEnabled(id: string, enabled: boolean): $CancellablePromise<void> {
+    return $Call.ByID(1374828956, id, enabled);
+}
+
+export function SetUpdaterProxyEnabled(enabled: boolean): $CancellablePromise<void> {
+    return $Call.ByID(4054721177, enabled);
+}
+
 /**
  * ShouldHideOnClose is the single source of truth for the window-X
  * decision: true means hide to tray instead of quitting. Read fresh on
@@ -870,12 +880,18 @@ export function Shutdown(): $CancellablePromise<void> {
     return $Call.ByID(2987688963);
 }
 
+export function SpoofClearStats(): $CancellablePromise<$models.SpoofStats | null> {
+    return $Call.ByID(2466882298).then(($result: any) => {
+        return $$createType38($result);
+    });
+}
+
 /**
  * SpoofGetConfig returns the stored engine options.
  */
 export function SpoofGetConfig(): $CancellablePromise<$models.SNIConfig> {
     return $Call.ByID(2618895244).then(($result: any) => {
-        return $$createType37($result);
+        return $$createType39($result);
     });
 }
 
@@ -898,7 +914,7 @@ export function SpoofGetLogs(sinceID: number): $CancellablePromise<$models.LogEn
  */
 export function SpoofGetStats(): $CancellablePromise<$models.SpoofStats | null> {
     return $Call.ByID(640968337).then(($result: any) => {
-        return $$createType39($result);
+        return $$createType38($result);
     });
 }
 
@@ -917,9 +933,8 @@ export function SpoofGetStatus(): $CancellablePromise<$models.SpoofStatus> {
 
 /**
  * SpoofSetConfig validates and persists the engine options. Empty
- * values mean "engine default" and are omitted from the generated
- * config — except Method, which migrates to "auto" (the engine
- * default) so a fresh tab never renders a blank method.
+ * values select the engine's current defaults; other zero values are
+ * omitted from the generated config.
  */
 export function SpoofSetConfig(cfg: $models.SNIConfig): $CancellablePromise<void> {
     return $Call.ByID(2586588200, cfg);
@@ -1063,6 +1078,10 @@ export function UpdateSubscriptions(): $CancellablePromise<$models.LinkImportRes
     });
 }
 
+export function UpdaterProxyEnabled(): $CancellablePromise<boolean> {
+    return $Call.ByID(3449497587);
+}
+
 /**
  * UpstreamSingBoxVersion runs the official sing-box.exe "version"
  * command, cached per resolved path like CoreVersion (transient ""
@@ -1130,9 +1149,9 @@ const $$createType33 = $Create.Map($Create.Any, $Create.Any);
 const $$createType34 = $models.SNIPairResult.createFrom;
 const $$createType35 = $Create.Array($$createType34);
 const $$createType36 = $models.SNIScanStatus.createFrom;
-const $$createType37 = $models.SNIConfig.createFrom;
-const $$createType38 = $models.SpoofStats.createFrom;
-const $$createType39 = $Create.Nullable($$createType38);
+const $$createType37 = $models.SpoofStats.createFrom;
+const $$createType38 = $Create.Nullable($$createType37);
+const $$createType39 = $models.SNIConfig.createFrom;
 const $$createType40 = $models.SpoofStatus.createFrom;
 const $$createType41 = $models.IPTestResult.createFrom;
 const $$createType42 = $Create.Nullable($$createType41);

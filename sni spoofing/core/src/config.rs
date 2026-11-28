@@ -107,7 +107,7 @@ impl Default for Config {
             listen_port: 40443,
             endpoints: vec![],
             fake_snis: vec![],
-            bypass_method: "auto".to_string(),
+            bypass_method: "hello_split".to_string(),
             handshake_timeout: 2.0,
             max_connections: 200,
             fake_delay: 0.001,
@@ -812,5 +812,19 @@ fn truncate(s: &str, n: usize) -> String {
         s.to_string()
     } else {
         format!("{}…", &s[..n])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_config_uses_hello_split_and_safe_modes() {
+        let cfg = Config::default();
+        assert_eq!(cfg.bypass_method, "hello_split");
+        assert_eq!(cfg.tls_fingerprint, "legacy");
+        assert_eq!(cfg.quic_mode, "block");
+        assert_eq!(cfg.ip_mode, "ipv4");
     }
 }

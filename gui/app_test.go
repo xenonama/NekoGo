@@ -33,8 +33,17 @@ func versionFileWant(t *testing.T) string {
 // version no release ever had, and the updater compared that phantom
 // prerelease against the published tag instead of the real one.
 func TestAppVersionMatchesVERSIONFile(t *testing.T) {
-	if want := versionFileWant(t); appVersion != want {
-		t.Errorf("appVersion = %q, want %q", appVersion, want)
+	if want := versionFileWant(t); appVersionValue() != want {
+		t.Errorf("appVersionValue() = %q, want %q", appVersionValue(), want)
+	}
+}
+
+func TestAppVersionStampTakesPrecedence(t *testing.T) {
+	previous := appVersion
+	t.Cleanup(func() { appVersion = previous })
+	appVersion = "9.8.7-test"
+	if got := appVersionValue(); got != appVersion {
+		t.Fatalf("stamped version = %q, want %q", got, appVersion)
 	}
 }
 

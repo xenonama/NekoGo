@@ -6,7 +6,6 @@ package main
 // 044 cross-compile) are verified by build/vet/GOOS checks, not here.
 
 import (
-	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -62,30 +61,22 @@ func TestP3DedupeKeyIncludesAlterID(t *testing.T) {
 	}
 }
 
-// BUG-041: anchored GUI asset picker — notes .txt must never win,
-// installer .exe must beat a leading generic asset.
+// BUG-041: the portable self-update accepts only the raw nekogo.exe,
+// never a setup executable, portable archive, notes file or lookalike.
 func TestP3PickGUIAssetAnchored(t *testing.T) {
 	assets := []ghAsset{
 		{Name: "NekoGo-Setup-notes.txt", BrowserDownloadURL: "http://x/notes.txt"},
 		{Name: "NekoGo-Setup-v1.exe", BrowserDownloadURL: "http://x/setup.exe"},
 		{Name: "NekoGo-Portable-v1.zip", BrowserDownloadURL: "http://x/portable.zip"},
+		{Name: "nekogo.exe.bak", BrowserDownloadURL: "http://x/backup"},
+		{Name: "NEKOGO.EXE", BrowserDownloadURL: "http://x/nekogo.exe"},
 	}
-	got := pickGUIAsset(assets)
-	if got == nil || got.Name != "NekoGo-Setup-v1.exe" {
-		t.Fatalf("pickGUIAsset = %v, want the .exe installer", got)
+	got := pickNekoGoAsset(assets)
+	if got == nil || got.Name != "NEKOGO.EXE" {
+		t.Fatalf("pickNekoGoAsset = %v, want the raw portable executable", got)
 	}
-	txtOnly := []ghAsset{
-		{Name: "NekoGo-Setup-notes.txt", BrowserDownloadURL: "http://x/notes.txt"},
-		{Name: "random-setup-blob", BrowserDownloadURL: "http://x/blob"},
-	}
-	if got := pickGUIAsset(txtOnly); got != nil {
-		t.Fatalf("pickGUIAsset(txt-only) = %v, want nil", got.Name)
-	}
-	portable := []ghAsset{
-		{Name: "NekoGo-Portable-v1.zip", BrowserDownloadURL: "http://x/p.zip"},
-	}
-	if got := pickGUIAsset(portable); got == nil || !strings.HasSuffix(strings.ToLower(got.Name), ".zip") {
-		t.Fatalf("pickGUIAsset(portable) = %v, want the .zip", got)
+	if got := pickNekoGoAsset(assets[:4]); got != nil {
+		t.Fatalf("pickNekoGoAsset(packages-only) = %v, want nil", got)
 	}
 }
 

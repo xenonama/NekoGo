@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strconv"
@@ -192,7 +193,7 @@ func TestPsiphonRowChecksTheAetherRelease(t *testing.T) {
 		if tc.installed == "" && !strings.Contains(row.Notes, "Not installed") {
 			t.Errorf("%s: Notes = %q, want Not installed", tc.tag, row.Notes)
 		}
-		rows, err := a.CheckUpdates()
+		rows, err := a.CheckUpdates(nil)
 		if err != nil {
 			t.Fatalf("CheckUpdates: %v", err)
 		}
@@ -256,10 +257,10 @@ func TestUpdatePsiphonRefusesDigestMismatch(t *testing.T) {
 	}
 }
 
-// TestUpdatePsiphonRefusesWhileTheEngineRuns: Windows cannot replace a mapped
-// image, and pt\lyrebird.exe is a child of a live Tor run — so every
-// aether child, the engine and both chain legs, has to be down first.
-func TestUpdatePsiphonRefusesWhileTheEngineRuns(t *testing.T) {
+// TestUpdatePsiphonStopsOnlyExactImageUsers: Windows cannot replace a
+// mapped image, so the updater stops every aether.exe child using the
+// destination while leaving an unrelated engine running.
+func TestUpdatePsiphonStopsOnlyExactImageUsers(t *testing.T) {
 	saveUpdateBaseURL(t)
 	if runtime.GOOS != "windows" {
 		t.Skip("the psiphon row installs the Windows archive only")
@@ -272,29 +273,103 @@ func TestUpdatePsiphonRefusesWhileTheEngineRuns(t *testing.T) {
 	defer srv.Close()
 	updateBaseURL["github-api"] = srv.URL
 
-	for _, mgr := range []func(*App) *AetherManager{
-		func(a *App) *AetherManager { return a.aetherMgr },
-		func(a *App) *AetherManager { return a.psiphonMgr },
-		func(a *App) *AetherManager { return a.torMgr },
+	for _, tc := range []struct {
+		name  string
+		which func(*App) (*AetherManager, *AetherManager)
+	}{
+		{"engine", func(a *App) (*AetherManager, *AetherManager) { return a.aetherMgr, a.psiphonMgr }},
+		{"psiphon chain", func(a *App) (*AetherManager, *AetherManager) { return a.psiphonMgr, a.torMgr }},
+		{"tor chain", func(a *App) (*AetherManager, *AetherManager) { return a.torMgr, a.aetherMgr }},
 	} {
-		a := newUpdaterTestApp(t)
-		dir := t.TempDir()
-		setAetherPath(t, a, dir)
-		m := mgr(a)
-		if m == nil {
-			t.Fatal("a manager the update has to check is not wired")
+		t.Run(tc.name, func(t *testing.T) {
+			a := newUpdaterTestApp(t)
+			dir := t.TempDir()
+			dest := filepath.Join(dir, "aether.exe")
+			if err := os.WriteFile(dest, []byte("old-aether"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			setAetherPath(t, a, dest)
+			m, other := tc.which(a)
+			if m == nil || other == nil {
+				t.Fatal("an aether manager is not wired")
+			}
+			m.mu.Lock()
+			m.cmd, m.running = exec.Command(dest), true
+			m.mu.Unlock()
+			otherPath := filepath.Join(t.TempDir(), "other-aether.exe")
+			other.mu.Lock()
+			other.cmd, other.running = exec.Command(otherPath), true
+			other.mu.Unlock()
+
+			if _, err := a.UpdateComponent("psiphon"); err != nil {
+				t.Fatalf("UpdateComponent(psiphon): %v", err)
+			}
+			m.mu.Lock()
+			stopped := !m.running && m.cmd == nil
+			m.mu.Unlock()
+			if !stopped {
+				t.Fatal("the exact-image aether child is still running")
+			}
+			other.mu.Lock()
+			untouched := other.running && other.cmd != nil && samePath(other.cmd.Path, otherPath)
+			other.mu.Unlock()
+			if !untouched {
+				t.Fatal("an unrelated aether child was stopped")
+			}
+			raw, err := os.ReadFile(dest)
+			if err != nil || string(raw) != "aether" {
+				t.Fatalf("installed engine = %q, %v; want aether", raw, err)
+			}
+		})
+	}
+}
+
+// TestUpdatePsiphonRefreshesTransportsWithIdenticalEngine: a release can
+// change pt\ without changing aether.exe. The transaction must still stop
+// an in-use engine and install the transports instead of taking the
+// identical-binary no-op.
+func TestUpdatePsiphonRefreshesTransportsWithIdenticalEngine(t *testing.T) {
+	saveUpdateBaseURL(t)
+	if runtime.GOOS != "windows" {
+		t.Skip("the psiphon row installs the Windows archive only")
+	}
+	stubAetherResolver(t, "aether 2.4.0")
+	zipBytes := aetherReleaseZip(t, torReleaseFiles("same-aether"))
+	srv := fakeAetherServer(t, "v2.4.0",
+		map[string][]byte{aetherAssetName: zipBytes},
+		map[string]string{aetherAssetName: "sha256:" + sha256Hex(zipBytes)})
+	defer srv.Close()
+	updateBaseURL["github-api"] = srv.URL
+
+	a := newUpdaterTestApp(t)
+	dir := t.TempDir()
+	dest := filepath.Join(dir, "aether.exe")
+	if err := os.WriteFile(dest, []byte("same-aether"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	pt := filepath.Join(dir, "pt")
+	if err := os.MkdirAll(pt, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(pt, "lyrebird.exe"), []byte("old-lyrebird"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	setAetherPath(t, a, dest)
+
+	if _, err := a.UpdateComponent("psiphon"); err != nil {
+		t.Fatalf("UpdateComponent(psiphon): %v", err)
+	}
+	for name, want := range map[string]string{
+		"lyrebird.exe":            "lyrebird-bytes",
+		"psiphon-tunnel-core.exe": "psiphon-bytes",
+	} {
+		raw, err := os.ReadFile(filepath.Join(pt, name))
+		if err != nil || string(raw) != want {
+			t.Errorf("%s = %q, %v; want %q", name, raw, err, want)
 		}
-		m.mu.Lock()
-		m.running = true
-		m.mu.Unlock()
-		if _, err := a.UpdateComponent("psiphon"); err == nil || !strings.Contains(err.Error(), "disconnect") {
-			t.Fatalf("err = %v, want a refusal while an aether child runs", err)
-		}
-		if _, err := os.Stat(filepath.Join(dir, "aether.exe")); !os.IsNotExist(err) {
-			t.Fatal("a refused update still wrote the engine")
-		}
-		m.mu.Lock()
-		m.running = false
-		m.mu.Unlock()
+	}
+	raw, err := os.ReadFile(dest)
+	if err != nil || string(raw) != "same-aether" {
+		t.Fatalf("identical engine changed to %q, %v", raw, err)
 	}
 }

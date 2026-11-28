@@ -192,10 +192,15 @@ export const backend = {
     Promise.resolve(App.SetStartOnBoot(enabled)),
   listUpdatables: () =>
     Promise.resolve(App.ListUpdatables()) as Promise<UpdatableComponent[]>,
-  checkUpdates: () =>
-    Promise.resolve(App.CheckUpdates()) as Promise<UpdatableComponent[]>,
+  checkUpdates: (ids: string[]) =>
+    Promise.resolve(App.CheckUpdates(ids)) as Promise<UpdatableComponent[]>,
+  setUpdatableEnabled: (id: string, enabled: boolean) =>
+    Promise.resolve(App.SetUpdatableEnabled(id, enabled)),
+  updaterProxyEnabled: () => Promise.resolve(App.UpdaterProxyEnabled()),
+  setUpdaterProxyEnabled: (enabled: boolean) => Promise.resolve(App.SetUpdaterProxyEnabled(enabled)),
+  cancelUpdate: (id: string) => Promise.resolve(App.CancelUpdate(id)),
   updateComponent: async (id: string): Promise<UpdatableComponent> =>
-    (await App.UpdateComponent(id)) ?? { id, name: id, current: '', latest: '', updateAvail: false, lastError: 'empty result' },
+    (await App.UpdateComponent(id)) ?? { id, name: id, current: '', latest: '', updateAvail: false, checkEnabled: true, lastError: 'empty result' },
   previewLinks: async (text: string): Promise<LinkImportResult> => {
     const r = await App.PreviewLinks(text)
     if (!r) return { profiles: [], invalid: 0 }
@@ -290,6 +295,8 @@ export const backend = {
     (await App.SpoofGetStatus()) ?? { running: false, listenPort: 0, startedAt: '', uptime: 0, lastError: '' },
   spoofGetStats: async (): Promise<SpoofStats | null> =>
     (await App.SpoofGetStats()) as unknown as SpoofStats | null,
+  spoofClearStats: async (): Promise<SpoofStats | null> =>
+    (await App.SpoofClearStats()) as unknown as SpoofStats | null,
   spoofGetConfig: async (): Promise<SNIConfig> =>
     (await App.SpoofGetConfig()) ?? {},
   spoofSetConfig: (cfg: SNIConfig) =>

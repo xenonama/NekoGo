@@ -198,20 +198,134 @@ func TestSettingsAppearanceHeadMatchesItsRows(t *testing.T) {
 	}
 }
 
-// TestSettingsUpdatesCountsEveryCheckItRuns: backend.checkUpdates() is the
-// whole list — a row's Check re-stamps every component's lastCheck — but
-// only checkAll recorded the timestamp the panel's own header reads. So
-// after pressing Check the rows said "checked just now" while the header
-// insisted the last global check was "never", two answers to one question.
-func TestSettingsUpdatesCountsEveryCheckItRuns(t *testing.T) {
-	src := readFrontendSrc(t, filepath.Join("components", "UpdatesPanel.vue"))
-	one := regexp.MustCompile(`(?s)async function checkOne\(.*?\n\}`).FindString(src)
-	all := regexp.MustCompile(`(?s)async function checkAll\(.*?\n\}`).FindString(src)
-	if one == "" || all == "" {
-		t.Fatal("UpdatesPanel no longer has checkOne/checkAll to compare")
+func updatesAsyncFunction(t *testing.T, src, name string) string {
+	t.Helper()
+	body := regexp.MustCompile(`(?sm)async function ` + regexp.QuoteMeta(name) + `\([^\n]*\).*?\n\}$`).FindString(src)
+	if body == "" {
+		t.Fatalf("UpdatesPanel no longer defines async function %s", name)
 	}
-	if strings.Contains(all, "lastGlobalCheck.value") && !strings.Contains(one, "lastGlobalCheck.value") {
-		t.Error("checkOne runs the global check but never records it")
+	return body
+}
+
+func TestSettingsUpdatesUsesOneSelectiveCheck(t *testing.T) {
+	src := readFrontendSrc(t, filepath.Join("components", "UpdatesPanel.vue"))
+	for _, want := range []string{
+		`@click="checkSelected"`,
+		`backend.checkUpdates(ids)`,
+		`Check and Update`,
+		`@click="checkAndUpdate"`,
+		`@click="toggleCheck(c.id, c.checkEnabled)"`,
+		`:aria-checked="c.checkEnabled"`,
+		`const selectedIds = computed`,
+	} {
+		if !strings.Contains(src, want) {
+			t.Errorf("UpdatesPanel is missing selective-check wiring %q", want)
+		}
+	}
+	if strings.Contains(src, "checkOne(") || strings.Contains(src, `>Check</button>`) {
+		t.Error("UpdatesPanel still has a per-row Check button routed through the global endpoint")
+	}
+	if strings.Contains(src, "backend.checkUpdates(selectedIds.value)") {
+		t.Error("UpdatesPanel checks the live selection instead of its enabled-ID snapshot")
+	}
+	if n := strings.Count(src, `@click="checkSelected"`); n != 1 {
+		t.Errorf("UpdatesPanel has %d Check buttons, want exactly one", n)
+	}
+	if n := strings.Count(src, `@click="checkAndUpdate"`); n != 1 {
+		t.Errorf("UpdatesPanel has %d Check and Update buttons, want exactly one", n)
+	}
+	check := updatesAsyncFunction(t, src, "checkSelected")
+	if strings.Count(check, "backend.checkUpdates(ids)") != 1 {
+		t.Error("the selective Check action must await exactly one snapshot check")
+	}
+}
+
+func TestSettingsUpdatesOffersCancellationAndProxy(t *testing.T) {
+	src := readFrontendSrc(t, filepath.Join("components", "UpdatesPanel.vue"))
+	for _, want := range []string{
+		`v-if="c.downloading"`,
+		`@click="cancelDownload(c.id)"`,
+		`backend.cancelUpdate(c.id)`,
+		`@click="updateOne(c.id)"`,
+		`Check and download via proxy`,
+		`backend.updaterProxyEnabled()`,
+		`backend.setUpdaterProxyEnabled(`,
+	} {
+		if !strings.Contains(src, want) {
+			t.Errorf("UpdatesPanel is missing download control %q", want)
+		}
+	}
+	update := updatesAsyncFunction(t, src, "updateOne")
+	for _, want := range []string{
+		`const cancelled = /download cancelled/i.test(errorText(error))`,
+		`return !cancelled`,
+	} {
+		if !strings.Contains(update, want) {
+			t.Errorf("UpdatesPanel does not report cancellation to the batch through %q", want)
+		}
+	}
+}
+
+func TestSettingsUpdatesBatchUsesSnapshotAndStopsOnCancellation(t *testing.T) {
+	src := readFrontendSrc(t, filepath.Join("components", "UpdatesPanel.vue"))
+	batch := updatesAsyncFunction(t, src, "checkAndUpdate")
+	for _, want := range []string{
+		`const ids = [...selectedIds.value]`,
+		`await backend.checkUpdates(ids)`,
+		`const selected = new Set(ids)`,
+		`const candidates = rows.filter((c) => selected.has(c.id) && c.checkEnabled && c.updateAvail && !isManual(c))`,
+		`for (const c of candidates)`,
+		`if (!(await updateOne(c.id))) break`,
+	} {
+		if !strings.Contains(batch, want) {
+			t.Errorf("UpdatesPanel batch is missing %q", want)
+		}
+	}
+	if n := strings.Count(batch, "backend.checkUpdates(ids)"); n != 1 {
+		t.Errorf("UpdatesPanel batch makes %d check calls, want exactly one", n)
+	}
+	if strings.Contains(batch, "checkSelected(") {
+		t.Error("UpdatesPanel batch reuses the selective Check action instead of awaiting its own result")
+	}
+	if strings.Contains(batch, "Promise.all") {
+		t.Error("UpdatesPanel batch still updates candidates in parallel")
+	}
+	snapshot := strings.Index(batch, `const ids = [...selectedIds.value]`)
+	check := strings.Index(batch, "backend.checkUpdates(ids)")
+	if snapshot < 0 || check < 0 || snapshot > check {
+		t.Error("UpdatesPanel batch does not snapshot enabled IDs before checking them")
+	}
+	failure := regexp.MustCompile(`(?s)\} catch \(error\) \{(.*?)\n  \} finally`).FindStringSubmatch(batch)
+	if len(failure) != 2 || !strings.Contains(failure[1], "return") {
+		t.Error("a failed batch check must return without starting updates")
+	}
+	if len(failure) == 2 && strings.Contains(failure[1], "updateOne(") {
+		t.Error("a failed batch check still reaches the update path")
+	}
+}
+
+func TestSettingsUpdatesNekoGoRestartsWithoutInstallerHandling(t *testing.T) {
+	src := readFrontendSrc(t, filepath.Join("components", "UpdatesPanel.vue"))
+	types := readFrontendSrc(t, filepath.Join("types", "index.ts"))
+	update := updatesAsyncFunction(t, src, "updateOne")
+	for _, want := range []string{
+		`id === 'nekogo'`,
+		`NekoGo will restart to install the update.`,
+	} {
+		if !strings.Contains(update, want) {
+			t.Errorf("UpdatesPanel is missing NekoGo update behavior %q", want)
+		}
+	}
+	if strings.Contains(update, "id === 'gui'") {
+		t.Error("UpdatesPanel still routes the app update through the legacy gui row")
+	}
+	for _, legacy := range []string{"installerPath", "openInstaller", "Open installer", "backend.openURL("} {
+		if strings.Contains(src, legacy) {
+			t.Errorf("UpdatesPanel still has legacy installer handling %q", legacy)
+		}
+	}
+	if strings.Contains(types, "installerPath") {
+		t.Error("the frontend UpdatableComponent type still carries installerPath")
 	}
 }
 
