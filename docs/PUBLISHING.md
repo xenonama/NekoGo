@@ -42,7 +42,35 @@ exact `nekogo.exe` asset, it reports `UpdateAvail=false` and
 `Notes="nekogo.exe is not published in this release"`. The other seven rows
 continue to use their independent sources.
 
+## Automated releases
+
+`.github/workflows/release.yml` is the preferred release path. It runs the
+existing `build.bat --yes` on `windows-latest`, collects the installer,
+portable ZIP, raw `nekogo.exe`, required core binaries, and `SHA256SUMS.txt`,
+then uploads a 14-day build artifact. The release job attests provenance and
+creates or updates the GitHub release.
+
+1. Run **Actions → NekoGo release → Run workflow** with `publish=false` for a
+   manual build test. Download the `nekogo-<version>` artifact and inspect it;
+   no release is created.
+2. Tag the reviewed commit as `v<VERSION>`. The workflow fails if the tag does
+   not exactly match `VERSION`. A tag push always creates a **draft** release.
+3. Review the draft's assets, checksums, provenance, and generated notes, then
+   choose **Publish**. Draft releases are invisible to the in-app updater until
+   they are published.
+4. Open NekoGo → **Updates → Check** and confirm the new published version.
+
+A manual dispatch with `publish=true` and `draft=false` publishes immediately;
+versions containing `-` (beta/rc) are marked as prereleases automatically.
+
+TODO: the updater rewrite is in progress elsewhere. Reconcile this automation
+with its final asset and state behavior before changing updater code or the
+Update behavior section above.
+
 ## Steps
+
+These manual steps remain a fallback; the workflow also publishes the setup,
+portable, core, checksum, and provenance assets.
 
 1. **Build the release artifacts:**
    ```bat

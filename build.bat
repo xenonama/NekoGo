@@ -119,8 +119,10 @@ if not defined ARG_OK (
 shift
 goto :args_loop
 :args_done
-REM Unattended runs (CI) never wait on a menu.
+REM Unattended runs (CI) never wait on a menu or a keypress.
 if defined CI set "ASK="
+set "PAUSE_CMD=pause"
+if defined CI set "PAUSE_CMD=rem"
 
 REM ---------- PATH ----------
 set "PATH=%USERPROFILE%\.cargo\bin;D:\mingw64\bin;%USERPROFILE%\go\bin;%PATH%"
@@ -164,7 +166,7 @@ if defined ASK (
         echo.
         echo   Cancelled - nothing was built.
         echo.
-        pause
+        %PAUSE_CMD%
         exit /b 2
     )
 )
@@ -745,13 +747,15 @@ echo.
 
 REM Nothing was packaged: there is no dist folder worth opening.
 if not defined ZIP_BUILT if not defined SETUP_BUILT goto :end
-choice /C YN /M "Open dist folder now"
-if errorlevel 2 goto :end
-explorer "%DIST%"
+if not defined CI (
+    choice /C YN /M "Open dist folder now"
+    if errorlevel 2 goto :end
+    explorer "%DIST%"
+)
 
 :end
 echo.
-pause
+%PAUSE_CMD%
 exit /b 0
 
 :same
@@ -894,7 +898,7 @@ echo ============================================================
 echo   BUILD FAILED
 echo ============================================================
 echo.
-pause
+%PAUSE_CMD%
 exit /b 1
 
 REM ---------- helper: usage ----------

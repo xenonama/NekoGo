@@ -1,0 +1,229 @@
+name: NekoGo release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: Create or update the GitHub release
+        type: boolean
+        default: false
+      draft:
+        description: Create the release as a draft
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: nekogo-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 90
+    permissions:
+      contents: read
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Read VERSION and validate tag
+        id: version
+        shell: pwsh
+        run: |
+          $version = (Get-Content -Raw -LiteralPath VERSION).Trim()
+          if ([string]::IsNullOrWhiteSpace($version)) {
+            throw "VERSION is empty"
+          }
+          if ($env:GITHUB_REF_TYPE -eq "tag") {
+            $tagVersion = $env:GITHUB_REF_NAME
+            if ($tagVersion.StartsWith("v")) { $tagVersion = $tagVersion.Substring(1) }
+            if ($tagVersion -cne $version) {
+              throw "Tag $env:GITHUB_REF_NAME does not match VERSION $version"
+            }
+          }
+          "version=$version" >> $env:GITHUB_OUTPUT
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: core/server/go.mod
+          cache: true
+          cache-dependency-path: |
+            gui/go.sum
+            core/server/go.sum
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: gui/frontend/package-lock.json
+
+      - name: Set up Rust
+        shell: pwsh
+        run: |
+          rustup toolchain install stable --profile minimal
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          rustup default stable
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          rustc --version
+          cargo --version
+
+      - name: Cache Rust build
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            sni spoofing/target
+          key: rust-stable-${{ runner.os }}-${{ hashFiles('sni spoofing/Cargo.lock') }}
+          restore-keys: |
+            rust-stable-${{ runner.os }}-
+
+      - name: Install Wails3 CLI
+        shell: pwsh
+        run: |
+          $goMod = Get-Content -Raw -LiteralPath gui/go.mod
+          $version = [regex]::Match($goMod, '(?m)^\s*github\.com/wailsapp/wails/v3\s+(v\S+)').Groups[1].Value
+          if (-not $version) { throw "Could not find Wails3 version in gui/go.mod" }
+          go install "github.com/wailsapp/wails/v3/cmd/wails3@$version"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $goBin = Join-Path (go env GOPATH) "bin"
+          $env:Path = "$goBin;$env:Path"
+          $goBin >> $env:GITHUB_PATH
+          if (-not (Get-Command wails3 -ErrorAction SilentlyContinue)) {
+            throw "wails3 was not installed into $goBin"
+          }
+
+      - name: Install NSIS and MinGW fallback
+        shell: pwsh
+        run: |
+          choco install nsis -y --no-progress
+          $nsis = "C:\Program Files (x86)\NSIS"
+          if (-not (Test-Path -LiteralPath (Join-Path $nsis "makensis.exe"))) {
+            throw "makensis.exe was not installed at $nsis"
+          }
+          $nsis >> $env:GITHUB_PATH
+          if (-not (Get-Command gcc -ErrorAction SilentlyContinue)) {
+            choco install mingw -y --no-progress
+            $machinePath = [Environment]::GetEnvironmentVariable("Path", "Machine")
+            $userPath = [Environment]::GetEnvironmentVariable("Path", "User")
+            $env:Path = "$machinePath;$userPath"
+          }
+          $gcc = Get-Command gcc -ErrorAction SilentlyContinue
+          if (-not $gcc) { throw "gcc is required for CGO builds" }
+          $gccDir = Split-Path -Parent $gcc.Source
+          $gccDir >> $env:GITHUB_PATH
+          gcc --version
+          makensis /VERSION
+
+      - name: Build release artifacts
+        shell: cmd
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: call build.bat --yes
+
+      - name: Collect release assets
+        shell: pwsh
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          $assets = @(
+            "gui\build\bin\nekobox_core.exe",
+            "gui\build\bin\xray.exe",
+            "dist\nekogo.exe",
+            "dist\NekoGo-Setup-v$env:VERSION.exe",
+            "dist\NekoGo-Portable-v$env:VERSION.zip"
+          )
+          if (Test-Path -LiteralPath release-assets) {
+            Remove-Item -LiteralPath release-assets -Recurse -Force
+          }
+          New-Item -ItemType Directory -Path release-assets | Out-Null
+          foreach ($asset in $assets) {
+            if (-not (Test-Path -LiteralPath $asset -PathType Leaf)) {
+              throw "Required release asset is missing: $asset"
+            }
+            Copy-Item -LiteralPath $asset -Destination release-assets -Force
+          }
+          $lines = foreach ($file in (Get-ChildItem -LiteralPath release-assets -File | Sort-Object Name)) {
+            $hash = (Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+            "$hash *$($file.Name)"
+          }
+          Set-Content -LiteralPath release-assets\SHA256SUMS.txt -Value $lines -Encoding ascii
+          Get-ChildItem -LiteralPath release-assets -File | Sort-Object Name | ForEach-Object {
+            Write-Host "$($_.Name) ($($_.Length) bytes)"
+          }
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: nekogo-${{ steps.version.outputs.version }}
+          path: release-assets/
+          if-no-files-found: error
+          retention-days: 14
+
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v') || inputs.publish
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - name: Download build artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: nekogo-${{ needs.build.outputs.version }}
+          path: release-assets
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v4
+        with:
+          subject-path: release-assets/*
+
+      - name: Generate release notes
+        shell: bash
+        env:
+          VERSION: ${{ needs.build.outputs.version }}
+        run: |
+          {
+            printf '# NekoGo %s\n\n' "$VERSION"
+            printf '%s\n' '- Platform: Windows 10/11 x64'
+            printf '%s\n\n' '- These binaries are not code-signed. Windows SmartScreen may show a warning.'
+            printf '%s\n' '## SHA-256' '' '```text'
+            cat release-assets/SHA256SUMS.txt
+            printf '%s\n\n' '```'
+            printf '[Full changelog](https://github.com/%s/blob/%s/CHANGELOG.md)\n' "$GITHUB_REPOSITORY" "$GITHUB_SHA"
+          } > release-notes.md
+
+      - name: Create or update release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.build.outputs.version }}
+          DRAFT_INPUT: ${{ inputs.draft }}
+        run: |
+          tag="v${VERSION}"
+          args=(release create "$tag" --target "$GITHUB_SHA" --title "NekoGo ${VERSION}" --notes-file release-notes.md)
+          if [[ "$GITHUB_REF" == refs/tags/* || "$DRAFT_INPUT" == "true" ]]; then
+            args+=(--draft)
+          fi
+          if [[ "$VERSION" == *-* ]]; then
+            args+=(--prerelease)
+          fi
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release upload "$tag" release-assets/* --clobber
+          else
+            gh "${args[@]}"
+          fi
